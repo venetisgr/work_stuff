@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <channel>
+    <title>MarketWatch.com - Top Stories</title>
+    <link>https://www.marketwatch.com/</link>
+    <description>MarketWatch, a leading publisher of business and financial news.</description>
+    <language>en-us</language>
+    <lastBuildDate>Fri, 25 Sep 2026 14:58:00 GMT</lastBuildDate>
+    <item>
+      <title>AMD shares slide after weak data-center guidance</title>
+      <link>https://www.marketwatch.com/story/amd-shares-slide-after-weak-data-center-guidance-2026-09-25?mod=mw_rss_topstories&amp;utm_source=rss&amp;utm_medium=feed&amp;utm_campaign=top#comments-section</link>
+      <guid isPermaLink="false">MW-AMD-20260925-1305</guid>
+      <pubDate>Fri, 25 Sep 2026 13:05:00 GMT</pubDate>
+      <dc:creator>Therese Poletti</dc:creator>
+      <description><![CDATA[<p><img src="https://images.mktw.net/im-81234.jpg" alt="AMD logo"/></p><p>Advanced Micro Devices Inc. <strong>cut</strong> its data-center revenue outlook for the fourth quarter, citing slower cloud spending &amp; inventory digestion.</p>
+<p>Shares fell&nbsp;7% in premarket trading.</p><script>trackImpression("amd");</script>]]></description>
+    </item>
+    <item>
+      <title>Boeing &amp; Airbus deliveries slow as supply-chain snags persist</title>
+      <link>https://WWW.MarketWatch.com/story/boeing-airbus-deliveries-slow-2026-09-25?fbclid=IwAR0xYz123&amp;mod=mw_rss_topstories</link>
+      <guid isPermaLink="false">MW-BA-20260925-0930</guid>
+      <pubDate>Fri, 25 Sep 2026 09:30:00 -0400</pubDate>
+      <description>&lt;b&gt;Boeing&lt;/b&gt; delivered 38 jets in August &amp;#8212; down from 44 a year earlier &amp;amp; well short of its target.</description>
+    </item>
+    <item>
+      <title>Fed's Waller says more rate cuts are likely if the job market weakens</title>
+      <link>https://www.marketwatch.com/story/feds-waller-says-more-rate-cuts-likely-2026-09-25?gclid=Cj0KCQjw&amp;ref=rss</link>
+      <description>Federal Reserve Governor Christopher Waller said on Friday that further cuts are on the table.</description>
+    </item>
+    <item>
+      <title>TSMC to raise prices on advanced chips in 2027, Nvidia and Apple among customers hit</title>
+      <link>https://www.marketwatch.com/story/tsmc-to-raise-prices-on-advanced-chips-2026-09-26</link>
+      <guid isPermaLink="false">MW-TSM-20260926-1800</guid>
+      <pubDate>Sat, 26 Sep 2026 18:00:00 GMT</pubDate>
+      <description>Taiwan Semiconductor Manufacturing plans price increases of 5% to 10% for its most advanced nodes.</description>
+    </item>
+  </channel>
+</rss>

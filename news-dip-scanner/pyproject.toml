@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "news-dip-scanner"
+version = "0.1.0"
+description = "Scan ~20 news feeds, find listed companies hit by the news, and rate price dips as fear or real damage with an LLM."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "feedparser>=6.0",
+    "openai>=3,<4",
+    "python-dotenv>=1.0",
+    "requests>=2.32",
+    "truststore>=0.10",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=1,<2"]
+azure = ["azure-identity>=1.19"]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+dip-scanner = "dip_scanner.cli:main"
+
+[tool.setuptools]
+packages = ["dip_scanner"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM"]

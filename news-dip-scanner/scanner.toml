@@ -1,0 +1,58 @@
+# news-dip-scanner thresholds and watchlist.
+#
+# Every setting is optional: delete a line (or this whole file) and the default shown here applies. A misspelled
+# setting is an error, never silently ignored. Point to another copy with --config or SCANNER_CONFIG.
+
+[scan]
+# Minutes between cycles in `dip-scanner watch` (cycles start on the boundaries: :00, :05, :10, ...).
+interval_minutes = 5
+# New articles older than this are stored but never sent to the model. This is what keeps the first cycle after
+# a fresh install from triaging days of backlog: it only triages the last day (a few hundred articles).
+max_article_age_hours = 24
+# How far back company news counts towards a candidate (a dip can follow the news by a day or two).
+lookback_hours = 48
+# Articles per triage request, and how often an article is retried when the model's reply is unusable.
+triage_batch_size = 20
+max_triage_attempts = 3
+# At most this many fear-vs-fundamentals analyses per cycle (bounds the LLM bill); the rest are named in the
+# report's notes and wait for the next cycle.
+max_candidates_per_cycle = 8
+# A ticker isn't re-analysed within this many hours unless new qualifying news arrives.
+cooldown_hours = 24
+# Fetch per-ticker headlines (Yahoo Finance + Google News) to give the analysis more context.
+context_news = true
+# Feeds fetched in parallel.
+workers = 8
+# Articles older than this many days are deleted (opportunities are kept forever for `dip-scanner track`).
+retention_days = 30
+
+[dip]
+# What counts as a dip: any one of these is enough. Percentages, written as positive numbers.
+min_drop_1d_pct = 3.0          # down at least 3% on the day (vs the previous close)
+min_drop_5d_pct = 6.0          # down at least 6% over 5 sessions
+min_drawdown_20d_pct = 10.0    # at least 10% below the 20-session high
+# Which news can make a company a candidate: impact 1 (negligible) to 5 (major), its direction, and whether news
+# that affects a company only indirectly (a supplier, customer or competitor) counts.
+min_magnitude = 2
+directions = ["negative", "mixed"]
+include_indirect = true
+
+[universe]
+# Watchlist tickers (Yahoo Finance symbols) are eligible with any news of magnitude 1 or more, direct or indirect.
+watchlist = []
+# watchlist = ["AMD", "NVDA", "ASML", "MSFT", "TSM"]
+# Only ever consider the watchlist.
+only_watchlist = false
+# Never consider these tickers.
+exclude = []
+# Skip penny stocks below this price (in the stock's own currency).
+min_price = 1.0
+# Only these exchanges, by Yahoo suffix: "" is US (AMD), ".DE" Xetra, ".PA" Paris, ".AS" Amsterdam, ".L" London,
+# ".AT" Athens, ".T" Tokyo, ".HK" Hong Kong... Leave it commented out to allow every exchange.
+# allowed_suffixes = ["", ".DE", ".PA", ".AS", ".AT"]
+
+[alerts]
+# Which new opportunities are sent as notifications (all of them are in the reports).
+min_score = 65
+min_probability = 60
+verdicts = ["temporary_fear", "mixed"]

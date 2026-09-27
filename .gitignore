@@ -8,3 +8,7 @@ venv/
 # Secrets and generated digests
 .env
 output/
+
+# news-dip-scanner: database, reports and cache (DATA_DIR defaults to ./data)
+data/
+.ruff_cache/

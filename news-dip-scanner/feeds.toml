@@ -1,0 +1,306 @@
+# News sources the scanner polls. List them and test them with: dip-scanner feeds --check
+#
+# Each [feeds.<key>] table is one RSS or Atom feed; <key> is its short id (lowercase, dashes) and is stored
+# with every article it produces, so keep it stable once the scanner has run.
+#   name     - label shown in reports and in the news digest
+#   url      - the feed URL (free, no login)
+#   category - label for reports: markets, earnings, filings, press-releases, tech, energy, health, macro,
+#              europe or greece
+#   enabled  - set to false to keep a feed listed without polling it (default true)
+#
+# The scanner polls every enabled feed each cycle (every ~5 minutes in watch mode) with conditional requests,
+# so feeds that send ETag or Last-Modified cost almost nothing when nothing changed. The same story in several
+# feeds is kept once (articles are matched by link and by normalised title).
+#
+# Every feed below was checked from a cloud server on Sunday 2026-09-27 with the scanner's User-Agent.
+# "newest" is the age of the newest item at that moment, so weekend ages are longer than weekday ones.
+# The 20 enabled feeds cover US markets, earnings, SEC 8-K filings, company press releases, tech and
+# semiconductors, energy, pharma/biotech, macro and Europe. Verified alternates and the Greek sources are listed
+# further down with enabled = false; feeds that were checked and rejected are listed at the end of the file.
+
+# ---------------------------------------------------------------------------------------------------------------
+# Markets
+# ---------------------------------------------------------------------------------------------------------------
+
+# MarketWatch top stories: market-moving headlines with a one-line summary.
+# verified 2026-09-27: 10 items, newest 13 min old, all with summaries, ETag (re-fetch -> 304)
+[feeds.marketwatch-top-stories]
+name = "MarketWatch - Top Stories"
+url = "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+category = "markets"
+enabled = true
+
+# WSJ US business: company scoops (strategy, deals, management, lawsuits). Headlines and summaries are free.
+# The old feeds.a.dj.com URLs still answer but stopped updating in early 2025; use feeds.content.dowjones.io.
+# verified 2026-09-27: 85 items, newest 6 min old, 82 with summaries, ETag (re-fetch -> 304)
+[feeds.wsj-us-business]
+name = "WSJ - US Business"
+url = "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness"
+category = "markets"
+enabled = true
+
+# CNBC US top news and analysis. www.cnbc.com/id/100003114/device/rss/rss.html is the same feed but answers
+# 403 from cloud IPs (Akamai bot block); this search.cnbc.com endpoint works from cloud and home connections.
+# verified 2026-09-27: 30 items, newest 22 min old, all with summaries, no ETag/Last-Modified
+[feeds.cnbc-top-news]
+name = "CNBC - Top News"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114"
+category = "markets"
+enabled = true
+
+# Bloomberg markets: stocks, bonds, deals. Official feed; redirects to www.bloomberg.com/feeds/markets/news.rss.
+# verified 2026-09-27: 20 items, newest 80 min old, all with summaries, ETag (re-fetch -> 304)
+[feeds.bloomberg-markets]
+name = "Bloomberg - Markets"
+url = "https://feeds.bloomberg.com/markets/news.rss"
+category = "markets"
+enabled = true
+
+# Seeking Alpha market currents: short breaking-news items, most about a single listed company.
+# verified 2026-09-27: 7 items, newest 13 min old, headlines only (no summaries), ETag (re-fetch -> 304)
+[feeds.seeking-alpha-market-currents]
+name = "Seeking Alpha - Market Currents"
+url = "https://seekingalpha.com/market_currents.xml"
+category = "markets"
+enabled = true
+
+# Investing.com stock market news: fast wire-style headlines (Reuters/Bloomberg rewrites, analyst calls).
+# verified 2026-09-27: 10 items, newest 42 min old, headlines only (no summaries), ETag + Last-Modified (-> 304)
+[feeds.investing-stock-market-news]
+name = "Investing.com - Stock Market News"
+url = "https://www.investing.com/rss/news_25.rss"
+category = "markets"
+enabled = true
+
+# Google News search for stories about falling shares, from any outlet, last 24 hours. The most direct "dip"
+# signal in this list; it is noisy (rallies and non-finance "stock report" stories slip in) and triage filters that.
+# verified 2026-09-27: 34 items, newest 38 min old, summaries (headline + source), no ETag/Last-Modified
+[feeds.google-news-stock-drops]
+name = "Google News - Shares Falling"
+url = "https://news.google.com/rss/search?q=%22shares+fell%22+OR+%22stock+drops%22+OR+%22shares+tumble%22+when:1d&hl=en-US&gl=US&ceid=US:en"
+category = "markets"
+enabled = true
+
+# Reuters business stories through Google News (Reuters closed its own RSS feeds in 2020).
+# verified 2026-09-27: 100 items, newest 24 min old, summaries (headline + source), no ETag/Last-Modified
+[feeds.reuters-business]
+name = "Reuters - Business (via Google News)"
+url = "https://news.google.com/rss/search?q=site:reuters.com+business+when:1d&hl=en-US&gl=US&ceid=US:en"
+category = "markets"
+enabled = true
+
+# ---------------------------------------------------------------------------------------------------------------
+# Earnings, filings, press releases
+# ---------------------------------------------------------------------------------------------------------------
+
+# CNBC earnings: results and the share-price reaction ("X stock falls as ..."). Same cloud-IP note as CNBC top news.
+# verified 2026-09-27: 30 items, newest 64 h old (weekend), all with summaries, no ETag/Last-Modified
+[feeds.cnbc-earnings]
+name = "CNBC - Earnings"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=15839135"
+category = "earnings"
+enabled = true
+
+# SEC EDGAR latest 8-K filings (material events: results, guidance, exec departures, delisting notices, ...).
+# sec.gov requires a User-Agent with contact details: set SEC_USER_AGENT in .env, e.g. "Jane Doe jane@example.com".
+# A generic User-Agent gets 403. Keep requests polite; SEC allows at most 10 per second.
+# verified 2026-09-27 (with a contact User-Agent): 100 items, newest 43 h old (no filings at weekends),
+# all with summaries (form items), no ETag/Last-Modified
+[feeds.sec-8k-filings]
+name = "SEC EDGAR - Latest 8-K Filings"
+url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=100&output=atom"
+category = "filings"
+enabled = true
+
+# PR Newswire, all news releases: company announcements straight from the source.
+# news-releases-list.rss serves the same list but answered 502/404 on 4 of 8 tries; this URL answered 14 of 14.
+# verified 2026-09-27: 20 items, newest 16 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.pr-newswire]
+name = "PR Newswire - All News Releases"
+url = "https://www.prnewswire.com/rss/all-news-releases-list.rss"
+category = "press-releases"
+enabled = true
+
+# GlobeNewswire releases from public companies only (includes French duplicates of Canadian releases).
+# verified 2026-09-27: 20 items, newest 133 min old, all with summaries, Last-Modified (-> 304)
+[feeds.globenewswire-public-companies]
+name = "GlobeNewswire - Public Companies"
+url = "https://www.globenewswire.com/RssFeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies"
+category = "press-releases"
+enabled = true
+
+# ---------------------------------------------------------------------------------------------------------------
+# Sectors: tech and semiconductors, health, energy
+# ---------------------------------------------------------------------------------------------------------------
+
+# Techmeme: the day's leading tech story from any outlet, with a summary. Covers TechCrunch, The Verge etc.
+# verified 2026-09-27: 15 items, newest 31 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.techmeme]
+name = "Techmeme"
+url = "https://www.techmeme.com/feed.xml"
+category = "tech"
+enabled = true
+
+# CNBC technology: big-tech and chip stocks from a markets angle. Same cloud-IP note as CNBC top news.
+# verified 2026-09-27: 30 items, newest 37 min old, all with summaries, no ETag/Last-Modified
+[feeds.cnbc-technology]
+name = "CNBC - Technology"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19854910"
+category = "tech"
+enabled = true
+
+# Tom's Hardware tech-industry section: semiconductors (Nvidia, AMD, Intel, TSMC, memory), export controls,
+# supply chain. This tag feed leaves out the reviews and shopping deals of the main feed (/feeds/all).
+# verified 2026-09-27: 50 items, newest 4 h old, all with summaries, no ETag/Last-Modified
+[feeds.tomshardware-tech-industry]
+name = "Tom's Hardware - Tech Industry"
+url = "https://www.tomshardware.com/feeds/tag/tech-industry"
+category = "tech"
+enabled = true
+
+# Endpoints News: biotech and pharma (FDA decisions, trial readouts, deals) - frequent causes of sharp drops.
+# verified 2026-09-27: 24 items, newest 24 h old (weekend), 22 with summaries, ETag + Last-Modified (-> 304)
+[feeds.endpoints-news]
+name = "Endpoints News"
+url = "https://endpoints.news/feed/"
+category = "health"
+enabled = true
+
+# Oilprice.com: oil, gas and energy companies, OPEC, geopolitics.
+# verified 2026-09-27: 15 items, newest 73 min old, all with summaries, no ETag/Last-Modified
+[feeds.oilprice]
+name = "Oilprice.com"
+url = "https://oilprice.com/rss/main"
+category = "energy"
+enabled = true
+
+# ---------------------------------------------------------------------------------------------------------------
+# Macro and Europe
+# ---------------------------------------------------------------------------------------------------------------
+
+# Bloomberg economics: central banks, data releases, fiscal policy worldwide.
+# verified 2026-09-27: 7 items, newest 143 min old, all with summaries, ETag (re-fetch -> 304)
+[feeds.bloomberg-economics]
+name = "Bloomberg - Economics"
+url = "https://feeds.bloomberg.com/economics/news.rss"
+category = "macro"
+enabled = true
+
+# Financial Times companies: global company news with a European focus. Headlines and standfirsts are free.
+# verified 2026-09-27: 25 items, newest 6 h old, all with summaries, ETag (changes on every response, so no 304)
+[feeds.ft-companies]
+name = "Financial Times - Companies"
+url = "https://www.ft.com/companies?format=rss"
+category = "europe"
+enabled = true
+
+# Euronews business: European economy and companies (recalls, energy prices, EU regulation).
+# verified 2026-09-27: 50 items, newest 17 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.euronews-business]
+name = "Euronews - Business"
+url = "https://www.euronews.com/rss?level=vertical&name=business"
+category = "europe"
+enabled = true
+
+# ---------------------------------------------------------------------------------------------------------------
+# Greece (Athens Exchange). Disabled by default: Greek-language news, and Yahoo symbols end in .AT.
+# ---------------------------------------------------------------------------------------------------------------
+
+# Naftemporiki economy & markets section (the whole-site feed is https://www.naftemporiki.gr/feed/).
+# verified 2026-09-27: 30 items, newest 7 h old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.naftemporiki]
+name = "Naftemporiki - Economy & Markets"
+url = "https://www.naftemporiki.gr/finance/feed/"
+category = "greece"
+enabled = false
+
+# Capital.gr.
+# 403 from cloud IPs (redirects to /rss/ and is refused); not verified from a home connection.
+[feeds.capital-gr]
+name = "Capital.gr"
+url = "https://www.capital.gr/rss"
+category = "greece"
+enabled = false
+
+# ---------------------------------------------------------------------------------------------------------------
+# Verified alternates (disabled). Swap one in if a feed above breaks or you want more depth in an area.
+# ---------------------------------------------------------------------------------------------------------------
+
+# CNBC Europe news. verified 2026-09-27: 30 items, newest 51 h old (weekend), all with summaries, no ETag
+[feeds.cnbc-europe]
+name = "CNBC - Europe"
+url = "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=19794221"
+category = "europe"
+enabled = false
+
+# Guardian business (UK-heavy, much politics). verified 2026-09-27: 40 items, newest 26 min old, ETag (-> 304)
+[feeds.guardian-business]
+name = "The Guardian - Business"
+url = "https://www.theguardian.com/uk/business/rss"
+category = "europe"
+enabled = false
+
+# WSJ markets (overlaps with MarketWatch). verified 2026-09-27: 61 items, newest 5 h old, ETag
+[feeds.wsj-markets]
+name = "WSJ - Markets"
+url = "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain"
+category = "markets"
+enabled = false
+
+# TechCrunch (mostly startups; Techmeme already picks up its big stories).
+# verified 2026-09-27: 20 items, newest 11 min old, ETag + Last-Modified (-> 304)
+[feeds.techcrunch]
+name = "TechCrunch"
+url = "https://techcrunch.com/feed/"
+category = "tech"
+enabled = false
+
+# EE Times: semiconductor industry (fewer items, some sponsored).
+# verified 2026-09-27: 10 items, newest 133 min old, ETag + Last-Modified (-> 304)
+[feeds.ee-times]
+name = "EE Times"
+url = "https://www.eetimes.com/feed/"
+category = "tech"
+enabled = false
+
+# STAT: health, pharma and FDA policy. verified 2026-09-27: 20 items, newest 29 h old, ETag + Last-Modified (-> 304)
+[feeds.stat-news]
+name = "STAT"
+url = "https://www.statnews.com/feed/"
+category = "health"
+enabled = false
+
+# GlobeNewswire earnings releases only (a subset of the public-companies feed above).
+# verified 2026-09-27: 20 items, newest 29 h old, Last-Modified (-> 304)
+[feeds.globenewswire-earnings]
+name = "GlobeNewswire - Earnings Releases"
+url = "https://www.globenewswire.com/RssFeed/subjectcode/13-Earnings%20Releases%20And%20Operating%20Results/feedTitle/GlobeNewswire%20-%20Earnings%20Releases%20And%20Operating%20Results"
+category = "earnings"
+enabled = false
+
+# Federal Reserve press releases (rate decisions, bank enforcement actions).
+# verified 2026-09-27: 20 items, newest 44 h old, ETag + Last-Modified (-> 304)
+[feeds.federal-reserve-press]
+name = "Federal Reserve - Press Releases"
+url = "https://www.federalreserve.gov/feeds/press_all.xml"
+category = "macro"
+enabled = false
+
+# ---------------------------------------------------------------------------------------------------------------
+# Checked on 2026-09-27 and left out:
+#   Yahoo Finance       finance.yahoo.com/news/rssindex answers 200 but is stale (newest item 2026-09-23,
+#                       Last-Modified 2026-09-24); per-ticker Yahoo RSS still works and is used for context news
+#   CNBC (www.cnbc.com) 403 from cloud IPs (Akamai); the search.cnbc.com URLs above serve the same feeds
+#   Nasdaq              www.nasdaq.com/feed/rssoutbound times out unless the User-Agent looks like a desktop browser
+#   Benzinga            /feed is crypto price-prediction pages; the news, earnings and ratings feeds answer 403
+#   Business Wire       feed.businesswire.com feeds answer 200 with no items; the site times out
+#   Fierce Pharma       /rss/xml is behind a Cloudflare challenge (403); /rss/pharma/xml works but has dates
+#                       feedparser cannot read ("Sep 23, 2026 1:55pm")
+#   Zacks               /rss/rss_news.php answers 404
+#   MarketWatch         mw_marketpulse and mw_realtimeheadlines stopped updating in 2025; mw_bulletins is ~1/day
+#   WSJ (feeds.a.dj.com) stopped updating in early 2025 (replaced by feeds.content.dowjones.io above)
+#   Motley Fool, The Verge, Ars Technica, Electrek, BBC business, Rigzone, BioPharma Dive: work, but lower signal
+#                       for listed-company news than the feeds chosen above
+#   Bloomberg via Google News  works, but Bloomberg's own feeds above carry summaries
+#   Barron's, Sharecast, Proactive Investors, Accesswire: 403 (bot protection); FDA press releases: 401
+# ---------------------------------------------------------------------------------------------------------------

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="ISO-8859-1" ?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Latest Filings - Fri, 25 Sep 2026 10:45:03 EDT</title>
+<link rel="alternate" href="/cgi-bin/browse-edgar?action=getcurrent"/>
+<link rel="self" href="/cgi-bin/browse-edgar?action=getcurrent&amp;type=8-K&amp;output=atom"/>
+<id>https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent</id>
+<author><name>Webmaster</name><email>webmaster@sec.gov</email></author>
+<updated>2026-09-25T10:45:03-04:00</updated>
+<entry>
+<title>8-K - ADVANCED MICRO DEVICES INC (0000002488) (Filer)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/2488/000000248826000071/0000002488-26-000071-index.htm"/>
+<summary type="html"> &lt;b&gt;Filed:&lt;/b&gt; 2026-09-25 &lt;b&gt;AccNo:&lt;/b&gt; 0000002488-26-000071 &lt;b&gt;Size:&lt;/b&gt; 312 KB&lt;br&gt;Item 2.02: Results of Operations and Financial Condition&lt;br&gt;Item 9.01: Financial Statements and Exhibits</summary>
+<updated>2026-09-25T10:32:15-04:00</updated>
+<category scheme="https://www.sec.gov/" label="form type" term="8-K"/>
+<id>urn:tag:sec.gov,2008:accession-number=0000002488-26-000071</id>
+</entry>
+<entry>
+<title>8-K - SOCIÉTÉ GÉNÉRALE AMERICAS HOLDINGS INC (0001234567) (Filer)</title>
+<link rel="alternate" type="text/html" href="https://www.sec.gov/Archives/edgar/data/1234567/000123456726000012/0001234567-26-000012-index.htm"/>
+<summary type="html"> &lt;b&gt;Filed:&lt;/b&gt; 2026-09-25 &lt;b&gt;AccNo:&lt;/b&gt; 0001234567-26-000012 &lt;b&gt;Size:&lt;/b&gt; 48 KB&lt;br&gt;Item 5.02: Departure of Directors or Certain Officers</summary>
+<updated>2026-09-25T09:58:40-04:00</updated>
+<category scheme="https://www.sec.gov/" label="form type" term="8-K"/>
+<id>urn:tag:sec.gov,2008:accession-number=0001234567-26-000012</id>
+</entry>
+</feed>
