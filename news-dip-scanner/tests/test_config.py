@@ -1,4 +1,5 @@
 import re
+import tomllib
 from dataclasses import fields
 from datetime import UTC
 from pathlib import Path
@@ -575,6 +576,22 @@ def test_the_shipped_scanner_config_and_the_readme_name_every_setting(tmp_path):
     for number, line in enumerate(examples.splitlines()):
         section = next(name for name, cls in sections.items() if line.split(" = ")[0] in {f.name for f in fields(cls)})
         load_scanner_config(_write(tmp_path, f"[{section}]\n{line}\n", f"example{number}.toml"))
+
+
+def test_the_dev_extra_installs_every_other_extra():
+    """Regression: `pip install -e ".[dev]"` left out the anthropic and azure-identity SDKs, and 37 tests of
+    test_llm.py failed in a fresh virtual environment. The tests exercise every provider."""
+    project = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
+    extras = project["optional-dependencies"]
+    included = {
+        extra.strip()
+        for requirement in extras["dev"]
+        if (match := re.fullmatch(rf"{re.escape(project['name'])}\[([^\]]+)\]", requirement))
+        for extra in match.group(1).split(",")
+    }
+    assert set(extras) - {"dev"} <= included
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    assert 'pip install -e ".[dev]"' in readme
 
 
 def test_the_env_example_loads_and_lists_every_setting():

@@ -20,7 +20,8 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=1,<2"]
 azure = ["azure-identity>=1.19"]
-dev = ["pytest>=8", "ruff>=0.6"]
+# The tests exercise every provider, so the dev extra installs the other extras' SDKs too.
+dev = ["news-dip-scanner[anthropic,azure]", "pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 dip-scanner = "dip_scanner.cli:main"

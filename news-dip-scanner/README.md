@@ -647,7 +647,7 @@ Add `-v` to any command for debug logging.
 ## Development
 
 ```bash
-pip install -e ".[dev,anthropic,azure]"
+pip install -e ".[dev]"            # pytest, ruff, and the Anthropic and Azure SDKs the tests use
 pytest
 ruff check . && ruff format --check .
 ```
