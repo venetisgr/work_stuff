@@ -145,7 +145,13 @@ class SecFundamentals:
         try:
             cik = self.cik(symbol)
             if cik is None:
-                log.info("%s isn't in the SEC's ticker list (not a US filer?); no fundamentals", symbol)
+                # Listings with an exchange suffix (ETE.AT, SAP.DE) are expected to be missing; BRK.B is a US class.
+                foreign = "." in symbol and len(symbol.rsplit(".", 1)[1]) > 1
+                log.log(
+                    logging.DEBUG if foreign else logging.INFO,
+                    "%s isn't in the SEC's ticker list (not a US filer?); no fundamentals",
+                    symbol,
+                )
                 return None
             fundamentals = self._fundamentals(cik, symbol)
         except Exception as exc:  # optional enrichment: never let it break a scan

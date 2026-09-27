@@ -491,6 +491,18 @@ def test_get_is_none_for_tickers_the_sec_does_not_list():
     assert session.urls == [TICKERS_URL]
 
 
+def test_missing_foreign_listings_are_not_logged_at_info(caplog):
+    sec, _, _ = sec_for(sec_routes())
+
+    with caplog.at_level(logging.INFO, logger="dip_scanner.fundamentals"):
+        assert sec.get("ETE.AT") is None
+        assert sec.get("ZZZZ") is None
+
+    assert [record.getMessage() for record in caplog.records] == [
+        "ZZZZ isn't in the SEC's ticker list (not a US filer?); no fundamentals"
+    ]
+
+
 def test_get_is_none_when_the_company_has_no_facts(caplog):
     routes = sec_routes()
     routes[AMD_FACTS] = FakeResponse(status_code=404, content=b"<Error><Code>NoSuchKey</Code></Error>")
