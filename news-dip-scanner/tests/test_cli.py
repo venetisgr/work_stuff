@@ -27,6 +27,8 @@ ENV_VARS = (
     "FOUNDRY_API_KEY",
     "FOUNDRY_DEPLOYMENT",
     "LLM_REASONING_EFFORT",
+    "LLM_TRIAGE_REASONING_EFFORT",
+    "LLM_ANALYSIS_REASONING_EFFORT",
     "LLM_MAX_OUTPUT_TOKENS",
     "SMTP_HOST",
     "SMTP_PORT",
@@ -284,6 +286,8 @@ def test_run_does_one_cycle_and_prints_the_summary(workdir, web, models, capsys)
     assert out.startswith("Cycle 2026-09-25 20:30 UTC: 2/2 feeds ok, 6 new articles, 6 triaged")
     assert "  AMD (Advanced Micro Devices, Inc.): score 67.8, temporary_fear (alert)" in out
     assert "Notes:" in out and "marked invalid" in out
+    assert "Model use today (since 00:00 UTC):\n  triage with fake-model: 1 call" in out
+    assert "  analysis with fake-analysis: 1 call, 0 tokens in, 0 out (1 without token counts)" in out
     report = workdir / "data" / "reports" / "2026-09-25" / "203000-opportunities.md"
     assert f"Report: {report}" in out and report.exists()
     assert any("companyfacts" in url for url in web.urls)  # SEC fundamentals were used
@@ -297,6 +301,63 @@ def test_run_without_an_api_key_is_a_config_error(workdir, capsys):
     (workdir / ".env").write_text("LLM_PROVIDER=openai\n", encoding="utf-8")
     assert cli.main(["run"]) == 2
     assert "Configuration problem: Set OPENAI_API_KEY in .env" in capsys.readouterr().err
+
+
+HOOK = "https://hooks.example.com/T123/very-secret-webhook-token"
+
+
+def hook_posts(web: FakeSession) -> list[dict]:
+    return [call["json"] for call in web.calls if call["url"] == HOOK]
+
+
+def test_a_setup_problem_sends_one_stop_notice_through_the_channels(workdir, web, capsys, monkeypatch):
+    """Regression: under cron a revoked key or an empty balance made every run exit 2 in a log nobody reads."""
+    web.routes[HOOK] = {"ok": True}
+    (workdir / ".env").write_text(f"LLM_PROVIDER=openai\nWEBHOOK_URL={HOOK}\n", encoding="utf-8")
+
+    assert cli.main(["run"]) == 2
+    assert "Configuration problem: Set OPENAI_API_KEY in .env" in capsys.readouterr().err
+    [payload] = hook_posts(web)
+    reason = "Configuration problem: Set OPENAI_API_KEY in .env to use LLM_PROVIDER=openai."
+    assert payload["subject"] == f"dip-scanner stopped: {reason}"
+    assert f"dip-scanner run stopped at 2026-09-25 20:30 UTC: {reason}" in payload["markdown"]
+    assert "very-secret-webhook-token" not in str(payload)
+
+    # The next cron run five minutes later fails the same way, but doesn't repeat the notice.
+    monkeypatch.setattr(cli, "_now", lambda: CYCLE + timedelta(minutes=5))
+    assert cli.main(["run"]) == 2
+    assert len(hook_posts(web)) == 1
+    # Twelve hours later it is sent again.
+    monkeypatch.setattr(cli, "_now", lambda: CYCLE + timedelta(hours=12))
+    assert cli.main(["run"]) == 2
+    assert len(hook_posts(web)) == 2
+
+
+def test_no_stop_notice_with_no_notify_or_when_switched_off(workdir, web):
+    web.routes[HOOK] = {"ok": True}
+    (workdir / ".env").write_text(f"LLM_PROVIDER=openai\nWEBHOOK_URL={HOOK}\n", encoding="utf-8")
+    assert cli.main(["run", "--no-notify"]) == 2
+    (workdir / "scanner.toml").write_text("[alerts]\nsystem_notices = false\n", encoding="utf-8")
+    assert cli.main(["run"]) == 2
+    assert hook_posts(web) == []
+
+
+def test_watch_sends_a_stop_notice_when_the_model_refuses_the_key(workdir, web, monkeypatch, capsys):
+    from dip_scanner.llm import LLMSetupError
+
+    web.routes[HOOK] = {"ok": True}
+    (workdir / ".env").write_text(f"OPENAI_API_KEY=sk-test\nWEBHOOK_URL={HOOK}\n", encoding="utf-8")
+    refused = FakeChatModel(LLMSetupError("OpenAI rejected the credentials (401). Check OPENAI_API_KEY."))
+    monkeypatch.setattr(cli, "build_models", lambda settings: (refused, refused))
+
+    assert cli.main(["watch"]) == 2
+    assert "The language model can't be used: OpenAI rejected the credentials" in capsys.readouterr().err
+    [payload] = hook_posts(web)
+    assert payload["subject"] == (
+        "dip-scanner stopped: The language model can't be used: OpenAI rejected the credentials (401). "
+        "Check OPENAI_API_KEY."
+    )
+    assert "`dip-scanner watch` has exited" in payload["markdown"]
 
 
 def test_run_fails_when_every_feed_fails(workdir, models, capsys):

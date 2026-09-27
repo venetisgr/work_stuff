@@ -11,6 +11,9 @@ Every model turns a system prompt and a user prompt into text. Failures come out
   article's attempts when every request is refused the same way.
 Anything else the SDKs raise (an Entra ID sign-in that fails, a gateway reply without choices) is mapped to one of
 these too.
+
+After every call a model's last_usage holds the tokens the service reported (Usage), or None when no reply came back
+(the request failed before the service answered). The pipeline stores them to total the day's use.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ import logging
 import os
 import re
 from collections.abc import Callable
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 from urllib.parse import unquote, urlparse
 
@@ -57,6 +61,7 @@ _ANTHROPIC_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 JSON_INSTRUCTION = "Reply with a single JSON object only: no code fences, no text before or after it."
 _RETRY_INSTRUCTION = "Reply with only the corrected JSON."
 _MAX_ECHOED_REPLY = 6000  # characters of a bad reply quoted back in the corrective retry
+_EFFORT_SETTINGS = "LLM_REASONING_EFFORT (or LLM_TRIAGE_/LLM_ANALYSIS_REASONING_EFFORT) and LLM_MAX_OUTPUT_TOKENS"
 
 
 class LLMError(Exception):
@@ -77,11 +82,48 @@ class LLMSetupError(Exception):
 
 
 class ChatModel(Protocol):
-    """Anything that turns a system prompt and a user prompt into text. Tests use a fake."""
+    """Anything that turns a system prompt and a user prompt into text. Tests use a fake.
+
+    The models here also set last_usage (a Usage, or None when the service never answered) on every call; callers
+    read it with getattr, since a model may not have it.
+    """
 
     name: str
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str: ...
+
+
+@dataclass(frozen=True)
+class Usage:
+    """The tokens one request used, as the service reported them; None where it didn't (some gateways, old servers).
+
+    input_tokens counts the whole prompt, cached parts included (OpenAI's prompt_tokens; for Anthropic input_tokens
+    plus cache writes and reads). output_tokens includes reasoning or thinking tokens, which are billed as output.
+    """
+
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+def openai_usage(response: Any) -> Usage:
+    """The Usage of a Chat Completions response (usage.prompt_tokens / completion_tokens), None where missing."""
+    usage = getattr(response, "usage", None)
+    return Usage(_tokens(getattr(usage, "prompt_tokens", None)), _tokens(getattr(usage, "completion_tokens", None)))
+
+
+def anthropic_usage(response: Any) -> Usage:
+    """The Usage of an Anthropic Messages response: input_tokens excludes cached tokens there, so they are added."""
+    usage = getattr(response, "usage", None)
+    fresh = _tokens(getattr(usage, "input_tokens", None))
+    cached = (
+        _tokens(getattr(usage, name, None)) for name in ("cache_creation_input_tokens", "cache_read_input_tokens")
+    )
+    total = None if fresh is None else fresh + sum(count for count in cached if count)
+    return Usage(total, _tokens(getattr(usage, "output_tokens", None)))
+
+
+def _tokens(value: Any) -> int | None:
+    return int(value) if isinstance(value, int | float) and not isinstance(value, bool) and value >= 0 else None
 
 
 # --- JSON replies --------------------------------------------------------------------------------------------------
@@ -213,6 +255,7 @@ class _ChatCompletionsModel:
 
     def __init__(self, client: openai.OpenAI, name: str, settings: LLMSettings) -> None:
         self.name = name
+        self.last_usage: Usage | None = None
         self._client = client
         self._reasoning_effort = settings.reasoning_effort
         self._max_output_tokens = settings.max_output_tokens
@@ -220,6 +263,7 @@ class _ChatCompletionsModel:
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str:
         """The model's reply to one system + user prompt."""
+        self.last_usage = None
         if json_mode and "json" not in f"{system}\n{prompt}".lower():
             system = f"{system}\n\n{JSON_INSTRUCTION}"  # the API insists the word JSON appears in json_object mode
         options: dict[str, Any] = {}
@@ -267,8 +311,7 @@ class _ChatCompletionsModel:
                 raise LLMError("The text is too long for the model's context window.") from exc
             if exc.code in _SETUP_ERROR_CODES:
                 raise LLMSetupError(
-                    f"{self.name} rejected the request settings: {_detail(exc)} "
-                    "(check LLM_REASONING_EFFORT and LLM_MAX_OUTPUT_TOKENS)."
+                    f"{self.name} rejected the request settings: {_detail(exc)} (check {_EFFORT_SETTINGS})."
                 ) from exc
             raise LLMRequestError(f"{self.service} rejected the request: {_detail(exc)}") from exc
         except openai.InternalServerError as exc:
@@ -279,6 +322,8 @@ class _ChatCompletionsModel:
             raise LLMRequestError(f"{self.service} rejected the request ({exc.status_code}): {_detail(exc)}") from exc
 
     def _reply(self, response: Any) -> str:
+        self.last_usage = usage = openai_usage(response)  # billed even when the reply turns out to be unusable
+        log.debug("%s used %s input and %s output tokens.", self.name, usage.input_tokens, usage.output_tokens)
         # OpenAI-compatible gateways sometimes answer 200 with no choices, or with an error object instead.
         choices = getattr(response, "choices", None)
         if not choices or getattr(choices[0], "message", None) is None:
@@ -286,9 +331,6 @@ class _ChatCompletionsModel:
             raise LLMError(f"{self.service} returned no reply" + (f": {error}" if error else " (no choices)."))
         choice = choices[0]
         text = (choice.message.content or "").strip()
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            log.debug("%s used %s input and %s output tokens.", self.name, usage.prompt_tokens, usage.completion_tokens)
         if choice.finish_reason == "content_filter":
             raise LLMError(f"{self.service}'s content filter blocked the model's reply.")
         refusal = getattr(choice.message, "refusal", None)
@@ -416,6 +458,7 @@ class AnthropicChatModel:
         if not model:
             raise ConfigError("No Claude model name given; set LLM_TRIAGE_MODEL / LLM_ANALYSIS_MODEL.")
         self.name = model
+        self.last_usage: Usage | None = None
         self._sdk = _import_anthropic()
         if client is None:
             # Without ANTHROPIC_API_KEY the SDK still finds ANTHROPIC_AUTH_TOKEN or an `ant auth login` profile.
@@ -456,19 +499,21 @@ class AnthropicChatModel:
             return None
         if effort not in _ANTHROPIC_EFFORTS:
             log.warning(
-                "LLM_REASONING_EFFORT=%s isn't a Claude effort level (%s); ignoring it for %s.",
+                "The reasoning effort %r (LLM_REASONING_EFFORT or a per-step one) isn't a Claude effort level (%s); "
+                "ignoring it for %s.",
                 effort,
                 ", ".join(_ANTHROPIC_EFFORTS),
                 self.name,
             )
             return None
         if "haiku" in self.name:  # Haiku 4.5 rejects the effort parameter
-            log.debug("Not sending LLM_REASONING_EFFORT to %s (Haiku doesn't support effort).", self.name)
+            log.debug("Not sending the reasoning effort to %s (Haiku doesn't support effort).", self.name)
             return None
         return effort
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str:
         """Claude's reply to one system + user prompt."""
+        self.last_usage = None
         if json_mode:  # no assistant prefill: current Claude models reject it
             system = f"{system}\n\n{JSON_INSTRUCTION}"
         options: dict[str, Any] = {}
@@ -512,8 +557,7 @@ class AnthropicChatModel:
                 ) from exc
             if "effort" in detail or "max_tokens" in detail:
                 raise LLMSetupError(
-                    f"{self.name} rejected the request settings: {detail} "
-                    "(check LLM_REASONING_EFFORT and LLM_MAX_OUTPUT_TOKENS)."
+                    f"{self.name} rejected the request settings: {detail} (check {_EFFORT_SETTINGS})."
                 ) from exc
             raise LLMRequestError(f"Anthropic rejected the request: {detail}") from exc
         except sdk.APIStatusError as exc:
@@ -536,10 +580,9 @@ class AnthropicChatModel:
         return self._reply(response)
 
     def _reply(self, response: Any) -> str:
+        self.last_usage = usage = anthropic_usage(response)  # billed even when the reply turns out to be unusable
+        log.debug("%s used %s input and %s output tokens.", self.name, usage.input_tokens, usage.output_tokens)
         text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text").strip()
-        usage = getattr(response, "usage", None)
-        if usage is not None:
-            log.debug("%s used %s input and %s output tokens.", self.name, usage.input_tokens, usage.output_tokens)
         stop_reason = response.stop_reason
         if stop_reason == "refusal":
             details = getattr(response, "stop_details", None)
@@ -580,7 +623,11 @@ def _mentions(exc: Exception, word: str) -> bool:
 
 
 def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel]:
-    """The (triage, analysis) models for the configured provider; ConfigError says what's missing."""
+    """The (triage, analysis) models for the configured provider; ConfigError says what's missing.
+
+    Each step's reasoning effort is LLM_TRIAGE_REASONING_EFFORT / LLM_ANALYSIS_REASONING_EFFORT, else
+    LLM_REASONING_EFFORT. The two steps share one model object when both the name and the effort match.
+    """
     provider = settings.provider
     if provider == "azure":
         if not settings.foundry_endpoint:
@@ -601,7 +648,19 @@ def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel]:
         factory = AnthropicChatModel if provider == "anthropic" else OpenAIChatModel
     else:
         raise ConfigError(f"Unknown LLM_PROVIDER {provider!r}; use openai, azure or anthropic.")
-    triage_model = factory(settings, triage_name)
-    analysis_model = triage_model if analysis_name == triage_name else factory(settings, analysis_name)
-    log.debug("Using %s for triage and %s for analysis (%s).", triage_model.name, analysis_model.name, provider)
+    triage_settings = replace(settings, reasoning_effort=settings.triage_reasoning_effort or settings.reasoning_effort)
+    analysis_settings = replace(
+        settings, reasoning_effort=settings.analysis_reasoning_effort or settings.reasoning_effort
+    )
+    triage_model = factory(triage_settings, triage_name)
+    shared = analysis_name == triage_name and analysis_settings.reasoning_effort == triage_settings.reasoning_effort
+    analysis_model = triage_model if shared else factory(analysis_settings, analysis_name)
+    log.debug(
+        "Using %s (effort %s) for triage and %s (effort %s) for analysis (%s).",
+        triage_model.name,
+        triage_settings.reasoning_effort or "default",
+        analysis_model.name,
+        analysis_settings.reasoning_effort or "default",
+        provider,
+    )
     return triage_model, analysis_model

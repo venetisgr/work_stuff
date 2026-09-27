@@ -285,7 +285,7 @@ def test_cooldown_skips_a_recently_analysed_ticker_without_new_news():
 def test_cooldown_lets_a_ticker_through(created_hours_ago, cooldown_hours, fetched_hours_ago):
     impacts = [news(hours_ago=max(3, fetched_hours_ago), fetched_hours_ago=fetched_hours_ago)]
     last = make_opportunity(created=NOW - timedelta(hours=created_hours_ago), article_ids=[])
-    cfg = config(scan={"cooldown_hours": cooldown_hours, "lookback_hours": 48})
+    cfg = config(scan={"cooldown_hours": cooldown_hours, "lookback_hours": 48, "reanalyse_same_session_hours": 0})
 
     candidates, notes = select(impacts, FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": last}), cfg)
 
@@ -299,8 +299,9 @@ def test_news_the_last_analysis_never_saw_lifts_the_cooldown_even_if_fetched_bef
     seen = news(hours_ago=3)
     late = news(title="AMD CFO resigns amid accounting probe", hours_ago=2.5, fetched_hours_ago=2, magnitude=5)
     last = make_opportunity(created=NOW - timedelta(hours=2), article_ids=[seen[1].id])
+    cfg = config(scan={"reanalyse_same_session_hours": 0})  # a new session since isn't the point here
 
-    candidates, notes = select([late, seen], FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": last}))
+    candidates, notes = select([late, seen], FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": last}), cfg)
 
     assert [candidate.ticker for candidate in candidates] == ["AMD"] and notes == []
 
@@ -464,9 +465,7 @@ def test_weekend_news_is_labelled_as_not_yet_priced():
 
     assert candidate.news_after_session and notes == []
     assert candidate.dip_reasons[0] == "down 3.3% on Fri 25 Sep"
-    assert candidate.dip_reasons[-1] == (
-        "no trading since this news (last session Fri 25 Sep); the price has not reacted to it yet"
-    )
+    assert candidate.dip_reasons[-1] == "all of this news came out after the last session (Fri 25 Sep)"
 
     # News from before the close is what the drop may be reacting to: no label.
     before = make_article(title="Meta slides after Goldman cut", published=FRIDAY_CLOSE - timedelta(hours=2))
@@ -477,7 +476,7 @@ def test_weekend_news_is_labelled_as_not_yet_priced():
         config(),
         now=SUNDAY,
     )
-    assert not candidate.news_after_session and "no trading" not in " ".join(candidate.dip_reasons)
+    assert not candidate.news_after_session and "after the last session" not in " ".join(candidate.dip_reasons)
 
 
 def test_an_analysis_before_the_market_reacted_is_redone_after_the_first_session_moves():
@@ -523,3 +522,79 @@ def test_funds_and_indices_are_not_candidates():
     assert [candidate.ticker for candidate in candidates] == ["AMD"]
     assert notes == ["Not a company's shares (a fund, index or other instrument; marked invalid): SOXL"]
     assert ("SOXL", False, NOW) in store.marked
+
+
+# --- no trading since the last analysis ----------------------------------------------------------------------------
+
+
+def test_weekend_news_on_friday_prices_re_analyses_at_most_every_12_hours():
+    """Regression (critic's weekend_repeat): four Sunday cycles, each with one follow-up article about ALWN.AT, ran
+    four strong-model analyses in 15 minutes against the same Friday price."""
+    friday = make_stats(ticker="ALWN.AT", as_of=FRIDAY_CLOSE, timezone="Europe/Athens", change_1d_pct=-3.3)
+    first = make_article(title="Allwyn warns on profit", published=SUNDAY - timedelta(hours=3))
+    last = make_opportunity(ticker="ALWN.AT", created=SUNDAY - timedelta(hours=2), stats=friday, article_ids=[first.id])
+    follow_up = make_article(title="Allwyn warning: analysts react", published=SUNDAY - timedelta(minutes=20))
+    impacts = [(make_impact(ticker="ALWN.AT", article_id=a.id), a) for a in (follow_up, first)]
+
+    def select_at(now, stats=friday, previous=last):
+        store = FakeStore(last={"ALWN.AT": previous})
+        return select_candidates(impacts, FakePrices({"ALWN.AT": stats}), store, config(), now=now)
+
+    candidates, notes = select_at(SUNDAY)
+    assert candidates == []
+    assert notes == [
+        "Already analysed on the latest session's prices, so new news waits for the next session or 12h after that "
+        "analysis ([scan] reanalyse_same_session_hours): ALWN.AT (analysed 2.0h ago, session Fri 25 Sep)"
+    ]
+
+    # 12 hours after that analysis the waiting news is analysed, still on Friday's prices.
+    [candidate], _ = select_at(SUNDAY + timedelta(hours=10, minutes=1))
+    assert candidate.impacts[0][1] == follow_up
+
+    # A new session lifts the wait at once.
+    monday = replace(friday, as_of=datetime(2026, 9, 28, 7, 45, tzinfo=UTC), change_1d_pct=-1.0)
+    [candidate], _ = select_at(datetime(2026, 9, 28, 8, 0, tzinfo=UTC), stats=monday)
+    assert candidate.ticker == "ALWN.AT"
+
+    # So does a further fall of [dip] min_drop_1d_pct while the session is still running.
+    lower = replace(friday, price=friday.price * 0.96)
+    [candidate], _ = select_at(SUNDAY, stats=lower)
+    assert candidate.ticker == "ALWN.AT"
+
+    # And 0 turns the limit off.
+    store = FakeStore(last={"ALWN.AT": last})
+    cfg = config(scan={"reanalyse_same_session_hours": 0})
+    [candidate], _ = select_candidates(impacts, FakePrices({"ALWN.AT": friday}), store, cfg, now=SUNDAY)
+    assert candidate.ticker == "ALWN.AT"
+
+
+def test_the_same_news_on_the_same_prices_is_not_analysed_again_after_the_cooldown():
+    friday = make_stats(as_of=FRIDAY_CLOSE, timezone=NEW_YORK, change_1d_pct=-5.0)
+    article = make_article(published=FRIDAY_CLOSE - timedelta(hours=2))
+    last = make_opportunity(created=FRIDAY_CLOSE + timedelta(hours=1), stats=friday, article_ids=[article.id])
+    saturday = FRIDAY_CLOSE + timedelta(hours=26)  # the 24h cooldown is over, nothing else changed
+
+    candidates, notes = select_candidates(
+        [(make_impact(article_id=article.id), article)],
+        FakePrices({"AMD": friday}),
+        FakeStore(last={"AMD": last}),
+        config(),
+        now=saturday,
+    )
+
+    assert candidates == []
+    assert notes == [
+        "Nothing new since the last analysis (the same news, no trading since), waiting for the next session: AMD "
+        "(analysed 25.0h ago, session Fri 25 Sep)"
+    ]
+
+    # Without a cooldown, trading since the last analysis (later in the same session) is reason enough.
+    later = replace(friday, as_of=FRIDAY_CLOSE + timedelta(minutes=1))
+    [candidate], _ = select_candidates(
+        [(make_impact(article_id=article.id), article)],
+        FakePrices({"AMD": later}),
+        FakeStore(last={"AMD": last}),
+        config(scan={"cooldown_hours": 0}),
+        now=FRIDAY_CLOSE + timedelta(hours=2),
+    )
+    assert candidate.ticker == "AMD"

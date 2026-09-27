@@ -41,7 +41,7 @@ the scores mean anything. Step 5 stays with you. Nothing here verifies the claim
         │  filters: [universe], [dip] news rules, 24 h cooldown, Yahoo Finance prices
         │  dip = down ≥3% on the day, or ≥6% over 5 days, or ≥10% below the 20-day high
         ▼
- analysis (stronger model, one request per candidate, at most 8 per cycle)
+ analysis (stronger model, one request per candidate, at most 8 per cycle and 40 a day)
         │  input: price statistics + SEC quarterly figures (US) + flagged news + per-ticker headlines
         │  output: verdict (temporary fear / mixed / fundamental / unclear), P(higher in 6 months),
         │          potential low, entry (limit buy), target (limit sell), fear, thesis, risks, checks
@@ -110,12 +110,16 @@ The settings you are most likely to change in `scanner.toml`:
 | `[scan] interval_minutes` | 5 | Minutes between cycles in `watch`. |
 | `[scan] max_candidates_per_cycle` | 8 | Analyses per cycle; the rest wait for the next cycle (bounds the LLM bill). |
 | `[scan] cooldown_hours` | 24 | A ticker isn't analysed again within this time unless news arrives that the last analysis didn't see, or that analysis came before any trading on its news (weekend news) and the next session moved. |
+| `[scan] reanalyse_same_session_hours` | 12 | Until a new session has traded since a ticker's last analysis (news in the evening, at the weekend or later the same day), new news analyses it again at most this often; the rest waits for the next session, and the same news on the same prices is never analysed twice. A further fall of `min_drop_1d_pct` lifts the wait. 0 turns it off. |
+| `[scan] max_analyses_per_day` | 40 | Analyses in any 24 hours, all tickers together; candidates over it are named in the notes and wait for room (0 = no limit). |
 | `[dip] min_drop_1d_pct` / `min_drop_5d_pct` / `min_drawdown_20d_pct` | 3 / 6 / 10 | What counts as a dip (any one is enough). |
 | `[dip] min_magnitude`, `directions`, `include_indirect` | 2, negative + mixed, true | Which news can make a company a candidate. |
 | `[universe] watchlist` | none | Tickers that skip the magnitude and relation filters (any negative or mixed news of magnitude 1 or more, direct or indirect). They still need a dip. |
 | `[universe] allowed_suffixes` | all | Exchanges by Yahoo suffix: `""` US, `.DE` Xetra, `.PA` Paris, `.AT` Athens... |
 | `[alerts] min_score`, `min_probability`, `verdicts` | 65, 60, temporary fear + mixed | What gets sent as an alert. Everything is in the reports. In practice the score is what binds, and 65 is rarely reached by a "mixed" verdict (see [Scoring](#scoring)). |
 | `[alerts] repeat_hours`, `min_score_change` | 24, 10 | A ticker alerted within `repeat_hours` isn't alerted again unless the score rose by `min_score_change`, the verdict changed or the price fell by another `min_drop_1d_pct`. |
+| `[alerts] system_notices` | true | Tell you through the same channels when the scanner stopped or can't work (see [Running it every 5 minutes](#running-it-every-5-minutes)). |
+| `[alerts] notice_after_cycles` | 6 | Cycles in a row with the model unavailable, or every feed failing, before such a notice. |
 
 Tickers are Yahoo Finance symbols: `AMD`, `BRK-B`, `SAP.DE`, `ASML.AS`, `OPAP.AT`, `7203.T`, `0700.HK` (in the
 watchlist and exclude lists `BRK.B` or `NASDAQ:TSLA` work too). Only company shares become candidates: ETFs, funds
@@ -127,8 +131,8 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 
 | Command | What it does | Needs a model |
 |---|---|---|
-| `dip-scanner run [--no-notify]` | One cycle; prints a summary, notes on what was skipped and why, and the report's path. | yes |
-| `dip-scanner watch [--interval MIN] [--no-notify]` | Cycles on the interval until Ctrl+C. | yes |
+| `dip-scanner run [--no-notify]` | One cycle; prints a summary, the day's model use, notes on what was skipped and why, and the report's path. | yes |
+| `dip-scanner watch [--interval MIN] [--no-notify]` | Cycles on the interval until Ctrl+C; each logs a summary ending with the day's model use. | yes |
 | `dip-scanner feeds [--check]` | Lists the feeds and how their last fetch went; `--check` fetches each one now. | no |
 | `dip-scanner news [--hours 24] [--ticker T]` | The news digest ("newsletter"): companies with negative news first, then the other headlines. | no |
 | `dip-scanner analyze TICKER [--no-save]` | Analyses one ticker now, whatever its price did and ignoring the cooldown. | yes |
@@ -143,7 +147,8 @@ Options for every command: `-v` (debug logging), `--env-file PATH`, `--config PA
 
 Everything goes to `data/` (or `DATA_DIR`):
 
-- `scanner.sqlite3`: articles (kept 30 days), company impacts, feed state and every opportunity (kept for good).
+- `scanner.sqlite3`: articles (kept 30 days), company impacts, feed state, every model call with its tokens (kept
+  30 days) and every opportunity (kept for good).
 - `reports/YYYY-MM-DD/HHMMSS-opportunities.md`, `.html` and `.json`, written by each cycle that found something,
   plus `reports/latest.md` and `latest.html`. The HTML is a single email-safe file. Its score badges use the same
   bands as the track record: 80+ strong, 65-80 good, 50-65 fair, under 50 weak.
@@ -211,6 +216,12 @@ above the 90% the model is told not to exceed. So with the defaults only confide
 `min_score = 55` if you want mixed verdicts too (mixed, high confidence, 80%, reward_risk 0.3 scores 55.2).
 `min_probability` only matters when the upside is over about 3.5 times the downside.
 
+Listings outside the US (Athens, Xetra, Paris...) get no fundamentals: they come from SEC filings only. The model is
+told that this is expected for such a listing and to judge its confidence on the news and the price data, not to
+lower it because figures are missing. Otherwise they could hardly ever alert: "low" confidence multiplies the score by
+0.85, and then even a 90% chance with a reward/risk of 0.43 scores 64.5. Their verdicts still rest on less
+information, so read the company's latest report before acting on one.
+
 Before scoring, the model's numbers are checked and fixed where they contradict each other, with a warning in the
 report: the probability is clamped to 0-100; a potential low at or above the price becomes the lower of the
 statistical 6-month low and 97% of the price, and one below 30% of the price is raised to that; the entry is clamped
@@ -236,12 +247,20 @@ provider's current prices.
   million input tokens a day for triage, most of it the fixed prompt repeated every cycle; a longer
   `interval_minutes` cuts it about proportionally (15 minutes: about 96 requests a day).
 - **Analysis**: one request per candidate, about 3,500 input tokens (price block, fundamentals, up to 12,000
-  characters of news) and a reply of 500-1,000 tokens. Every new qualifying article about a ticker triggers another
-  analysis (its alert is only repeated when something material changed), so a busy story costs one analysis per
-  new article, up to `max_candidates_per_cycle` per cycle. Expect a handful to a few dozen a day.
+  characters of news) and a reply of 500-1,000 tokens. A new qualifying article about a ticker analyses it again
+  (its alert is only repeated when something material changed), up to `max_candidates_per_cycle` per cycle. Until
+  a new session has traded (evenings, weekends, later the same day) that happens at most every
+  `reanalyse_same_session_hours` (12) unless the price fell further, and `max_analyses_per_day` (40) caps the day,
+  so a busy news day can't run up the bill. Expect a handful to a few dozen a day.
 - **Total**: roughly 0.25-0.6 million input tokens a day. With a small model for triage this usually costs
-  well under a few dollars a day. Reasoning models also bill their thinking as output tokens;
-  `LLM_REASONING_EFFORT=low` keeps that down.
+  well under a few dollars a day. Reasoning models also bill their thinking as output tokens: set
+  `LLM_TRIAGE_REASONING_EFFORT=low` (triage only maps headlines to companies, all day long), and
+  `LLM_ANALYSIS_REASONING_EFFORT` or `LLM_REASONING_EFFORT` if you want the analysis cheaper too.
+
+Every summary line of `run` and `watch` ends with the day's use so far (calls and tokens in and out, since 00:00
+UTC), and `run` also prints it per step and model: multiply by your provider's prices to see what the day cost. The
+token counts are what the service reported, reasoning included; a gateway that reports none shows "without token
+counts".
 
 Feeds, Yahoo Finance and SEC data cost nothing, but be polite: the defaults poll each feed once per cycle with
 conditional requests, and SEC requests are spaced out to at most 5 a second.
@@ -256,7 +275,20 @@ dip-scanner watch
 
 Cycles start on the interval's boundaries (:00, :05, :10...), each logs one summary line, a failed cycle is logged
 and the next one runs as usual, and Ctrl+C stops it cleanly. Bad credentials or configuration stop it with exit code
-2.
+2 (and a notice, see below).
+
+**Nobody watching?** An unattended scanner tells you through the alert channels (email, Slack, Discord, Telegram,
+webhook) when it can't do its job, so a quiet week means a quiet market and not a dead scanner:
+
+- "dip-scanner stopped: ..." when `run` or `watch` stops on a setup problem: a rejected or revoked key, no credit
+  left (`insufficient_quota`, a spend limit), an unknown model, a broken setting;
+- "the language model has been unavailable for 6 cycles" when it couldn't be reached, kept throttling or refused
+  every request for `[alerts] notice_after_cycles` cycles in a row;
+- "every feed has failed for 6 cycles" when no news came in at all (usually the network).
+
+Each kind is sent at most once every 12 hours; the times are kept in the database, so a cron job running every 5
+minutes doesn't repeat it either. Notices never contain keys, passwords, tokens or webhook URLs. They need a
+configured channel and are off with `--no-notify` or `[alerts] system_notices = false`.
 
 **cron** (Linux), one cycle per run, with `flock` so a slow cycle doesn't overlap the next:
 
@@ -293,7 +325,9 @@ you log out of, or it stops when you disconnect and doesn't start after a reboot
 **Windows Task Scheduler**: create a task that runs every 5 minutes, with the program
 `C:\path\to\news-dip-scanner\.venv\Scripts\dip-scanner.exe`, arguments `run`, and "Start in" set to
 `C:\path\to\news-dip-scanner` (so `.env`, `scanner.toml` and `data\` are found). Under Settings, choose "Do not start
-a new instance" if the task is already running. Or run `dip-scanner watch` in a terminal that stays open.
+a new instance" if the task is already running. Or run `dip-scanner watch` in a terminal that stays open. With cron
+and Task Scheduler the output goes where nobody looks, so set up at least one notification channel: the system
+notices above are how you learn that the runs stopped working.
 
 ## Track record
 
@@ -338,15 +372,17 @@ your open orders against them is still yours to do.
 - **Fundamentals are US-only** (SEC XBRL). IFRS filers usually have annual figures only; other listings get none.
   Of a company's us-gaap and ifrs-full facts the fresher set is used (companies that moved to IFRS keep their old
   US GAAP facts), proxy statements are ignored (their pay-versus-performance tables restate net income, rounded),
-  and 12-16-week quarters of retail calendars count. Figures whose newest period is over 18 months old carry a note.
+  and 12-16-week quarters of retail calendars count. Figures whose newest period is over 18 months old carry a note,
+  and so does a newest quarter that ended over 200 days ago ("a later one may be missing").
 - **Triage makes mistakes**: wrong tickers, missed indirect effects, stories about a company's stock price mistaken
   for news about the company. A reused ticker can point at a different company. Check the ticker before acting.
 - **Some feeds are noisy** (Google News queries, general business news): triage filters them out, at some token
   cost. Google News links are redirects. The per-ticker context headlines for an analysis keep only items that name
   the company or its symbol and are at most 30 days old.
 - **News after the close.** A dip is often matched with news that came out after the last session (evenings,
-  weekends): the drop can't be a reaction to it. Such candidates say "no trading since this news", the model is
-  told to compare the dates, and the first session after the news can end the cooldown if it moves.
+  weekends): the drop can't be a reaction to it, unless the article only reports an earlier event or the drop itself.
+  Such candidates say "all of this news came out after the last session (Fri 25 Sep)", the model is told to compare
+  the dates, and the first session after the news can end the cooldown if it moves.
 - The same headline (at least five words) seen again within 72 hours, from any feed, is kept once; short formulaic
   headlines ("Trading update") and SEC 8-K filings are always new. Machine translations of press releases are
   dropped, and a headline's trailing " - Publisher" only goes when it names a publisher.
@@ -378,6 +414,9 @@ money:
 | `sec-8k-filings` fails or is skipped | Set `SEC_USER_AGENT` to your name and email. |
 | A feed fails in `feeds --check` | Some sites block cloud IP addresses; feeds.toml notes the ones known to. Switch it off or use an alternate. |
 | `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know; it is rechecked after 7 days. |
+| `Daily limit of 40 analyses reached ...` in the notes | `[scan] max_analyses_per_day` was used up in the last 24 hours; the named candidates are analysed once there is room. Raise it, or set 0 for no limit, if the bill allows. |
+| `Already analysed on the latest session's prices, so new news waits ...` | More news (often in the evening or at the weekend) about a ticker analysed on the same session's prices; it is analysed after the next session, 12 hours after the last analysis (`[scan] reanalyse_same_session_hours`) or when the price falls by another `min_drop_1d_pct`. |
+| A "dip-scanner stopped" notice | The reason is in it (the same message `run` prints). Fix that setting; `dip-scanner run --no-notify` checks it. |
 | `Analysis of X failed ...` | The model refused, was filtered, or its reply was unusable even after a corrective retry. That ticker waits 30 minutes, then 1 h, 2 h... up to a day before it is tried again. |
 | Throttling (429) | Raise `interval_minutes`, lower `triage_batch_size` or `max_candidates_per_cycle`, or raise your quota. |
 | SSL certificate errors on a corporate network | The tool trusts the operating system's certificates. If your proxy's root certificate isn't installed there, point `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at a bundle that includes it. |
@@ -400,13 +439,14 @@ without sleeping.
 | `cli.py` | Commands, options, exit codes |
 | `pipeline.py` | One cycle, the watch loop, manual analysis |
 | `feeds.py` | Fetching and parsing RSS/Atom, link and headline normalisation, per-ticker news |
-| `store.py` | SQLite: feed state, articles, impacts, ticker validity, opportunities |
+| `store.py` | SQLite: feed state, articles, impacts, ticker validity, opportunities, model calls, notice times |
 | `triage.py` / `prompts.py` | News to affected companies (batched), and all prompt text |
 | `prices.py` | Yahoo Finance chart API and the price statistics |
 | `fundamentals.py` | SEC XBRL company facts (US filers) |
 | `detect.py` | Dip rules, severity and candidate selection |
 | `analyze.py` | The fear-vs-fundamentals analysis, number checks and the score |
 | `report.py` / `notify.py` | Markdown/HTML/JSON reports, the news digest, and alerts |
+| `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing), rate-limited and scrubbed |
 | `track.py` | The track record |
 | `llm.py` | OpenAI, Azure AI Foundry and Anthropic chat models, JSON replies |
 | `config.py` / `models.py` | Settings and config files; the shared data types |

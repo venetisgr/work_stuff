@@ -127,7 +127,7 @@ class YahooPrices:
         if cached is not None and 0 <= (now - cached[0]).total_seconds() < self.cache_seconds:
             return cached[1]
         meta, bars = self.chart(symbol)
-        stats = compute_stats(symbol, meta, bars)
+        stats = compute_stats(symbol, meta, bars, now=now)
         if now - stats.as_of > STALE_AFTER:
             raise PriceError(
                 f"{symbol} hasn't traded since {stats.as_of:%Y-%m-%d} according to Yahoo Finance "
@@ -290,7 +290,7 @@ def range_for(start: date, today: date) -> str:
     return next((name for name, span in _RANGES if span >= days), "max")
 
 
-def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
+def compute_stats(ticker: str, meta: dict, bars: list[PriceBar], *, now: datetime | None = None) -> PriceStats:
     """PriceStats from chart meta and daily bars (needs at least 21 bars, else PriceError).
 
     The latest session is the exchange-local day of regularMarketTime. Its close is the live price (regularMarketPrice)
@@ -300,9 +300,9 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     rows Yahoo sometimes adds for a holiday) are ignored.
 
     volume_ratio compares the latest session's volume with the average of the 20 before it. While the session is
-    still running (regularMarketTime inside meta.currentTradingPeriod.regular), the latest bar only holds the volume
-    so far, so the average is pro-rated to the share of the session that has passed (at least MIN_SESSION_SHARE),
-    and session_elapsed says how far the session was.
+    still running (now and regularMarketTime both inside meta.currentTradingPeriod.regular), the latest bar only
+    holds the volume so far, so the average is pro-rated to the share of the session that has passed (at least
+    MIN_SESSION_SHARE), and session_elapsed says how far the session was. Without now the session counts as over.
     """
     bars = sorted(bars, key=lambda bar: bar.day)
     if len(bars) < MIN_BARS:
@@ -336,7 +336,7 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     low_52w = min(low_52w, price)
     volatility = _volatility_pct(closes[-(VOLATILITY_RETURNS + 1) :])
     base_volume = statistics.fmean(bar.volume for bar in before[-VOLUME_SESSIONS:])
-    elapsed = _session_elapsed(meta, market_time) if latest is not None else None
+    elapsed = _session_elapsed(meta, market_time, now) if latest is not None else None
     volume_ratio = None
     if latest is not None and base_volume > 0:
         share = 1.0 if elapsed is None else max(MIN_SESSION_SHARE, elapsed)
@@ -373,18 +373,21 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     )
 
 
-def _session_elapsed(meta: dict, market_time: Any) -> float | None:
-    """The share of the regular session that had passed at market_time, or None when it wasn't during the session.
+def _session_elapsed(meta: dict, market_time: Any, now: datetime | None) -> float | None:
+    """The share of the regular session that had passed at market_time, or None when no session is running.
 
-    After the close (and on weekends) currentTradingPeriod can describe the last or the next session, so only a
-    quote time strictly inside [start, end) counts as a session in progress.
+    After the close (and on weekends) currentTradingPeriod can still describe the last session, and on exchanges
+    like Athens the last trade comes a few minutes before its end: a Friday 14:17 quote inside a 07:30-14:20 period
+    must not look like a running session on Sunday. So both the quote time and now have to be inside [start, end).
     """
     period = meta.get("currentTradingPeriod")
     regular = period.get("regular") if isinstance(period, dict) else None
-    if not isinstance(regular, dict) or not _is_number(market_time):
+    if not isinstance(regular, dict) or not _is_number(market_time) or now is None:
         return None
     start, end = regular.get("start"), regular.get("end")
     if not (_is_number(start) and _is_number(end)) or end <= start or not start <= market_time < end:
+        return None
+    if not start <= utc(now).timestamp() < end:  # the session in the quote is over (or the clock is off)
         return None
     return (market_time - start) / (end - start)
 

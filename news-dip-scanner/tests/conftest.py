@@ -19,6 +19,7 @@ from typing import Any
 import requests
 from requests.structures import CaseInsensitiveDict
 
+from dip_scanner.llm import Usage
 from dip_scanner.models import Analysis, Article, Candidate, Impact, Opportunity, PriceBar, PriceStats
 
 NOW = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
@@ -35,11 +36,15 @@ class FakeChatModel:
     - a str or dict: the same reply every time;
     - a list/tuple: replies used in order (AssertionError when they run out).
     A reply that is a dict or list is sent as JSON text; an exception (instance or class) is raised instead.
+    usage (input tokens, output tokens), when given, is what last_usage reports after every reply, like the real
+    models; an exception leaves last_usage None (the service never answered).
     """
 
-    def __init__(self, replies: Any = None, *, name: str = "fake-model"):
+    def __init__(self, replies: Any = None, *, name: str = "fake-model", usage: tuple[int, int] | None = None):
         self.name = name
         self.calls: list[tuple[str, str, bool]] = []
+        self.last_usage: Usage | None = None
+        self._usage = usage
         self._lock = threading.Lock()
         self._fn: Callable[[str, str, bool], Any] | None = None
         self._constant: Any = None
@@ -56,6 +61,7 @@ class FakeChatModel:
         return [prompt for _, prompt, _ in self.calls]
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str:
+        self.last_usage = None
         with self._lock:
             self.calls.append((system, prompt, json_mode))
             if self._queue is not None:
@@ -68,6 +74,8 @@ class FakeChatModel:
                 reply = self._constant
         if _is_exception(reply):
             raise reply
+        if self._usage is not None:
+            self.last_usage = Usage(*self._usage)
         if isinstance(reply, dict | list):
             return json.dumps(reply)
         return reply

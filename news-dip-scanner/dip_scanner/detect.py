@@ -164,10 +164,15 @@ def select_candidates(
     7. Instruments that aren't company shares (Yahoo's instrumentType ETF, MUTUALFUND, INDEX...) are skipped and
        marked invalid; so are prices below [universe] min_price (in the currency's main unit: pence, cents and
        agorot quotes are divided by 100) and prices that don't pass dip_reasons.
+    8. Same session: until a newer session has traded since the ticker's last analysis (evening or weekend news on
+       the last close, more news later the same day), news that analysis didn't see re-analyses it at most once
+       every [scan] reanalyse_same_session_hours, and the same news on the same prices isn't analysed again (see
+       _same_session).
     The rest become candidates, sorted by severity; those beyond [scan] max_candidates_per_cycle are left for the
     next cycle and named in a note. When every qualifying article came out after the latest session in the price
-    data (news after the close or at the weekend), the drop can't be a reaction to it: the candidate is marked
-    news_after_session and its reasons say that the price hasn't reacted yet.
+    data (news after the close or at the weekend), the drop can't be a reaction to it, unless the news only reports
+    an earlier event or the drop itself: the candidate is marked news_after_session and its reasons say that all of
+    this news came out after the last session.
     """
     now = utc(now)
     scan, dip, universe = cfg.scan, cfg.dip, cfg.universe
@@ -215,7 +220,8 @@ def select_candidates(
         qualifying.sort(key=lambda pair: (utc(pair[1].published), utc(pair[1].fetched)), reverse=True)
 
         stats: PriceStats | None = None
-        last = store.last_opportunity(ticker) if scan.cooldown_hours > 0 else None
+        wanted = scan.cooldown_hours > 0 or scan.reanalyse_same_session_hours > 0
+        last = store.last_opportunity(ticker) if wanted else None
         if (cooldown := _cooldown(ticker, qualifying, last, scan.cooldown_hours, now)) is not None:
             reacted = False
             if last is not None and last.news_after_session:  # analysed before its news could move the price
@@ -250,12 +256,12 @@ def select_candidates(
         if not reasons:
             notes.add("No dip (price not down enough)", f"{ticker} ({_moves(stats)})")
             continue
+        if (wait := _same_session(ticker, stats, last, qualifying, cfg, now)) is not None:
+            notes.add(*wait)
+            continue
         unpriced = news_after_session(stats, qualifying)
         if unpriced:
-            reasons.append(
-                f"no trading since this news (last session {session_day(stats):%a %d %b}); the price has not "
-                "reacted to it yet"
-            )
+            reasons.append(f"all of this news came out after the last session ({session_day(stats):%a %d %b})")
         candidates.append(
             Candidate(
                 ticker=ticker,
@@ -343,6 +349,54 @@ def _cooldown(
             return None
     ago = max(0.0, (now - created).total_seconds() / 3600)
     return f"{ticker} (analysed {ago:.1f}h ago)"
+
+
+def _same_session(
+    ticker: str,
+    stats: PriceStats,
+    last: Opportunity | None,
+    impacts: list[tuple[Impact, Article]],
+    cfg: ScannerConfig,
+    now: datetime,
+) -> tuple[str, str] | None:
+    """(note reason, note item) while the ticker's last analysis was made on the same session's prices, else None.
+
+    Until a newer session trades (evening or weekend news on the last close, or more news later in the same session):
+    - news the last analysis didn't see analyses the ticker again at most once every [scan]
+      reanalyse_same_session_hours; until then it waits, and is picked up after the next session or that time;
+    - without such news (the cooldown ran out) and with nothing traded since, the same news on the same prices isn't
+      analysed again at all.
+    Nothing waits when the price fell by another [dip] min_drop_1d_pct since the last analysis (it was made while the
+    session was running), or when reanalyse_same_session_hours is 0.
+    """
+    hours = cfg.scan.reanalyse_same_session_hours
+    if last is None or hours <= 0 or session_day(stats) != session_day(last.stats):
+        return None
+    further = 1 - cfg.dip.min_drop_1d_pct / 100
+    if last.stats.currency == stats.currency and stats.price <= last.stats.price * further + _EPSILON:
+        return None
+    created = utc(last.created)
+    ago = max(0.0, (now - created).total_seconds() / 3600)
+    item = f"{ticker} (analysed {ago:.1f}h ago, session {session_day(stats):%a %d %b})"
+    analysed = set(last.article_ids)
+    unseen = any(
+        article.id not in analysed if analysed else max(utc(article.published), utc(article.fetched)) > created
+        for _, article in impacts
+    )
+    if not unseen:
+        if utc(stats.as_of) <= utc(last.stats.as_of):  # nothing has traded since: the very same inputs
+            return (
+                "Nothing new since the last analysis (the same news, no trading since), waiting for the next session",
+                item,
+            )
+        return None
+    if created > now - timedelta(hours=hours):
+        return (
+            "Already analysed on the latest session's prices, so new news waits for the next session or "
+            f"{_hours(hours)} after that analysis ([scan] reanalyse_same_session_hours)",
+            item,
+        )
+    return None
 
 
 def _stats(ticker: str, prices: YahooPrices, store: Store, notes: _Notes, now: datetime) -> PriceStats | None:

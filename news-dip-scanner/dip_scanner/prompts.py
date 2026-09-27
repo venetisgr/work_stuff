@@ -105,10 +105,12 @@ a failed trial of a key drug, heavy dilution, a debt or liquidity problem, a key
 heavy volume, in a stock that was healthy before, leans towards overreaction. A small drop on news that removes a \
 large part of future profit means the market may not have finished repricing. Compare the move with the stock's \
 normal volatility: a 3% day in a stock with 60% annual volatility is noise. Compare the news dates with the time \
-of the prices ("as of"): news that came out after the last session can't explain a drop in it. Then the market has \
-not reacted to that news yet; say so, and treat the earlier drop as unexplained by it (often "unclear").
+of the prices ("as of"). An article that came out after the last session either reports something new, which the \
+market has not traded on yet (say so, and don't treat the earlier drop as a reaction to it; often "unclear"), or \
+looks back at an earlier event or at the drop itself, which the drop may well be reacting to.
 4. Use the fundamentals, if given, to judge whether the business was healthy before the news (growth, margins, \
-profitability, cash flow). If they are missing, do not assume them: say what to look up in checks.
+profitability, cash flow). If they are missing, do not assume them: say what to look up in checks. They come only \
+from US SEC filings, so listings outside the US never have them; that is expected, not a weakness of the case.
 5. List what could still go wrong (risks) and what could lift the price (catalysts). Mention dates only if the input \
 gives them; otherwise use generic ones such as "next quarterly results".
 
@@ -134,7 +136,9 @@ Close to today's price when a quick recovery is likely; lower when more selling 
 It must be above entry_price. Base it on where the stock traded before the drop (the 20-day high, the moving \
 averages) and how much the fundamentals changed; it can be below today's price when the verdict is "fundamental".
 - confidence ({_choices(CONFIDENCES)}): how far you trust your own verdict given the quality and amount of \
-information. "high" only with clear news and supporting data; "low" when the news is thin or data is missing.
+information. "high" only with clear news and supporting price or fundamental data; "low" when the news is thin or \
+contradictory, or data the verdict depends on is missing. For a listing outside the US, judge confidence on the news \
+and the price data: don't lower it because there are no fundamentals.
 - fear (1-2 sentences), fundamental_impact (whether and how revenue, margins, balance sheet or moat are really \
 affected, 1-3 sentences), thesis (why the price should or should not be higher in 6 months, 2-4 sentences).
 - risks, catalysts, checks: lists of up to 5 short strings each. checks are concrete things the investor should \

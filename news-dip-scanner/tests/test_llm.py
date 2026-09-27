@@ -20,6 +20,7 @@ from dip_scanner.llm import (
     LLMSetupError,
     LLMUnavailableError,
     OpenAIChatModel,
+    Usage,
     build_models,
     complete_json,
     deployment_from_endpoint,
@@ -327,6 +328,33 @@ def test_openai_keeps_a_truncated_reply_with_a_warning(caplog):
     assert "output token limit" in caplog.text
 
 
+def test_openai_reports_the_tokens_of_every_answered_call():
+    model = openai_model(Recorder(completion()))
+    assert model.last_usage is None
+    model.complete("s", "p")
+    assert model.last_usage == Usage(input_tokens=10, output_tokens=5)
+
+    # A reply that is unusable was still answered (and billed): its tokens are kept.
+    filtered = openai_model(Recorder(completion("", "content_filter")))
+    with pytest.raises(LLMError):
+        filtered.complete("s", "p")
+    assert filtered.last_usage == Usage(10, 5)
+
+    # A gateway that reports no usage: answered, tokens unknown.
+    body = completion()
+    del body["usage"]
+    model = openai_model(Recorder(body))
+    model.complete("s", "p")
+    assert model.last_usage == Usage(None, None)
+
+    # No reply at all: nothing was used, and the previous call's figures don't linger.
+    model = openai_model(Recorder(completion(), openai_error(500, None)))
+    model.complete("s", "p")
+    with pytest.raises(LLMUnavailableError):
+        model.complete("s", "p")
+    assert model.last_usage is None
+
+
 # --- Azure AI Foundry ----------------------------------------------------------------------------------------------
 
 
@@ -614,6 +642,29 @@ def test_anthropic_keeps_a_truncated_reply_with_a_warning(caplog):
     assert "output token limit" in caplog.text
 
 
+def test_anthropic_reports_the_tokens_with_cached_input_included():
+    body = message()
+    body["usage"] = {
+        "input_tokens": 40,
+        "output_tokens": 700,
+        "cache_creation_input_tokens": 1_000,
+        "cache_read_input_tokens": None,
+    }
+    model = anthropic_model(Recorder(body))
+    model.complete("s", "p")
+    assert model.last_usage == Usage(input_tokens=1_040, output_tokens=700)
+
+    refused = anthropic_model(Recorder(message(stop_reason="refusal")))
+    with pytest.raises(LLMError):
+        refused.complete("s", "p")
+    assert refused.last_usage == Usage(10, 5)  # declined, but answered
+
+    failing = anthropic_model(Recorder(anthropic_error(529, "overloaded_error")))
+    with pytest.raises(LLMUnavailableError):
+        failing.complete("s", "p")
+    assert failing.last_usage is None
+
+
 def test_anthropic_accepts_an_injected_client():
     class Messages:
         def __init__(self):
@@ -665,6 +716,25 @@ def test_build_models_honours_the_model_settings_and_shares_one_model_when_they_
 
     triage, analysis = build_models(openai_settings(triage_model="gpt-5", analysis_model="gpt-5"))
     assert triage is analysis
+
+
+def test_each_step_can_have_its_own_reasoning_effort():
+    recorder = Recorder(completion())
+    settings = openai_settings(
+        reasoning_effort="medium", triage_reasoning_effort="low", triage_model="gpt-5", analysis_model="gpt-5"
+    )
+    triage, analysis = build_models(settings)
+    assert triage is not analysis  # the same model name, but two efforts
+    for model, effort in ((triage, "low"), (analysis, "medium")):  # the analysis falls back to the shared one
+        model._client = model._client.with_options(http_client=recorder.client, max_retries=0)
+        model.complete("s", "p")
+        assert recorder.body["reasoning_effort"] == effort
+
+    triage, analysis = build_models(openai_settings(analysis_reasoning_effort="high"))
+    assert (triage._reasoning_effort, analysis._reasoning_effort) == (None, "high")
+
+    triage, analysis = build_models(anthropic_settings(reasoning_effort="low", analysis_reasoning_effort="max"))
+    assert (triage._effort, analysis._effort) == (None, "max")  # Haiku gets no effort at all
 
 
 def test_build_models_for_azure_uses_deployment_names():

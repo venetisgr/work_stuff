@@ -36,8 +36,9 @@ from .feeds import USER_AGENT, FeedResult, fetch_feed, needs_contact_user_agent,
 from .fundamentals import SecFundamentals
 from .llm import LLMError, LLMSetupError, build_models
 from .models import Feed, Opportunity, utc
+from .notices import STOPPED, one_line, scrub, secrets_of, send_notice, stopped_lines
 from .notify import build_notifiers
-from .pipeline import Scanner, thesis_change_line
+from .pipeline import Scanner, thesis_change_line, usage_lines
 from .prices import PriceError, PriceFetchError, YahooPrices
 from .report import render_html, render_markdown, render_news_digest
 from .store import Store
@@ -297,11 +298,54 @@ def _scanner(args: argparse.Namespace, settings: Settings, *, notify: bool, feed
         session.close()
 
 
+@contextmanager
+def _stop_notice(command: str, args: argparse.Namespace, settings: Settings, *, notify: bool) -> Iterator[None]:
+    """Sends a "dip-scanner stopped" notice to the alert channels when `run` or `watch` stops on a setup problem
+    (LLMSetupError or ConfigError), then lets the error through. Unattended runs otherwise fail where nobody looks.
+    At most one such notice every 12 hours (notices.py); none with --no-notify or [alerts] system_notices = false."""
+    try:
+        yield
+    except (LLMSetupError, ConfigError) as exc:
+        if notify:
+            what = "Configuration problem" if isinstance(exc, ConfigError) else "The language model can't be used"
+            _send_stop_notice(command, args, settings, f"{what}: {exc}")
+        raise
+
+
+def _send_stop_notice(command: str, args: argparse.Namespace, settings: Settings, reason: str) -> None:
+    secrets = secrets_of(settings)
+    try:
+        try:
+            enabled = _scanner_config(args).alerts.system_notices
+        except ConfigError:  # the broken config may be the very problem: tell the user anyway
+            enabled = True
+        if not enabled:
+            return
+        with make_session() as session:
+            notifiers = build_notifiers(settings.notify, session=session)
+            if not notifiers:
+                return
+            now = _now()
+            with open_store(settings) as store:
+                send_notice(
+                    notifiers,
+                    store,
+                    kind=STOPPED,
+                    subject=f"dip-scanner stopped: {one_line(reason, 150)}",
+                    lines=stopped_lines(command, one_line(reason), now),
+                    now=now,
+                    secrets=secrets,
+                )
+    except Exception as exc:  # the original error matters more; it is reported by main()
+        log.warning("Couldn't send a notice that dip-scanner stopped: %s", scrub(str(exc), secrets))
+
+
 # --- commands ------------------------------------------------------------------------------------------------------
 
 
 def _run(args: argparse.Namespace, settings: Settings) -> int:
-    with _scanner(args, settings, notify=not args.no_notify) as scanner:
+    notify = not args.no_notify
+    with _stop_notice("run", args, settings, notify=notify), _scanner(args, settings, notify=notify) as scanner:
         result = scanner.run_cycle()
     print(result.summary())
     for opp in sorted(result.opportunities, key=lambda opp: opp.score, reverse=True):
@@ -309,6 +353,10 @@ def _run(args: argparse.Namespace, settings: Settings) -> int:
         print(f"  {opp.ticker} ({opp.company}): score {opp.score:.1f}, {opp.analysis.verdict}{alert}")
     for previous, opp in result.thesis_changes:
         print(f"Thesis change: {thesis_change_line(previous, opp)}")
+    if result.usage_today:
+        print("Model use today (since 00:00 UTC):")
+        for line in usage_lines(result.usage_today):
+            print(f"  {line}")
     if result.notes:
         print("Notes:")
         for note in result.notes:
@@ -322,7 +370,8 @@ def _run(args: argparse.Namespace, settings: Settings) -> int:
 
 
 def _watch(args: argparse.Namespace, settings: Settings) -> int:
-    with _scanner(args, settings, notify=not args.no_notify) as scanner:
+    notify = not args.no_notify
+    with _stop_notice("watch", args, settings, notify=notify), _scanner(args, settings, notify=notify) as scanner:
         scanner.watch(interval_minutes=args.interval)
     return EXIT_OK
 

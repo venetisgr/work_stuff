@@ -345,7 +345,13 @@ def _triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -
 
 
 def triage(
-    model: ChatModel, store: Store, *, batch_size: int, max_attempts: int, now: datetime
+    model: ChatModel,
+    store: Store,
+    *,
+    batch_size: int,
+    max_attempts: int,
+    now: datetime,
+    on_stop: Callable[[str], None] | None = None,
 ) -> tuple[int, list[Impact]]:
     """Triage every pending article in the store; returns (articles triaged, impacts found).
 
@@ -357,7 +363,8 @@ def triage(
     refuses every request of the cycle the same way (an LLMRequestError for a whole batch before anything worked:
     a spend limit, a setting the model rejects), triage stops for this cycle and the remaining articles stay pending
     without using up attempts. LLMSetupError propagates: every call would fail. Any other exception (a bug, an odd
-    reply) counts as a failed batch.
+    reply) counts as a failed batch. on_stop, when given, is called with the reason when triage stops for the cycle
+    because the model can't be used (unreachable, throttling, or refusing every request).
     """
     batch_size = max(1, batch_size)
     triaged = 0
@@ -408,6 +415,8 @@ def triage(
                     "Stopped triage for this cycle: the model refused every request (%s); the articles stay pending.",
                     error,
                 )
+                if on_stop is not None:
+                    on_stop(f"the triage model refused every request: {error}")
                 break
             if failed:
                 left_pending += len(failed)
@@ -416,6 +425,8 @@ def triage(
                 log.warning("Triage failed for %d article(s) (%s): %s", len(failed), titles, error)
     except LLMUnavailableError as exc:
         log.warning("Stopped triage for this cycle, the remaining articles stay pending: %s", exc)
+        if on_stop is not None:
+            on_stop(f"the triage model is unavailable: {exc}")
     if triaged:
         log.info("Triaged %d article(s): %d company impact(s).", triaged, len(impacts))
     return triaged, impacts

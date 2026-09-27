@@ -38,6 +38,10 @@ FUNDAMENTAL_METRICS = (
 # Fundamentals whose newest period ended longer ago than this carry a warning (a 20-F filer's latest fiscal year can
 # legitimately be 12-16 months old, so the limit is above that).
 STALE_FUNDAMENTALS_DAYS = 548
+# A quarterly filer's newest quarter older than this means a later one is probably missing: a 10-Q is due 40-45 days
+# after the quarter and a 10-K 60-90 days after the year, so even the third quarter before a late 10-K is about 180
+# days old.
+STALE_QUARTER_DAYS = 200
 _METRIC_LABELS = {
     "revenue": "Revenue",
     "gross_profit": "Gross profit",
@@ -135,7 +139,8 @@ class PriceStats:
     # price * exp(-1.645 * (volatility_pct/100) * sqrt(0.5))
     stat_low_6m: float
     worst_6m_drawdown_pct: float  # worst peak-to-trough decline within any 126-session window of the history, <= 0
-    # The share (0..1) of the regular session that had passed when the quote was taken during it; None otherwise.
+    # The share (0..1) of the regular session that had passed at the quote, when that session was still running at
+    # the time of the price check; None otherwise (after the close, at weekends, before the open).
     session_elapsed: float | None = None
     timezone: str | None = None  # the exchange's IANA time zone (e.g. America/New_York), when Yahoo gives it
     instrument_type: str | None = None  # Yahoo's instrumentType: EQUITY, ETF, MUTUALFUND, INDEX...
@@ -195,7 +200,8 @@ class Fundamentals:
         Quarter growth is year over year (y/y) when the same quarter a year earlier is in the list, else quarter
         over quarter (q/q) against the previous quarter. Growth is left out when the earlier figure is zero or
         negative, because a percentage would be meaningless. Given today, a note warns when the newest period ended
-        more than STALE_FUNDAMENTALS_DAYS (about 18 months) earlier.
+        more than STALE_FUNDAMENTALS_DAYS (about 18 months) earlier, or else when the newest quarter ended more than
+        STALE_QUARTER_DAYS earlier (a later quarter may be missing).
         """
         header = (
             f"{self.ticker}: {self.entity} (SEC CIK {self.cik}). Amounts in {self.currency} millions except EPS; "
@@ -205,11 +211,16 @@ class Fundamentals:
             return f"{header}\nNo income statement figures were found in the SEC filings."
         lines = [header]
         newest = max(filter(None, (_period(row) for row in [*self.quarters, *self.annual])), default=None)
+        newest_quarter = max(filter(None, (_period(row) for row in self.quarters)), default=None)
         if today is not None and newest is not None and (today - newest).days > STALE_FUNDAMENTALS_DAYS:
-            months = (today.year - newest.year) * 12 + today.month - newest.month
             lines.append(
-                f"Note: the newest figures are for the period ending {newest:%Y-%m-%d}, about {months} months ago; "
-                "they may not reflect the business today."
+                f"Note: the newest figures are for the period ending {newest:%Y-%m-%d}, about "
+                f"{_months(newest, today)} months ago; they may not reflect the business today."
+            )
+        elif today is not None and newest_quarter is not None and (today - newest_quarter).days > STALE_QUARTER_DAYS:
+            lines.append(
+                f"Note: the newest quarter ends {newest_quarter:%Y-%m-%d}, about {_months(newest_quarter, today)} "
+                "months ago; a later one may be missing."
             )
         if self.quarters:
             lines += ["", "Quarters (newest first):", _table_header("Quarter ending")]
@@ -306,6 +317,18 @@ class Opportunity:
             id=data.get("id"),
             news_after_session=bool(data.get("news_after_session", False)),
         )
+
+
+@dataclass(frozen=True)
+class ModelUsage:
+    """The calls one model answered for one step (triage or analysis) over a period, with the tokens reported."""
+
+    step: str
+    model: str
+    calls: int
+    input_tokens: int  # the sum of the calls that reported tokens
+    output_tokens: int
+    unmetered: int = 0  # calls the service answered without token counts (their tokens aren't in the sums)
 
 
 @dataclass(frozen=True)
@@ -412,6 +435,10 @@ def _price(value: float) -> str:
 
 
 # --- Fundamentals.as_text helpers ---------------------------------------------------------------------------------
+
+
+def _months(earlier: date, later: date) -> int:
+    return (later.year - earlier.year) * 12 + later.month - earlier.month
 
 
 def _period(row: dict) -> date | None:

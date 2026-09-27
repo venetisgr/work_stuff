@@ -10,6 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import requests
 from conftest import (
     FakeChatModel,
     FakeResponse,
@@ -20,12 +21,12 @@ from conftest import (
     make_opportunity,
 )
 
-from dip_scanner.config import DipConfig, ScanConfig, ScannerConfig, Settings
+from dip_scanner.config import AlertConfig, DipConfig, ScanConfig, ScannerConfig, Settings
 from dip_scanner.fundamentals import SecFundamentals
 from dip_scanner.llm import LLMError, LLMSetupError, LLMUnavailableError
 from dip_scanner.models import Feed
 from dip_scanner.notify import NotifyError, WebhookNotifier
-from dip_scanner.pipeline import CycleResult, Scanner, alert_subject, seconds_until_next
+from dip_scanner.pipeline import CycleResult, Scanner, alert_subject, seconds_until_next, usage_lines
 from dip_scanner.prices import PriceError, YahooPrices
 from dip_scanner.report import render_markdown
 from dip_scanner.store import Store
@@ -262,7 +263,10 @@ def test_the_next_cycle_respects_the_cooldown_until_new_news_arrives(build):
     triage_model = FakeChatModel(triage_reply)
     analysis_model = FakeChatModel(ANALYSIS)
     notifier = FakeNotifier()
-    scanner = build(session=session, triage_model=triage_model, analysis_model=analysis_model, notifiers=[notifier])
+    config = ScannerConfig(scan=ScanConfig(reanalyse_same_session_hours=0))  # see the weekend test below
+    scanner = build(
+        session=session, triage_model=triage_model, analysis_model=analysis_model, notifiers=[notifier], config=config
+    )
     first = scanner.run_cycle(CYCLE)
 
     # Five minutes later the feeds list the same articles: nothing new, AMD is in its cooldown.
@@ -395,7 +399,7 @@ def test_news_triaged_a_cycle_late_ends_the_cooldown(build):
         feeds=FEEDS[:1],
         triage_model=FakeChatModel(triage_model_reply),
         analysis_model=analysis_model,
-        config=ScannerConfig(scan=ScanConfig(triage_batch_size=1, context_news=False)),
+        config=ScannerConfig(scan=ScanConfig(triage_batch_size=1, context_news=False, reanalyse_same_session_hours=0)),
     )
     first = scanner.run_cycle(CYCLE)
     assert first.triaged == 1 and len(first.opportunities) == 1
@@ -748,7 +752,10 @@ def test_a_developing_story_is_analysed_again_but_alerted_once(build):
     replies = {"probability": 75}
     analysis_model = FakeChatModel(lambda *_: {**ANALYSIS, "probability_up_6m": replies["probability"]})
     session = FakeSession(routes())
-    scanner = build(session=session, feeds=FEEDS[:1], analysis_model=analysis_model, notifiers=[notifier], config=QUIET)
+    config = ScannerConfig(scan=ScanConfig(context_news=False, reanalyse_same_session_hours=0))
+    scanner = build(
+        session=session, feeds=FEEDS[:1], analysis_model=analysis_model, notifiers=[notifier], config=config
+    )
     items = []
     for n in range(6):
         when = CYCLE + timedelta(minutes=5 * n)
@@ -865,3 +872,145 @@ def test_a_setup_error_mid_analysis_still_reports_and_alerts_what_was_found(buil
     )
     [(subject, _, _)] = notifier.sent
     assert subject == "Dip alert: AMD (score 68)"
+
+
+# --- model use, the daily analysis limit and system notices --------------------------------------------------------
+
+
+def test_every_model_call_is_stored_with_its_tokens_and_totalled_for_the_day(build, caplog):
+    triage_model = FakeChatModel(triage_reply, name="fake-triage", usage=(1_200, 150))
+    analysis_model = FakeChatModel(ANALYSIS, name="fake-analysis", usage=(3_500, 900))
+    scanner = build(triage_model=triage_model, analysis_model=analysis_model, config=QUIET)
+
+    with caplog.at_level(logging.INFO, logger="dip_scanner"):
+        result = scanner.run_cycle(CYCLE)
+
+    assert result.model_calls == 2
+    assert [(row.step, row.model, row.calls, row.input_tokens, row.output_tokens) for row in result.usage_today] == [
+        ("triage", "fake-triage", 1, 1_200, 150),
+        ("analysis", "fake-analysis", 1, 3_500, 900),
+    ]
+    assert result.summary().endswith("; model today: 2 calls, 4.7k tokens in, 1.1k out")
+    assert usage_lines(result.usage_today) == [
+        "triage with fake-triage: 1 call, 1.2k tokens in, 150 out",
+        "analysis with fake-analysis: 1 call, 3.5k tokens in, 900 out",
+    ]
+
+    # The next day starts from zero; yesterday's calls still count towards the last 24 hours.
+    tomorrow = CYCLE.replace(hour=0, minute=5) + timedelta(days=1)
+    assert scanner.run_cycle(tomorrow).usage_today == []
+    assert scanner.store.analyses_since(tomorrow - timedelta(hours=24)) == 1
+
+
+def test_calls_that_never_reached_the_model_are_not_counted(build):
+    scanner = build(analysis_model=FakeChatModel(LLMUnavailableError("overloaded (529)")), config=QUIET)
+    result = scanner.run_cycle(CYCLE)
+    assert [row.step for row in result.usage_today] == ["triage"]  # the fake triage answered, without token counts
+    assert result.summary().endswith("; model today: 1 call, 0 tokens in, 0 out (1 without token counts)")
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=1)) == 0  # an outage uses up no daily analyses
+
+
+def test_the_daily_analysis_limit_leaves_the_rest_for_later(build):
+    config = ScannerConfig(scan=ScanConfig(context_news=False, max_analyses_per_day=3))
+    analysis_model = FakeChatModel(ANALYSIS)
+    session = FakeSession({CHART_PREFIX: fixture_json("yahoo_chart_amd.json")})
+    scanner = build(session=session, feeds=[], analysis_model=analysis_model, config=config, sec_user_agent=None)
+    for hours_ago, ticker in ((30, "OLD"), (20, "X1"), (2, "X2")):  # two analyses in the last 24 hours
+        scanner.store.record_model_call(
+            when=CYCLE - timedelta(hours=hours_ago), step="analysis", model="gpt-5", ticker=ticker
+        )
+    for ticker, magnitude in (("BIG", 5), ("MID", 3), ("LOW", 2)):
+        seed(scanner, ticker, magnitude=magnitude)
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["BIG"] and result.candidates == 1
+    note = next(note for note in result.notes if note.startswith("Daily limit"))
+    assert note.startswith(
+        "Daily limit of 3 analyses reached ([scan] max_analyses_per_day; 2 in the last 24h), left for later: MID "
+    )
+    assert "LOW (severity" in note
+
+    # Once the analysis from 20 hours ago is more than a day old, the next one goes.
+    later = scanner.run_cycle(CYCLE + timedelta(hours=4, minutes=5))
+    assert [opp.ticker for opp in later.opportunities] == ["MID"]
+
+    # 0 means no limit.
+    scanner.config = ScannerConfig(scan=ScanConfig(context_news=False, max_analyses_per_day=0))
+    assert [opp.ticker for opp in scanner.run_cycle(CYCLE + timedelta(hours=4, minutes=10)).opportunities] == ["LOW"]
+
+
+def test_a_model_unavailable_for_six_cycles_sends_one_notice_every_12_hours(build):
+    notifier = FakeNotifier()
+    down = FakeChatModel(LLMUnavailableError("Couldn't connect to https://api.openai.com/v1/."))
+    session = FakeSession(routes())
+    scanner = build(session=session, feeds=FEEDS[:1], triage_model=down, notifiers=[notifier], config=QUIET)
+
+    for n in range(6):
+        when = CYCLE + timedelta(minutes=5 * n)
+        session.routes[MARKETWATCH_URL] = rss((f"AMD shares slide, update {n}", f"https://e.com/{n}", when))
+        result = scanner.run_cycle(when)
+        assert (
+            result.model_unavailable
+            == "the triage model is unavailable: Couldn't connect to https://api.openai.com/v1/."
+        )
+        assert len(notifier.sent) == (1 if n == 5 else 0)
+    subject, markdown, html = notifier.sent[0]
+    assert subject == "dip-scanner: the language model has been unavailable for 6 cycles"
+    assert "The last 6 cycles in a row couldn't use the language model (the latest at 2026-09-25 20:55 UTC)" in markdown
+    assert "at most once every 12 hours" in markdown and "<h1>dip-scanner: the language model" in html
+
+    # Still down: not repeated for 12 hours, even across separate runs (the time is in the database).
+    for hours in (1, 6, 11.9):
+        scanner.run_cycle(CYCLE + timedelta(hours=hours))
+    assert len(notifier.sent) == 1
+    scanner.run_cycle(CYCLE + timedelta(hours=12, minutes=30))
+    assert len(notifier.sent) == 2 and "unavailable for 10 cycles" in notifier.sent[1][0]
+
+    # A cycle in which the model answers resets the count.
+    scanner.triage_model = FakeChatModel(triage_reply)
+    session.routes[MARKETWATCH_URL] = rss(("AMD shares slide again", "https://e.com/x", CYCLE + timedelta(hours=13)))
+    scanner.run_cycle(CYCLE + timedelta(hours=13))
+    assert scanner.store.bump_streak("model_unavailable") == 1
+
+
+def test_every_feed_failing_sends_a_notice_without_secrets(build, monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-proj-verysecretkey123")
+    notifier = FakeNotifier()
+    session = FakeSession(
+        {
+            MARKETWATCH_URL: requests.ConnectionError(
+                "proxy https://me:hunter2@proxy.example.com refused, key sk-proj-verysecretkey123"
+            )
+        }
+    )
+    scanner = build(session=session, feeds=FEEDS[:1], notifiers=[notifier])
+
+    for n in range(6):
+        result = scanner.run_cycle(CYCLE + timedelta(minutes=5 * n))
+    assert (result.feeds_ok, result.feeds_failed) == (0, 1)
+    [(subject, markdown, _)] = notifier.sent
+    assert subject == "dip-scanner: every feed has failed for 6 cycles"
+    assert "All 1 feed failed in each of the last 6 cycles" in markdown and "marketwatch: " in markdown
+    assert "verysecretkey" not in markdown and "hunter2" not in markdown
+    assert "proxy https://***@proxy.example.com refused, key ***" in markdown
+
+    session.routes[MARKETWATCH_URL] = fixture("rss_marketwatch.xml")
+    scanner.run_cycle(CYCLE + timedelta(minutes=30))
+    assert scanner.store.bump_streak("feeds_failing") == 1  # a feed answered: counting starts again
+
+
+@pytest.mark.parametrize("how", ["no-notify", "switched off"])
+def test_no_system_notices_without_notifications(build, how):
+    notifier = FakeNotifier()
+    config = ScannerConfig(alerts=AlertConfig(system_notices=how != "switched off", notice_after_cycles=1))
+    scanner = build(
+        session=FakeSession({MARKETWATCH_URL: 500}),
+        feeds=FEEDS[:1],
+        notifiers=[notifier],
+        notify=how != "no-notify",
+        config=config,
+    )
+    scanner.run_cycle(CYCLE)
+    assert notifier.sent == []
+    assert scanner.store.bump_streak("feeds_failing") == 2  # counted all the same

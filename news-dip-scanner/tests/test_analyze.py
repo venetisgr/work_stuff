@@ -16,6 +16,7 @@ from dip_scanner.analyze import (
     NEWS_CHARS,
     NO_FUNDAMENTALS,
     NO_NEWS,
+    NON_US_FUNDAMENTALS,
     analyze_candidate,
     news_block,
     price_block,
@@ -435,6 +436,25 @@ def test_analyze_candidate_without_fundamentals_or_dip_reasons():
     prompt = model.prompts[0]
     assert NO_FUNDAMENTALS in prompt
     assert "Why it was flagged: manual analysis (no dip thresholds applied)" in prompt
+
+
+def test_a_listing_outside_the_us_is_not_penalised_for_having_no_sec_figures():
+    """Regression: Athens and other EU listings never have SEC fundamentals; the model called that "data missing",
+    answered with low confidence, and the 0.85 factor kept every such stock below the default alert threshold."""
+    model = FakeChatModel(reply())
+    stats = make_stats(ticker="ALWN.AT", currency="EUR", exchange="Athens")
+    analyze_candidate(model, make_candidate(ticker="ALWN.AT", stats=stats), fundamentals=None, extra_news=[], now=NOW)
+
+    system, prompt, _ = model.calls[0]
+    assert NON_US_FUNDAMENTALS.format(ticker="ALWN.AT") in prompt and NO_FUNDAMENTALS not in prompt
+    assert "ALWN.AT is listed outside the US" in prompt
+    assert "don't lower your confidence because figures are missing" in prompt
+    assert "don't lower it because there are no fundamentals" in system  # and the rule for confidence says so too
+
+    # A US listing without figures (SEC unreachable, SEC_USER_AGENT unset) keeps the plain note.
+    model = FakeChatModel(reply())
+    analyze_candidate(model, make_candidate(ticker="BRK-B"), fundamentals=None, extra_news=[], now=NOW)
+    assert NO_FUNDAMENTALS in model.prompts[0] and "outside the US, so none" not in model.prompts[0]
 
 
 def test_analyze_candidate_lists_each_article_once():

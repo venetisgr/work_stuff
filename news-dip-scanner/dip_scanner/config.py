@@ -43,7 +43,9 @@ class LLMSettings:
     foundry_endpoint: str | None = None  # FOUNDRY_ENDPOINT: resource name or endpoint URL
     foundry_api_key: str | None = None  # FOUNDRY_API_KEY (empty -> Entra ID)
     foundry_deployment: str | None = None  # FOUNDRY_DEPLOYMENT: fallback for both azure models
-    reasoning_effort: str | None = None  # LLM_REASONING_EFFORT
+    reasoning_effort: str | None = None  # LLM_REASONING_EFFORT: both models, unless one of the two below is set
+    triage_reasoning_effort: str | None = None  # LLM_TRIAGE_REASONING_EFFORT
+    analysis_reasoning_effort: str | None = None  # LLM_ANALYSIS_REASONING_EFFORT
     max_output_tokens: int | None = None  # LLM_MAX_OUTPUT_TOKENS
 
 
@@ -92,7 +94,6 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
             f"WEBHOOK_FORMAT must be one of {', '.join(WEBHOOK_FORMATS)} (got {get('WEBHOOK_FORMAT')!r})."
         )
 
-    effort = get("LLM_REASONING_EFFORT")
     smtp_port = _positive_int(get("SMTP_PORT"), "SMTP_PORT")
     if smtp_port is not None and smtp_port > 65535:
         raise ConfigError(f"SMTP_PORT must be a port number between 1 and 65535 (got {smtp_port}).")
@@ -108,7 +109,9 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
             foundry_endpoint=get("FOUNDRY_ENDPOINT"),
             foundry_api_key=get("FOUNDRY_API_KEY"),
             foundry_deployment=get("FOUNDRY_DEPLOYMENT"),
-            reasoning_effort=effort.lower() if effort else None,
+            reasoning_effort=_lower(get("LLM_REASONING_EFFORT")),
+            triage_reasoning_effort=_lower(get("LLM_TRIAGE_REASONING_EFFORT")),
+            analysis_reasoning_effort=_lower(get("LLM_ANALYSIS_REASONING_EFFORT")),
             max_output_tokens=_positive_int(get("LLM_MAX_OUTPUT_TOKENS"), "LLM_MAX_OUTPUT_TOKENS"),
         ),
         notify=NotifySettings(
@@ -127,6 +130,10 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         sec_user_agent=get("SEC_USER_AGENT"),
         data_dir=_data_dir(get("DATA_DIR")),
     )
+
+
+def _lower(value: str | None) -> str | None:
+    return value.lower() if value else None
 
 
 def _positive_int(value: str | None, name: str) -> int | None:
@@ -178,6 +185,10 @@ class ScanConfig:
     max_triage_attempts: int = 3
     max_candidates_per_cycle: int = 8  # bounds LLM cost; the rest are logged, not silently dropped
     cooldown_hours: float = 24  # don't re-analyse a ticker unless new negative news arrived since
+    # Until a new session has traded since a ticker's last analysis (weekend or evening news on an unchanged price,
+    # or more news later the same day), new news re-analyses it at most once in this many hours; 0 turns this off.
+    reanalyse_same_session_hours: float = 12
+    max_analyses_per_day: int = 40  # analyses in any 24 hours, all tickers together; 0 = no limit
     context_news: bool = True  # fetch per-ticker Yahoo/Google headlines for analysis
     workers: int = 8  # feed fetch threads
     retention_days: int = 30  # prune articles older than this (opportunities are kept)
@@ -217,6 +228,10 @@ class AlertConfig:
     # verdict changed or the price fell by another [dip] min_drop_1d_pct.
     repeat_hours: float = 24
     min_score_change: float = 10
+    # System notices to the same channels: the scanner stopped (bad key, no credit, broken config), the model was
+    # unavailable or every feed failed for notice_after_cycles cycles in a row. Each kind at most every 12 hours.
+    system_notices: bool = True
+    notice_after_cycles: int = 6
 
 
 @dataclass(frozen=True)
@@ -332,6 +347,8 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
         (scan.max_triage_attempts >= 1, "scan.max_triage_attempts must be at least 1"),
         (scan.max_candidates_per_cycle >= 0, "scan.max_candidates_per_cycle can't be negative"),
         (scan.cooldown_hours >= 0, "scan.cooldown_hours can't be negative"),
+        (scan.reanalyse_same_session_hours >= 0, "scan.reanalyse_same_session_hours can't be negative"),
+        (scan.max_analyses_per_day >= 0, "scan.max_analyses_per_day can't be negative"),
         (scan.workers >= 1, "scan.workers must be at least 1"),
         (scan.retention_days >= 1, "scan.retention_days must be at least 1"),
         (1 <= dip.min_magnitude <= 5, "dip.min_magnitude must be between 1 and 5"),
@@ -340,6 +357,7 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
         (0 <= alerts.min_probability <= 100, "alerts.min_probability must be between 0 and 100"),
         (alerts.repeat_hours >= 0, "alerts.repeat_hours can't be negative"),
         (alerts.min_score_change >= 0, "alerts.min_score_change can't be negative"),
+        (alerts.notice_after_cycles >= 1, "alerts.notice_after_cycles must be at least 1"),
     ]
     for ok, message in checks:
         if not ok:

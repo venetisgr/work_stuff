@@ -8,7 +8,7 @@ import pytest
 from conftest import NOW, make_article, make_impact, make_opportunity
 
 from dip_scanner.feeds import FeedState, title_key
-from dip_scanner.store import Store
+from dip_scanner.store import SCHEMA_VERSION, Store
 
 
 @pytest.fixture
@@ -463,4 +463,51 @@ def test_a_version_1_database_gets_the_alerted_column(tmp_path):
 
     with Store(path) as store:
         assert store.last_alerted("AMD") is not None
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+
+
+# --- model use and system notices ----------------------------------------------------------------------------------
+
+
+def test_model_calls_are_totalled_per_step_and_model(store):
+    def call(hours_ago, step, model, ticker=None, tokens=(100, 20)):
+        store.record_model_call(
+            when=NOW - timedelta(hours=hours_ago),
+            step=step,
+            model=model,
+            ticker=ticker,
+            input_tokens=tokens[0],
+            output_tokens=tokens[1],
+        )
+
+    call(30, "triage", "gpt-5-mini")  # yesterday: left out below
+    call(2, "triage", "gpt-5-mini")
+    call(1, "triage", "gpt-5-mini", tokens=(1_200, 80))
+    call(1, "analysis", "gpt-5", "amd", tokens=(3_500, 900))
+    call(1, "analysis", "gpt-5", "AMD", tokens=(4_000, None))  # the corrective retry of the same analysis
+    call(0.5, "analysis", "gpt-5", "NVDA")
+
+    usage = store.model_usage(since=NOW - timedelta(hours=24))
+    assert [(row.step, row.model, row.calls, row.input_tokens, row.output_tokens, row.unmetered) for row in usage] == [
+        ("triage", "gpt-5-mini", 2, 1_300, 100, 0),
+        ("analysis", "gpt-5", 3, 7_600, 920, 1),
+    ]
+    # Analyses count once per ticker and time, however many calls they took.
+    assert store.analyses_since(NOW - timedelta(hours=24)) == 2
+    assert store.analyses_since(NOW - timedelta(minutes=45)) == 1
+    assert store.model_usage(since=NOW + timedelta(hours=1)) == []
+
+    store.prune(older_than=NOW - timedelta(hours=24))
+    assert sum(row.calls for row in store.model_usage(since=NOW - timedelta(days=10))) == 5
+
+
+def test_notice_times_and_failure_streaks_are_kept(store):
+    assert store.notice_times("stopped") == (None, None)
+    store.record_notice("stopped", when=NOW, sent=True)
+    store.record_notice("stopped", when=NOW + timedelta(hours=13), sent=False)  # no channel took the next one
+    assert store.notice_times("stopped") == (NOW + timedelta(hours=13), NOW)
+
+    assert [store.bump_streak("feeds_failing") for _ in range(3)] == [1, 2, 3]
+    store.reset_streak("feeds_failing")
+    assert store.bump_streak("feeds_failing") == 1
+    store.reset_streak("never_seen")  # nothing to reset: fine

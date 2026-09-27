@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import math
+import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable
@@ -20,8 +21,9 @@ from .config import ConfigError, ScannerConfig, Settings
 from .detect import dip_reasons, select_candidates, severity
 from .feeds import CONTACT_USER_AGENT_MISSING, fetch_all, needs_contact_user_agent, ticker_news, user_agent_for
 from .fundamentals import SecFundamentals
-from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError
-from .models import Candidate, Feed, Opportunity, utc
+from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError, Usage
+from .models import Candidate, Feed, ModelUsage, Opportunity, utc
+from .notices import FEEDS_FAILING, MODEL_UNAVAILABLE, one_line, secrets_of, send_notice
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
 from .prices import YahooPrices
 from .report import format_price, format_when, render_html, render_markdown, verdict_label, write_reports
@@ -44,6 +46,7 @@ FAILURE_BACKOFF = timedelta(minutes=30)
 MAX_FAILURE_BACKOFF = timedelta(hours=24)
 ALERT_TITLE = "Dip alerts"
 MANUAL_TITLE = "Manual analysis"
+DAY = timedelta(hours=24)  # the window of [scan] max_analyses_per_day
 
 
 def _now() -> datetime:
@@ -68,9 +71,14 @@ class CycleResult:
     thesis_changes: list[tuple[Opportunity, Opportunity]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     report_paths: list[Path] = field(default_factory=list)
+    # Calls the model service answered this cycle, and why the model couldn't be used (None when nothing failed).
+    model_calls: int = 0
+    model_unavailable: str | None = None
+    usage_today: list[ModelUsage] = field(default_factory=list)  # model use since 00:00 UTC, this cycle included
 
     def summary(self) -> str:
-        """One line for the log, e.g. "Cycle 2026-09-25 15:00 UTC: 19/20 feeds ok, 37 new articles, ..."."""
+        """One line for the log, e.g. "Cycle 2026-09-25 15:00 UTC: 19/20 feeds ok, 37 new articles, ...", ending with
+        the day's model use when there is any."""
         ranked = sorted(self.opportunities, key=lambda opp: opp.score, reverse=True)
         found = _count(len(ranked), "opportunity", "opportunities")
         if ranked:
@@ -85,7 +93,54 @@ class CycleResult:
             _count(len(self.alerts), "alert"),
         ]
         took = f"; took {(self.finished - self.started).total_seconds():.0f} s" if self.finished else ""
-        return f"Cycle {utc(self.started):%Y-%m-%d %H:%M} UTC: {', '.join(parts)}{took}"
+        usage = f"; {usage_summary(self.usage_today)}" if self.usage_today else ""
+        return f"Cycle {utc(self.started):%Y-%m-%d %H:%M} UTC: {', '.join(parts)}{took}{usage}"
+
+
+class MeteredModel:
+    """A ChatModel that stores every call the service answered in the store's model_calls, with its tokens.
+
+    A call counts as answered when the wrapped model set last_usage (the models in llm.py do as soon as a reply
+    arrives, also one that turns out unusable, which is billed all the same) or when it returned a reply (models
+    without last_usage, like the tests' fakes). Calls that never reached the service (connection errors, throttling,
+    bad credentials) aren't stored, so an outage doesn't use up [scan] max_analyses_per_day. answered counts the
+    calls stored; when is the cycle's time, so all calls of one analysis share it.
+    """
+
+    def __init__(self, model: ChatModel, store: Store, *, step: str, when: datetime, ticker: str | None = None) -> None:
+        self.model = model
+        self.name = model.name
+        self.answered = 0
+        self._store = store
+        self._step = step
+        self._when = when
+        self._ticker = ticker
+
+    def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str:
+        """The wrapped model's reply; the call is recorded whether or not the reply is usable."""
+        try:
+            reply = self.model.complete(system, prompt, json_mode=json_mode)
+        except Exception:
+            self._record(getattr(self.model, "last_usage", None))
+            raise
+        self._record(getattr(self.model, "last_usage", None) or Usage())
+        return reply
+
+    def _record(self, usage: object) -> None:
+        if not isinstance(usage, Usage):
+            return  # the service never answered
+        self.answered += 1
+        try:
+            self._store.record_model_call(
+                when=self._when,
+                step=self._step,
+                model=self.name,
+                ticker=self._ticker,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+            )
+        except sqlite3.Error as exc:  # bookkeeping must not cost the reply
+            log.warning("Couldn't record a call to %s: %s", self.name, exc)
 
 
 class Scanner:
@@ -203,13 +258,18 @@ class Scanner:
                 "Skipped %s older than [scan] max_article_age_hours that the model couldn't triage in time.",
                 _count(stale, "pending article"),
             )
-        result.triaged, impacts = triage(
-            self.triage_model,
-            self.store,
-            batch_size=scan.triage_batch_size,
-            max_attempts=scan.max_triage_attempts,
-            now=now,
-        )
+        triage_model = MeteredModel(self.triage_model, self.store, step="triage", when=now)
+        try:
+            result.triaged, impacts = triage(
+                triage_model,
+                self.store,
+                batch_size=scan.triage_batch_size,
+                max_attempts=scan.max_triage_attempts,
+                now=now,
+                on_stop=lambda reason: _unavailable(result, reason),
+            )
+        finally:
+            result.model_calls += triage_model.answered
         result.impacts = len(impacts)
 
         recent = self.store.recent_impacts(now - timedelta(hours=scan.lookback_hours))
@@ -217,16 +277,18 @@ class Scanner:
             recent, self.prices, self.store, self.config, now=now, waiting=lambda ticker: self._waiting(ticker, now)
         )
         result.notes.extend(notes)
+        candidates = self._daily_limit(candidates, now, result)
         result.candidates = len(candidates)
 
         fatal: Exception | None = None
         for index, candidate in enumerate(candidates):
             try:
-                opportunity = self._analyze(candidate, now)
+                opportunity = self._analyze(candidate, now, result=result)
             except LLMUnavailableError as exc:
                 left = ", ".join(c.ticker for c in candidates[index:])
                 result.notes.append(f"The analysis model is unavailable, left for the next cycle: {left} ({exc})")
                 log.warning("%s", result.notes[-1])
+                _unavailable(result, f"the analysis model is unavailable: {exc}")
                 break
             except (LLMSetupError, ConfigError) as exc:  # no later call can work; report what was found first
                 left = ", ".join(c.ticker for c in candidates[index:])
@@ -261,6 +323,8 @@ class Scanner:
             if fatal is not None:
                 raise fatal  # after the report and the alerts, so the analyses already paid for aren't stranded
         self._prune(now)
+        result.usage_today = self._usage_today(now)
+        self._check_health(now, result)
         result.finished = now + timedelta(seconds=time.monotonic() - started)
         return result
 
@@ -273,6 +337,94 @@ class Scanner:
             and opp.analysis.verdict in alerts.verdicts
         )
 
+    def _daily_limit(self, candidates: list[Candidate], now: datetime, result: CycleResult) -> list[Candidate]:
+        """The candidates that fit under [scan] max_analyses_per_day (analyses the model answered in the last 24
+        hours, `dip-scanner analyze` included); the rest are noted and stay candidates for a later cycle."""
+        limit = self.config.scan.max_analyses_per_day
+        if limit <= 0 or not candidates:
+            return candidates
+        done = self.store.analyses_since(now - DAY)
+        room = max(0, limit - done)
+        if len(candidates) <= room:
+            return candidates
+        left = ", ".join(f"{c.ticker} (severity {c.severity:.1f})" for c in candidates[room:])
+        result.notes.append(
+            f"Daily limit of {_count(limit, 'analysis', 'analyses')} reached ([scan] max_analyses_per_day; {done} in "
+            f"the last 24h), left for later: {left}"
+        )
+        log.info("%s", result.notes[-1])
+        return candidates[:room]
+
+    def _usage_today(self, now: datetime) -> list[ModelUsage]:
+        try:
+            return self.store.model_usage(since=now.replace(hour=0, minute=0, second=0, microsecond=0))
+        except sqlite3.Error as exc:
+            log.warning("Couldn't total today's model use: %s", exc)
+            return []
+
+    # --- system notices ---
+
+    def _check_health(self, now: datetime, result: CycleResult) -> None:
+        """Count the cycles in a row in which the model couldn't be used, or every feed failed, and send a system
+        notice once a count reaches [alerts] notice_after_cycles (see notices.py). A cycle in which the model
+        answered (or a feed did) resets its count; a cycle that didn't need the model leaves it. Never raises."""
+        needed = self.config.alerts.notice_after_cycles
+        try:
+            if result.model_unavailable is not None:
+                streak = self.store.bump_streak(MODEL_UNAVAILABLE)
+                if streak >= needed:
+                    self._notice(
+                        MODEL_UNAVAILABLE,
+                        now,
+                        subject=f"dip-scanner: the language model has been unavailable for {streak} cycles",
+                        lines=[
+                            f"The last {streak} cycles in a row couldn't use the language model (the latest at "
+                            f"{now:%Y-%m-%d %H:%M} UTC): {one_line(result.model_unavailable)}",
+                            "Meanwhile new articles wait for triage and candidates for their analysis; articles "
+                            "older than [scan] max_article_age_hours are skipped for good. Check the provider's "
+                            "status page, the network, and your rate limits and quota.",
+                        ],
+                    )
+            elif result.model_calls:
+                self.store.reset_streak(MODEL_UNAVAILABLE)
+            if result.feeds_failed and not result.feeds_ok:
+                streak = self.store.bump_streak(FEEDS_FAILING)
+                if streak >= needed:
+                    keys = {feed.key for feed in self.feeds}
+                    errors = [
+                        f"{row['key']}: {one_line(row['last_error'], 150)}"
+                        for row in self.store.feed_health()
+                        if row["key"] in keys and row["last_error"]
+                    ]
+                    self._notice(
+                        FEEDS_FAILING,
+                        now,
+                        subject=f"dip-scanner: every feed has failed for {streak} cycles",
+                        lines=[
+                            f"All {_count(result.feeds_failed, 'feed')} failed in each of the last {streak} cycles "
+                            f"(the latest at {now:%Y-%m-%d %H:%M} UTC), so no news is coming in. Check the network "
+                            "connection with `dip-scanner feeds --check`.",
+                            "Latest errors: " + "; ".join(errors[:3]) + (" ..." if len(errors) > 3 else ""),
+                        ],
+                    )
+            elif result.feeds_ok:
+                self.store.reset_streak(FEEDS_FAILING)
+        except Exception:  # bookkeeping and notices must never break a cycle
+            log.warning("Couldn't check whether to send a system notice.", exc_info=True)
+
+    def _notice(self, kind: str, now: datetime, *, subject: str, lines: list[str]) -> None:
+        if not (self.notify and self.notifiers and self.config.alerts.system_notices):
+            return
+        send_notice(
+            self.notifiers,
+            self.store,
+            kind=kind,
+            subject=subject,
+            lines=lines,
+            now=now,
+            secrets=secrets_of(self.settings),
+        )
+
     def _waiting(self, ticker: str, now: datetime) -> str | None:
         """Why a ticker waits (its last analysis failed recently, see FAILURE_BACKOFF), or None when it may go."""
         failed = self.store.analysis_failures(ticker)
@@ -280,8 +432,15 @@ class Scanner:
             return f"{ticker} ({_count(failed[0], 'failure')}, next try {retry:%H:%M} UTC)"
         return None
 
-    def _analyze(self, candidate: Candidate, now: datetime, *, context_news: bool | None = None) -> Opportunity:
-        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model."""
+    def _analyze(
+        self,
+        candidate: Candidate,
+        now: datetime,
+        *,
+        context_news: bool | None = None,
+        result: CycleResult | None = None,
+    ) -> Opportunity:
+        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model (its calls recorded)."""
         if context_news is None:
             context_news = self.config.scan.context_news
         extra = []
@@ -290,7 +449,12 @@ class Scanner:
                 self.session, candidate.ticker, company=candidate.company, now=now, limit=CONTEXT_NEWS_LIMIT
             )
         fundamentals = self.fundamentals.get(candidate.ticker) if self.fundamentals is not None else None
-        return analyze_candidate(self.analysis_model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
+        model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
+        try:
+            return analyze_candidate(model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
+        finally:
+            if result is not None:
+                result.model_calls += model.answered
 
     def _send_alerts(self, now: datetime, result: CycleResult) -> None:
         """Send this cycle's alerts and thesis changes, plus any from the last day that couldn't be sent.
@@ -519,6 +683,36 @@ def alert_subject(opps: list[Opportunity]) -> str:
     return f"Dip alert{'s' if len(ranked) > 1 else ''}: {names}{more}"
 
 
+def usage_summary(usage: list[ModelUsage]) -> str:
+    """The day's model use in one phrase, e.g. "model today: 175 calls, 312.4k tokens in, 41.0k out"."""
+    unmetered = sum(row.unmetered for row in usage)
+    return (
+        f"model today: {_count(sum(row.calls for row in usage), 'call')}, "
+        f"{format_tokens(sum(row.input_tokens for row in usage))} tokens in, "
+        f"{format_tokens(sum(row.output_tokens for row in usage))} out"
+        + (f" ({unmetered} without token counts)" if unmetered else "")
+    )
+
+
+def usage_lines(usage: list[ModelUsage]) -> list[str]:
+    """One line per step and model, e.g. "triage with gpt-5-mini: 162 calls, 230.1k tokens in, 30.2k out"."""
+    return [
+        f"{row.step} with {row.model}: {_count(row.calls, 'call')}, {format_tokens(row.input_tokens)} tokens in, "
+        f"{format_tokens(row.output_tokens)} out"
+        + (f" ({row.unmetered} without token counts)" if row.unmetered else "")
+        for row in usage
+    ]
+
+
+def format_tokens(count: int) -> str:
+    """A token count for people: 950, 312.4k, 1.25M."""
+    if count < 1000:
+        return str(count)
+    if count < 1_000_000:
+        return f"{count / 1000:.1f}k"
+    return f"{count / 1_000_000:.2f}M"
+
+
 def seconds_until_next(now: datetime, interval_seconds: float) -> float:
     """Seconds from now to the next multiple of the interval since the epoch (always > 0)."""
     timestamp = utc(now).timestamp()
@@ -531,6 +725,12 @@ def _is_chat(notifier: object) -> bool:
     if isinstance(notifier, TelegramNotifier):
         return True
     return isinstance(notifier, WebhookNotifier) and notifier.format != "generic"
+
+
+def _unavailable(result: CycleResult, reason: str) -> None:
+    """Remember the first reason the model couldn't be used in this cycle."""
+    if result.model_unavailable is None:
+        result.model_unavailable = reason
 
 
 def _retry_at(last_failure: datetime, failures: int) -> datetime:

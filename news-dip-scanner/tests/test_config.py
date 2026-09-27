@@ -1,4 +1,5 @@
 import re
+from dataclasses import fields
 from pathlib import Path
 
 import pytest
@@ -58,6 +59,8 @@ def test_every_setting_is_read():
         "FOUNDRY_API_KEY": "fk",
         "FOUNDRY_DEPLOYMENT": "gpt-5",
         "LLM_REASONING_EFFORT": "Low",
+        "LLM_TRIAGE_REASONING_EFFORT": "Minimal",
+        "LLM_ANALYSIS_REASONING_EFFORT": "high",
         "LLM_MAX_OUTPUT_TOKENS": "16_000",
         "SMTP_HOST": "smtp.example.com",
         "SMTP_PORT": "465",
@@ -84,6 +87,8 @@ def test_every_setting_is_read():
         foundry_api_key="fk",
         foundry_deployment="gpt-5",
         reasoning_effort="low",
+        triage_reasoning_effort="minimal",
+        analysis_reasoning_effort="high",
         max_output_tokens=16000,
     )
     assert settings.notify == NotifySettings(
@@ -185,13 +190,23 @@ def test_the_defaults_match_the_spec():
         max_triage_attempts=3,
         max_candidates_per_cycle=8,
         cooldown_hours=24,
+        reanalyse_same_session_hours=12,
+        max_analyses_per_day=40,
         context_news=True,
         workers=8,
         retention_days=30,
     )
     assert config.dip == DipConfig(3.0, 6.0, 10.0, 2, ("negative", "mixed"), True)
     assert config.universe == UniverseConfig((), False, (), 1.0, None)
-    assert config.alerts == AlertConfig(65, 60, ("temporary_fear", "mixed"))
+    assert config.alerts == AlertConfig(
+        min_score=65,
+        min_probability=60,
+        verdicts=("temporary_fear", "mixed"),
+        repeat_hours=24,
+        min_score_change=10,
+        system_notices=True,
+        notice_after_cycles=6,
+    )
 
 
 def test_a_full_scanner_file_is_read(tmp_path):
@@ -206,6 +221,8 @@ triage_batch_size = 10
 max_triage_attempts = 2
 max_candidates_per_cycle = 0
 cooldown_hours = 0
+reanalyse_same_session_hours = 6.5
+max_analyses_per_day = 0
 context_news = false
 workers = 4
 retention_days = 14
@@ -229,14 +246,29 @@ allowed_suffixes = ["", "de", ".at", ".DE"]
 min_score = 70.5
 min_probability = 65
 verdicts = ["temporary_fear"]
+system_notices = false
+notice_after_cycles = 12
 """,
     )
     config = load_scanner_config(path)
-    assert config.scan == ScanConfig(10, 12.5, 72, 10, 2, 0, 0, False, 4, 14)
+    assert config.scan == ScanConfig(
+        interval_minutes=10,
+        max_article_age_hours=12.5,
+        lookback_hours=72,
+        triage_batch_size=10,
+        max_triage_attempts=2,
+        max_candidates_per_cycle=0,
+        cooldown_hours=0,
+        reanalyse_same_session_hours=6.5,
+        max_analyses_per_day=0,
+        context_news=False,
+        workers=4,
+        retention_days=14,
+    )
     assert isinstance(config.scan.interval_minutes, float)
     assert config.dip == DipConfig(4.0, 7.5, 12.0, 3, ("negative",), False)
     assert config.universe == UniverseConfig(("AMD", "SAP.DE"), True, ("TSLA",), 5.0, ("", ".DE", ".AT"))
-    assert config.alerts == AlertConfig(70.5, 65, ("temporary_fear",))
+    assert config.alerts == AlertConfig(70.5, 65, ("temporary_fear",), system_notices=False, notice_after_cycles=12)
 
 
 def test_watchlist_and_exclude_are_written_like_triage_tickers(tmp_path):
@@ -302,6 +334,11 @@ def test_a_section_must_be_a_table(tmp_path):
         ("[scan]\ninterval_minutes = 0\n", "scan.interval_minutes must be greater than zero"),
         ("[scan]\nworkers = 0\n", "scan.workers must be at least 1"),
         ("[scan]\nmax_candidates_per_cycle = -1\n", "scan.max_candidates_per_cycle can't be negative"),
+        ("[scan]\nreanalyse_same_session_hours = -1\n", "scan.reanalyse_same_session_hours can't be negative"),
+        ("[scan]\nmax_analyses_per_day = -5\n", "scan.max_analyses_per_day can't be negative"),
+        ("[scan]\nmax_analyses_per_day = 2.5\n", "scan.max_analyses_per_day in .* must be a whole number"),
+        ("[alerts]\nnotice_after_cycles = 0\n", "alerts.notice_after_cycles must be at least 1"),
+        ('[alerts]\nsystem_notices = "yes"\n', "alerts.system_notices in .* must be true or false"),
         ("[dip]\nmin_magnitude = 6\n", "dip.min_magnitude must be between 1 and 5"),
         ("[alerts]\nmin_score = 101\n", "alerts.min_score must be between 0 and 100"),
         ("[alerts]\nmin_probability = -1\n", "alerts.min_probability must be between 0 and 100"),
@@ -407,6 +444,20 @@ def test_the_shipped_feed_list_loads():
 
 def test_the_shipped_scanner_config_spells_out_the_defaults():
     assert load_scanner_config(PROJECT_ROOT / "scanner.toml") == ScannerConfig()
+
+
+def test_the_shipped_scanner_config_and_the_readme_name_every_setting():
+    text = (PROJECT_ROOT / "scanner.toml").read_text(encoding="utf-8")
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    written = set(re.findall(r"^#? ?([a-z_0-9]+) = ", text, re.MULTILINE))
+    sections = {"scan": ScanConfig, "dip": DipConfig, "universe": UniverseConfig, "alerts": AlertConfig}
+    for section, cls in sections.items():
+        assert f"[{section}]" in text
+        for name in (f.name for f in fields(cls)):
+            assert name in written, f"{section}.{name} is missing from scanner.toml"
+    # The settings that bound the model bill and keep an unattended scanner honest are in the README too.
+    for name in ("max_analyses_per_day", "reanalyse_same_session_hours", "system_notices", "notice_after_cycles"):
+        assert f"`[{'scan' if 'analys' in name else 'alerts'}] {name}`" in readme, name
 
 
 def test_the_env_example_loads_and_lists_every_setting():

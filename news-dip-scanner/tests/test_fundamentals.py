@@ -368,6 +368,32 @@ def test_old_fundamentals_say_how_old_they_are():
     assert "Note:" not in fundamentals.as_text()
 
 
+def test_a_quarterly_filer_missing_its_latest_quarter_gets_a_note():
+    """Regression (live F on 2026-09-27): the newest quarter ended 2026-03-31, and nothing said a later one was
+    missing because the 18-month note only fires much later."""
+    doc = facts_doc(
+        Revenues={
+            "USD": [
+                fact("2025-01-01", "2025-12-31", 180_000, form="10-K"),
+                fact("2026-01-01", "2026-03-31", 40_000),
+            ]
+        }
+    )
+    fundamentals = parse_company_facts("F", "37996", doc)
+
+    text = fundamentals.as_text(today=date(2026, 10, 25))  # 208 days after the quarter
+    assert "Note: the newest quarter ends 2026-03-31, about 7 months ago; a later one may be missing." in text
+    assert "Note:" not in fundamentals.as_text(today=date(2026, 9, 27))  # 180 days: a late 10-K can explain it
+    # Much later only the 18-month note is shown.
+    old = fundamentals.as_text(today=date(2028, 1, 31))
+    assert old.count("Note:") == 1 and "ending 2026-03-31, about 22 months ago; they may not reflect" in old
+    # Annual-only (20-F) filers have no quarters to be missing.
+    annual = parse_company_facts(
+        "NVO", "1", facts_doc(Revenues={"USD": [fact("2025-01-01", "2025-12-31", 1, form="20-F")]})
+    )
+    assert "Note:" not in annual.as_text(today=date(2026, 10, 25))
+
+
 def test_a_16_week_fourth_quarter_is_derived():
     """Regression (live COST, PEP): 12/12/12/16-week calendars; the 112-day Q4 was neither shown nor derived."""
     doc = facts_doc(

@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 import requests
-from conftest import NOW, FakeResponse, FakeSession, make_bars
+from conftest import NOW, FakeResponse, FakeSession, make_article, make_bars, make_impact
 
+from dip_scanner.detect import news_after_session
 from dip_scanner.models import PriceBar, Split
 from dip_scanner.prices import (
     BROWSER_USER_AGENT,
@@ -269,7 +270,7 @@ def test_compute_stats_during_the_session_uses_the_live_price():
     quote["close"][-1], quote["low"][-1], quote["volume"][-1] = 150.0, 149.0, 21_000_000  # the partial session
     prices, _, _ = prices_for({QUERY1: doc})
 
-    stats = compute_stats("AMD", *prices.chart("AMD"))
+    stats = compute_stats("AMD", *prices.chart("AMD"), now=datetime(2026, 9, 25, 14, 50, tzinfo=UTC))
 
     assert stats.as_of == datetime(2026, 9, 25, 14, 45, tzinfo=UTC)
     assert stats.previous_close == 159.5  # yesterday, not today's partial bar
@@ -289,14 +290,73 @@ def test_volume_pace_is_floored_in_the_first_minutes_and_plain_after_the_close()
     meta["regularMarketTime"] = meta["currentTradingPeriod"]["regular"]["start"] + 60  # a minute after the open
     result_of(doc)["indicators"]["quote"][0]["volume"][-1] = 2_100_000
     prices, _, _ = prices_for({QUERY1: doc})
-    stats = compute_stats("AMD", *prices.chart("AMD"))
+    now = datetime.fromtimestamp(meta["regularMarketTime"] + 120, UTC)
+    stats = compute_stats("AMD", *prices.chart("AMD"), now=now)
     assert stats.volume_ratio == pytest.approx(2.1 / (42 * 0.1))  # the session counts as at least 10% done
 
     # After the close (and before the next open, when the period describes another session) the bar is complete.
     prices, _, _ = prices_for({QUERY1: chart_doc()})
-    stats = compute_stats("AMD", *prices.chart("AMD"))
+    stats = compute_stats("AMD", *prices.chart("AMD"), now=CLOSE_TIME + timedelta(hours=1))
     assert stats.session_elapsed is None and stats.volume_ratio == pytest.approx(2.5)
     assert "latest volume 2.5x the 20-day average" in stats.as_text()
+
+
+def athens_doc(volume: int = 1_400_000) -> dict:
+    """An Athens listing whose last trade (Friday 14:17 UTC) came three minutes before the end of the 07:30-14:20 UTC
+    regular session, which Yahoo still reports as currentTradingPeriod after the close."""
+    friday = date(2026, 9, 25)
+    bars = make_bars([10.0 + (i % 5) * 0.1 for i in range(40)], start=friday - timedelta(days=55), volume=1_000_000)
+    rows = [
+        (int(datetime(bar.day.year, bar.day.month, bar.day.day, 7, 30, tzinfo=UTC).timestamp()), bar.open, bar.high,
+         bar.low, bar.close, bar.volume)
+        for bar in bars if bar.day < friday
+    ]  # fmt: skip
+    rows.append((int(datetime(2026, 9, 25, 7, 30, tzinfo=UTC).timestamp()), 10.4, 10.5, 9.4, 9.5, volume))
+    start, end = datetime(2026, 9, 25, 7, 30, tzinfo=UTC), datetime(2026, 9, 25, 14, 20, tzinfo=UTC)
+    meta = {
+        "currency": "EUR",
+        "symbol": "ALWN.AT",
+        "exchangeName": "ATH",
+        "gmtoffset": 10800,
+        "exchangeTimezoneName": "Europe/Athens",
+        "instrumentType": "EQUITY",
+        "regularMarketTime": int(datetime(2026, 9, 25, 14, 17, tzinfo=UTC).timestamp()),
+        "regularMarketPrice": 9.5,
+        "currentTradingPeriod": {
+            "regular": {"timezone": "EEST", "start": int(start.timestamp()), "end": int(end.timestamp())}
+        },
+    }
+    return doc_from(meta, rows)
+
+
+def test_a_last_trade_just_before_the_end_of_the_session_is_not_a_running_session_at_the_weekend():
+    """Regression (live ETE.AT, ALWN.AT on a Sunday): the Friday 14:17 quote inside the 07:30-14:20 period made the
+    stock look mid-session all weekend, so its volume was pro-rated and weekend news never counted as after the
+    session."""
+    sunday = datetime(2026, 9, 27, 10, 0, tzinfo=UTC)
+    prices, _, _ = prices_for({QUERY1: athens_doc()})
+
+    stats = prices.stats("ALWN.AT", now=sunday)
+
+    assert stats.session_elapsed is None
+    assert stats.volume_ratio == pytest.approx(1.4)  # the whole session's volume, not pro-rated to 99%
+    assert "latest volume 1.4x the 20-day average" in stats.as_text()
+    assert "so far today" not in stats.as_text()
+    # So Sunday's news counts as news the market hasn't traded on yet.
+    sunday_news = make_article(title="Allwyn warns on profit", published=sunday - timedelta(hours=1))
+    assert news_after_session(stats, [(make_impact(ticker="ALWN.AT", article_id=sunday_news.id), sunday_news)])
+
+    # A minute after the close, too.
+    stats = compute_stats("ALWN.AT", *prices.chart("ALWN.AT"), now=datetime(2026, 9, 25, 14, 21, tzinfo=UTC))
+    assert stats.session_elapsed is None
+
+    # While the session runs (the check at 14:18, the quote a minute older), it is a session in progress.
+    stats = compute_stats("ALWN.AT", *prices.chart("ALWN.AT"), now=datetime(2026, 9, 25, 14, 18, tzinfo=UTC))
+    assert stats.session_elapsed == pytest.approx((6 * 60 + 47) / (6 * 60 + 50))
+    assert "volume so far today" in stats.as_text()
+
+    # Without now nothing says the session is still running.
+    assert compute_stats("ALWN.AT", *prices.chart("ALWN.AT")).session_elapsed is None
 
 
 def test_a_placeholder_bar_after_the_quote_day_is_ignored():

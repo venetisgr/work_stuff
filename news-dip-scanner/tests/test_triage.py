@@ -418,10 +418,12 @@ def test_triage_stops_for_the_cycle_when_the_service_is_unavailable():
     store = FakeStore(items)
     replies = [{"articles": [{"id": "a1", "companies": [company()]}]}, LLMUnavailableError("429")]
     model = FakeChatModel(replies)
+    stops: list[str] = []
 
-    triaged, impacts = triage(model, store, batch_size=1, max_attempts=3, now=NOW)
+    triaged, impacts = triage(model, store, batch_size=1, max_attempts=3, now=NOW, on_stop=stops.append)
 
     assert triaged == 1 and [i.article_id for i in impacts] == [items[0].id]
+    assert stops == ["the triage model is unavailable: 429"]  # so the pipeline can count unavailable cycles
     assert store.failures == []  # not the articles' fault: no attempt used up
     assert [store.status[a.id] for a in items] == ["done", "pending", "pending"]
 
@@ -453,9 +455,11 @@ def test_a_request_every_call_is_refused_for_uses_up_no_attempts():
     """Regression: an account-level 400 (spend limit) failed every pending article for good after 3 cycles."""
     store = FakeStore(articles(4))
     model = FakeChatModel(LLMRequestError("Anthropic rejected the request: You have reached your usage limits"))
+    stops: list[str] = []
     for _ in range(5):
-        assert triage(model, store, batch_size=4, max_attempts=3, now=NOW) == (0, [])
+        assert triage(model, store, batch_size=4, max_attempts=3, now=NOW, on_stop=stops.append) == (0, [])
     assert store.failures == [] and set(store.status.values()) == {"pending"}
+    assert len(stops) == 5 and stops[0].startswith("the triage model refused every request: Anthropic rejected")
 
 
 def test_unexpected_errors_count_as_a_failed_batch_instead_of_breaking_every_cycle():

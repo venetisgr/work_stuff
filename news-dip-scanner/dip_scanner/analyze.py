@@ -11,7 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import re
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from . import prompts
@@ -39,6 +39,14 @@ MAX_ITEM_CHARS = 300
 NO_FUNDAMENTALS = (
     "Not available (not a US SEC filer, or the SEC data couldn't be fetched). Don't assume any figures; "
     "put what to look up in checks."
+)
+# Listings outside the US (a Yahoo suffix: SAP.DE, ALWN.AT) never have SEC figures. Without this the model rates its
+# confidence "low" for missing data, and the score's 0.85 factor keeps such stocks below the default alert threshold.
+NON_US_FUNDAMENTALS = (
+    "Not provided for this listing: company figures come only from US SEC filings, and {ticker} is listed outside "
+    "the US, so none were expected. This is not a gap in the case and says nothing about the company: judge the "
+    "verdict and your confidence on the news and the price data, and don't lower your confidence because figures "
+    "are missing. Don't assume any figures; put what to look up in checks."
 )
 NO_NEWS = "No news articles were provided."
 
@@ -179,6 +187,21 @@ def _summary(article: Article) -> str:
 
 def _safe(text: str) -> str:
     return text.replace("<", "‹").replace(">", "›")
+
+
+def fundamentals_block(ticker: str, fundamentals: Fundamentals | None, *, today: date) -> str:
+    """The fundamentals for the prompt, or why there are none: a listing outside the US (a Yahoo exchange suffix such
+    as .DE or .AT) never has SEC figures, which the model must not count against its confidence."""
+    if fundamentals is not None:
+        return fundamentals.as_text(today=today)
+    if not is_us_listing(ticker):
+        return NON_US_FUNDAMENTALS.format(ticker=ticker)
+    return NO_FUNDAMENTALS
+
+
+def is_us_listing(ticker: str) -> bool:
+    """Whether a Yahoo symbol is a US listing: those have no exchange suffix (AMD, BRK-B; SAP.DE and ALWN.AT do)."""
+    return "." not in ticker.strip()
 
 
 # --- the model's reply ---------------------------------------------------------------------------------------------
@@ -432,7 +455,7 @@ def analyze_candidate(
         company=candidate.company,
         today=f"{now:%Y-%m-%d} ({now:%A})",
         price_block=price_block(stats),
-        fundamentals_block=fundamentals.as_text(today=now.date()) if fundamentals is not None else NO_FUNDAMENTALS,
+        fundamentals_block=fundamentals_block(candidate.ticker, fundamentals, today=now.date()),
         news_block=news_block(candidate.impacts, extra_news),
         dip_reasons="; ".join(candidate.dip_reasons) or "manual analysis (no dip thresholds applied)",
         currency=stats.currency,

@@ -18,7 +18,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .feeds import FeedState
-from .models import Article, Impact, Opportunity, from_iso, utc
+from .models import Article, Impact, ModelUsage, Opportunity, from_iso, utc
 
 log = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ INVALID_TICKER_TTL = timedelta(days=7)
 ARTICLE_STATUSES = ("pending", "done", "failed", "skipped")
 _MAX_PARAMS = 500  # stay well under SQLite's bound-parameter limit in IN (...) lists
 
-SCHEMA_VERSION = 2  # 2: opportunities.alerted
+SCHEMA_VERSION = 3  # 2: opportunities.alerted; 3: model_calls and system_notices
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -91,6 +91,22 @@ CREATE TABLE IF NOT EXISTS analysis_failures (
     failures INTEGER NOT NULL,
     last_failure TEXT NOT NULL,
     last_error TEXT
+);
+CREATE TABLE IF NOT EXISTS model_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created TEXT NOT NULL,   -- the time of the cycle (or manual analysis) that made the call
+    step TEXT NOT NULL,      -- 'triage' or 'analysis'
+    model TEXT NOT NULL,
+    ticker TEXT,             -- the analysed ticker (analysis only)
+    input_tokens INTEGER,    -- NULL when the service didn't report them
+    output_tokens INTEGER
+);
+CREATE INDEX IF NOT EXISTS model_calls_created ON model_calls (created);
+CREATE TABLE IF NOT EXISTS system_notices (
+    kind TEXT PRIMARY KEY,
+    streak INTEGER NOT NULL DEFAULT 0,  -- cycles in a row with this problem
+    last_attempt TEXT,                  -- the last time a notice of this kind was tried
+    last_sent TEXT                      -- the last time one reached at least one channel
 );
 """
 
@@ -517,11 +533,102 @@ class Store:
         with self._write() as conn:
             conn.execute("DELETE FROM analysis_failures WHERE ticker = ?", (ticker.strip().upper(),))
 
+    # --- model use (token totals and the daily analysis limit) ---
+
+    def record_model_call(
+        self,
+        *,
+        when: datetime,
+        step: str,
+        model: str,
+        ticker: str | None = None,
+        input_tokens: int | None = None,
+        output_tokens: int | None = None,
+    ) -> None:
+        """Remember one call the model service answered, with the tokens it reported (None when it didn't)."""
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO model_calls (created, step, model, ticker, input_tokens, output_tokens) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (_ts(when), step, model, ticker.strip().upper() if ticker else None, input_tokens, output_tokens),
+            )
+
+    def model_usage(self, *, since: datetime) -> list[ModelUsage]:
+        """The model calls since the given time, totalled per step and model (triage first)."""
+        rows = self._query(
+            """
+            SELECT step, model, COUNT(*) AS calls,
+                   COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                   SUM(input_tokens IS NULL OR output_tokens IS NULL) AS unmetered
+            FROM model_calls WHERE created >= ?
+            GROUP BY step, model ORDER BY step = 'analysis', step, model
+            """,
+            (_ts(since),),
+        )
+        return [
+            ModelUsage(
+                step=row["step"],
+                model=row["model"],
+                calls=row["calls"],
+                input_tokens=row["input_tokens"],
+                output_tokens=row["output_tokens"],
+                unmetered=row["unmetered"],
+            )
+            for row in rows
+        ]
+
+    def analyses_since(self, since: datetime) -> int:
+        """How many analyses the model answered since the given time (a corrective retry is part of its analysis,
+        and a reply that turned out unusable counts too: it was paid for)."""
+        rows = self._query(
+            "SELECT COUNT(*) FROM (SELECT DISTINCT ticker, created FROM model_calls "
+            "WHERE step = 'analysis' AND created >= ?)",
+            (_ts(since),),
+        )
+        return int(rows[0][0])
+
+    # --- system notices (see notices.py) ---
+
+    def notice_times(self, kind: str) -> tuple[datetime | None, datetime | None]:
+        """(last attempt, last successful send) of a kind of system notice."""
+        rows = self._query("SELECT last_attempt, last_sent FROM system_notices WHERE kind = ?", (kind,))
+        if not rows:
+            return None, None
+        return tuple(from_iso(value) if value else None for value in (rows[0]["last_attempt"], rows[0]["last_sent"]))
+
+    def record_notice(self, kind: str, *, when: datetime, sent: bool) -> None:
+        """Remember that a notice of this kind was tried at when, and whether any channel took it."""
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT INTO system_notices (kind, last_attempt, last_sent) VALUES (?, ?, ?)
+                ON CONFLICT (kind) DO UPDATE SET
+                    last_attempt = excluded.last_attempt, last_sent = COALESCE(excluded.last_sent, last_sent)
+                """,
+                (kind, _ts(when), _ts(when) if sent else None),
+            )
+
+    def bump_streak(self, kind: str) -> int:
+        """Count one more cycle in a row with this problem; returns the count."""
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO system_notices (kind, streak) VALUES (?, 1) "
+                "ON CONFLICT (kind) DO UPDATE SET streak = streak + 1",
+                (kind,),
+            )
+            return int(conn.execute("SELECT streak FROM system_notices WHERE kind = ?", (kind,)).fetchone()[0])
+
+    def reset_streak(self, kind: str) -> None:
+        """The problem is gone: the next occurrence starts counting from one again."""
+        with self._write() as conn:
+            conn.execute("UPDATE system_notices SET streak = 0 WHERE kind = ?", (kind,))
+
     def prune(self, *, older_than: datetime) -> int:
         """Delete articles (and their impacts) older than the given time; returns how many were deleted.
 
         An article goes once both its publication and our first sighting of it are older than older_than (so an
-        old item still listed in a feed isn't re-inserted as new every day). Opportunities are always kept.
+        old item still listed in a feed isn't re-inserted as new every day). Model call records older than that go
+        too. Opportunities are always kept.
         """
         cutoff = _ts(older_than)
         with self._write() as conn:
@@ -529,6 +636,7 @@ class Store:
             conn.execute(f"DELETE FROM impacts WHERE article_id IN ({old})", (cutoff, cutoff))
             deleted = conn.execute("DELETE FROM articles WHERE published < ? AND fetched < ?", (cutoff, cutoff))
             count = deleted.rowcount
+            conn.execute("DELETE FROM model_calls WHERE created < ?", (cutoff,))
         if count:
             log.info("Pruned %d article(s) older than %s", count, cutoff)
         return count
