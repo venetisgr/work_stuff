@@ -297,3 +297,25 @@ def test_article_helpers_round_trip():
     data = article_to_dict(article)
     assert data["published"] == "2026-09-25T14:00:00+00:00"
     assert article_from_dict(json.loads(json.dumps(data))) == article
+
+
+def test_a_record_from_before_article_ids_loads_with_none_and_an_empty_list_stays_empty():
+    """The cooldown tells a legacy record (time test) from an analysis that saw no flagged news (none seen)."""
+    data = make_opportunity().to_dict()
+    del data["article_ids"]
+    assert Opportunity.from_dict(data).article_ids is None
+    empty = make_opportunity(article_ids=[])
+    assert Opportunity.from_dict(empty.to_dict()).article_ids == []
+    legacy = make_opportunity(article_ids=None)
+    assert Opportunity.from_dict(legacy.to_dict()) == legacy
+
+
+def test_the_benchmark_level_round_trips_and_old_records_have_none():
+    opp = make_opportunity(benchmark="^GSPC", benchmark_level=7012.5)
+    assert Opportunity.from_dict(opp.to_dict()) == opp
+    data = make_opportunity().to_dict()
+    del data["benchmark"], data["benchmark_level"]
+    old = Opportunity.from_dict(data)
+    assert (old.benchmark, old.benchmark_level) == (None, None)
+    data["benchmark_level"] = 0  # never a level
+    assert Opportunity.from_dict(data).benchmark_level is None

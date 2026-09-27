@@ -323,6 +323,15 @@ def test_news_lists_articles_with_their_impacts_and_filters_by_ticker(store):
     nvda = store.news(NOW - timedelta(hours=24), ticker="nvda")
     assert [(a.title, [i.ticker for i in impacts]) for a, impacts in nvda] == [("Chip rules", ["NVDA"])]
 
+    # With the symbols whose news belongs to it (an old symbol, a preferred listing's other one): relabelled, once.
+    both_ways = store.news(NOW - timedelta(hours=24), ticker="NVDA", also={"amd"})
+    assert [(a.title, [i.ticker for i in impacts]) for a, impacts in both_ways] == [
+        ("AMD slides", ["NVDA"]),
+        ("Chip rules", ["NVDA"]),
+    ]
+    assert both_ways[0][1][0] == replace(impacts[0], ticker="NVDA")
+    assert both_ways[1][1][0] == impacts[2]  # filed under both: its own impact
+
 
 def test_get_articles_handles_many_ids(store):
     stories = [article(f"Story number {n}", hours_ago=n / 100) for n in range(1200)]
@@ -463,7 +472,31 @@ def test_a_version_1_database_gets_the_alerted_column(tmp_path):
 
     with Store(path) as store:
         assert store.last_alerted("AMD") is not None
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+
+
+def test_a_version_4_database_forgets_its_symbol_lookups(tmp_path):
+    """Regression (live): version 4's looser name test stored HES -> HESM (Hess Midstream LP) and CS -> DHY (a bond
+    fund); those kept moving Hess and Credit Suisse news to them for 7 days after an upgrade."""
+    path = tmp_path / "v4.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE symbol_lookups (ticker TEXT NOT NULL, query TEXT NOT NULL, resolved TEXT, name TEXT,"
+        " checked TEXT NOT NULL, PRIMARY KEY (ticker, query)); PRAGMA user_version = 4;"
+    )
+    conn.execute(
+        "INSERT INTO symbol_lookups VALUES (?, ?, ?, ?, ?)",
+        ("HES", "Hess", "HESM", "Hess Midstream LP", NOW.isoformat(timespec="microseconds")),
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        assert store.resolved_symbol("HES", now=NOW) is None
+        assert store.symbol_lookup("HES", "Hess", now=NOW) is None
+        store.save_symbol_lookup("MYTIL.AT", "Metlen", "MTLN.AT", "Metlen Energy & Metals PLC", checked=NOW)
+    with Store(path) as store:  # opening a version 5 database again keeps its lookups
+        assert store.resolved_symbol("MYTIL.AT", now=NOW) == ("MTLN.AT", "Metlen Energy & Metals PLC", "Metlen")
 
 
 # --- model use and system notices ----------------------------------------------------------------------------------

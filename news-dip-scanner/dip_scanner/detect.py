@@ -20,7 +20,7 @@ from .config import DipConfig, ScannerConfig
 from .fx import major_units
 from .models import Article, Candidate, Impact, Opportunity, PriceStats, utc
 from .prices import PriceError
-from .symbols import Resolution, SymbolSearchError
+from .symbols import Resolution, SymbolSearchError, fund_name
 
 if TYPE_CHECKING:
     from .prices import YahooPrices
@@ -31,7 +31,8 @@ log = logging.getLogger(__name__)
 
 # Tolerance for comparing drops with thresholds, so a drop of exactly 3% isn't missed through float rounding.
 _EPSILON = 1e-9
-# Yahoo's instrumentType of single-company shares (ADRs included); ETFs, funds and indices aren't candidates.
+# Yahoo's instrumentType of single-company shares (ADRs included); ETFs, funds and indices aren't candidates, and
+# neither is a listing whose name says it is a fund (Yahoo types some closed-end funds and ETFs as EQUITY).
 _EQUITY_TYPES = frozenset({"EQUITY"})
 
 # severity() weights, see its docstring.
@@ -179,11 +180,14 @@ def select_candidates(
        With symbols (a SymbolResolver), a ticker without prices is first looked up by the company names the triage
        gave for it (Yahoo's search, same exchange, see symbols.py): the model may know an old symbol (OPAP.AT for
        Allwyn, now ALWN.AT). When a listing is found, the ticker's news moves to that symbol, which then goes
-       through these steps like any other (a note says "OPAP.AT -> ALWN.AT"); a replacement found in the last 7
-       days applies before step 2. A symbol found this way isn't replaced in turn.
-    7. Instruments that aren't company shares (Yahoo's instrumentType ETF, MUTUALFUND, INDEX...) are skipped and
-       marked invalid; so are prices below [universe] min_price (in the currency's main unit: pence, cents and
-       agorot quotes are divided by 100) and prices that don't pass dip_reasons.
+       through these steps like any other (a note says "OPAP.AT -> ALWN.AT"). A replacement found in the last 7
+       days applies before step 2, unless the triage's symbol is in [universe] exclude; so does a new lookup for a
+       ticker that only the watchlist would leave out ([universe] only_watchlist, or news that only the watchlist's
+       leniency lets through) when the watchlist has a symbol on its exchange (OPAP.AT news with ALWN.AT on the
+       watchlist). A symbol found this way isn't replaced in turn.
+    7. Instruments that aren't company shares (Yahoo's instrumentType ETF, MUTUALFUND, INDEX..., or a name that says
+       it is a fund) are skipped and marked invalid; so are prices below [universe] min_price (in the currency's
+       main unit: pence, cents and agorot quotes are divided by 100) and prices that don't pass dip_reasons.
     8. Same session: until a newer session has traded since the ticker's last analysis (evening or weekend news on
        the last close, more news later the same day), news that analysis didn't see re-analyses it at most once
        every [scan] reanalyse_same_session_hours, and the same news on the same prices isn't analysed again (see
@@ -226,9 +230,15 @@ def select_candidates(
     replacements: set[str] = set()  # symbols found for a ticker without prices; never replaced in turn
     if symbols is not None:
         for ticker in list(by_ticker):
-            if store.ticker_valid(ticker, now=now) is True:
+            # An excluded triage symbol keeps its news (noted in step 2): excluding it is how a wrong match is undone.
+            if ticker not in by_ticker or ticker in replacements or ticker in cfg.universe.exclude:
+                continue
+            valid = store.ticker_valid(ticker, now=now)
+            if valid is True:
                 continue
             found = _known(symbols, ticker, now)
+            if found is None and _watchlist_decides(ticker, by_ticker[ticker], cfg):
+                found = _resolve_early(ticker, by_ticker[ticker], valid, prices, store, symbols, now)
             if found is not None:
                 notes.add(_RENAMED, f"{ticker} -> {found.symbol} ({found.name})")
                 _hand_over(by_ticker, ticker, found.symbol)
@@ -338,7 +348,7 @@ def _evaluate(
         stats = _stats(ticker, group, prices, store, notes, now, symbols)
     if not isinstance(stats, PriceStats):
         return stats
-    if stats.instrument_type is not None and stats.instrument_type not in _EQUITY_TYPES:
+    if (stats.instrument_type is not None and stats.instrument_type not in _EQUITY_TYPES) or fund_name(stats.name):
         store.set_ticker_valid(ticker, False, checked=now)
         notes.add("Not a company's shares (a fund, index or other instrument; marked invalid)", ticker)
         return None
@@ -423,13 +433,14 @@ def _cooldown(
     created = utc(last.created)
     if created <= now - timedelta(hours=cooldown_hours):
         return None
-    analysed = set(last.article_ids)
+    analysed = set(last.article_ids or ())
     for _, article in impacts:
         if article.id in analysed:
             continue
         # Qualifying news the last analysis never saw, however old it is: it may have been triaged a cycle late
-        # (the model was unavailable). Records from before article_ids existed fall back to the time test.
-        if analysed or max(utc(article.published), utc(article.fetched)) > created:
+        # (the model was unavailable), or the analysis was a manual one with no flagged news. Records from before
+        # article_ids existed (None) fall back to the time test.
+        if last.article_ids is not None or max(utc(article.published), utc(article.fetched)) > created:
             return None
     ago = max(0.0, (now - created).total_seconds() / 3600)
     return f"{ticker} (analysed {ago:.1f}h ago)"
@@ -462,9 +473,11 @@ def _same_session(
     created = utc(last.created)
     ago = max(0.0, (now - created).total_seconds() / 3600)
     item = f"{ticker} (analysed {ago:.1f}h ago, session {session_day(stats):%a %d %b})"
-    analysed = set(last.article_ids)
+    analysed = set(last.article_ids or ())
     unseen = any(
-        article.id not in analysed if analysed else max(utc(article.published), utc(article.fetched)) > created
+        article.id not in analysed
+        if last.article_ids is not None
+        else max(utc(article.published), utc(article.fetched)) > created
         for _, article in impacts
     )
     if not unseen:
@@ -528,6 +541,49 @@ def _stats(
     return stats
 
 
+def _watchlist_decides(ticker: str, group: list[tuple[Impact, Article]], cfg: ScannerConfig) -> bool:
+    """Whether ticker would be left out only for not being on the watchlist ([universe] only_watchlist, or news that
+    just the watchlist's leniency lets through), while a watchlist symbol on its exchange may be its current symbol."""
+    universe = cfg.universe
+    if ticker in universe.watchlist or ticker in universe.exclude:
+        return False
+    if universe.allowed_suffixes is not None and _suffix(ticker) not in universe.allowed_suffixes:
+        return False  # a replacement is on the same exchange: left out as well
+    if not any(_suffix(symbol) == _suffix(ticker) for symbol in universe.watchlist):
+        return False  # resolve() only finds listings on the same exchange
+    if universe.only_watchlist:
+        return True
+    return not _qualifying(group, cfg.dip, on_watchlist=False)[0] and bool(
+        _qualifying(group, cfg.dip, on_watchlist=True)[0]
+    )
+
+
+def _resolve_early(
+    ticker: str,
+    group: list[tuple[Impact, Article]],
+    valid: bool | None,
+    prices: YahooPrices,
+    store: Store,
+    symbols: SymbolResolver,
+    now: datetime,
+) -> Resolution | None:
+    """The replacement for a ticker the watchlist filters would leave out, looked up before them: first a price
+    request when its prices were never checked (PriceError marks it invalid, prices mark it valid for good), then
+    Yahoo's search. None when it has prices, nothing is found or anything fails: the filters then decide as usual."""
+    if valid is None:
+        try:
+            prices.stats(ticker, now=now)
+        except PriceError:
+            store.set_ticker_valid(ticker, False, checked=now)
+        except Exception as exc:  # network trouble: not the ticker's fault
+            log.warning("Couldn't get prices for %s: %s", ticker, exc, exc_info=log.isEnabledFor(logging.DEBUG))
+            return None
+        else:
+            store.set_ticker_valid(ticker, True, checked=now)
+            return None
+    return _resolve(symbols, ticker, group, now)[0]
+
+
 def _known(symbols: SymbolResolver, ticker: str, now: datetime) -> Resolution | None:
     """A replacement found for ticker in the last 7 days (from the store; None on any trouble)."""
     try:
@@ -545,8 +601,9 @@ def _resolve(
     if symbols is None:
         return None, False
     names = Counter(impact.company.strip() for impact, _ in group if impact.company.strip())
+    texts = [f"{article.title} {article.summary}" for _, article in group]
     try:
-        found = symbols.resolve(ticker, [name for name, _ in names.most_common()], now=now)
+        found = symbols.resolve(ticker, [name for name, _ in names.most_common()], now=now, texts=texts)
     except SymbolSearchError:
         return None, True
     except Exception:  # a bug or a database problem: this ticker is skipped, the cycle goes on

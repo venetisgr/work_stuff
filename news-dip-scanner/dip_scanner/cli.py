@@ -36,7 +36,7 @@ from .feeds import USER_AGENT, FeedResult, fetch_feed, needs_contact_user_agent,
 from .fundamentals import SecFundamentals
 from .fx import FxRates, main_currency, same_money
 from .llm import LLMError, LLMSetupError, build_models
-from .models import Feed, Opportunity, PriceBar, utc
+from .models import Feed, Impact, Opportunity, PriceBar, utc
 from .notices import STOPPED, one_line, scrub, secrets_of, send_notice, stopped_lines
 from .notify import build_notifiers
 from .pipeline import Scanner, thesis_change_line, usage_lines
@@ -48,9 +48,10 @@ from .report import (
     render_markdown,
     render_news_digest,
     set_display_zone,
+    zone_label,
 )
 from .store import Store
-from .symbols import SymbolResolver
+from .symbols import Resolution, SymbolResolver, current_symbol, symbol_aliases
 from .track import (
     Outcome,
     benchmark_for,
@@ -85,7 +86,13 @@ def main(argv: list[str] | None = None) -> int:
     truststore.inject_into_ssl()
     try:
         _load_env(args.env_file)
-        settings = load_settings()
+        # `run` and `watch` raise a wrong DISPLAY_TZ inside _stop_notice, so an unattended scanner still says it
+        # stopped; every other command reports it right away.
+        problems: list[ConfigError] = []
+        settings = load_settings(problems=problems)
+        if problems and args.handler not in (_run, _watch):
+            raise problems[0]
+        args.setting_problems = problems
         set_display_zone(settings.display_tz)
         if args.data_dir is not None:
             settings = replace(settings, data_dir=_folder(args.data_dir))
@@ -235,14 +242,15 @@ def _safe_console() -> None:
 
 
 class _DisplayTimeFormatter(logging.Formatter):
-    """Log times in the display time zone (DISPLAY_TZ, UTC by default), like every other time the scanner shows. The
-    zone is looked up for every record, so the log follows DISPLAY_TZ from .env, which is read after logging starts."""
+    """Log times in the display time zone (DISPLAY_TZ, UTC by default) with its abbreviation, like every other time
+    the scanner shows ("2026-09-25 23:30:05 EEST"). The zone is looked up for every record, so the log follows
+    DISPLAY_TZ from .env, which is read after logging starts."""
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
         moment = datetime.fromtimestamp(record.created, display_zone())
         if datefmt:
-            return moment.strftime(datefmt)
-        return f"{moment:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d}"
+            return f"{moment.strftime(datefmt)} {zone_label(moment)}"
+        return f"{moment:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d} {zone_label(moment)}"
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -358,8 +366,12 @@ def _scanner(args: argparse.Namespace, settings: Settings, *, notify: bool, feed
 def _stop_notice(command: str, args: argparse.Namespace, settings: Settings, *, notify: bool) -> Iterator[None]:
     """Sends a "dip-scanner stopped" notice to the alert channels when `run` or `watch` stops on a setup problem
     (LLMSetupError or ConfigError), then lets the error through. Unattended runs otherwise fail where nobody looks.
-    At most one such notice every 12 hours (notices.py); none with --no-notify or [alerts] system_notices = false."""
+    At most one such notice every 12 hours (notices.py); none with --no-notify or [alerts] system_notices = false.
+    A setting main() collected instead of raising (a wrong DISPLAY_TZ) is raised here, so it is noticed too."""
+    problems: list[ConfigError] = getattr(args, "setting_problems", [])
     try:
+        if problems:
+            raise problems[0]
         yield
     except (LLMSetupError, ConfigError) as exc:
         if notify:
@@ -512,14 +524,40 @@ def _age(delta: timedelta) -> str:
 
 
 def _news(args: argparse.Namespace, settings: Settings) -> int:
+    """The digest with every story under the symbol a scan cycle reads it as: its [universe] preferred_listings
+    listing, or the replacement found for an old symbol (OPAP.AT's news under ALWN.AT); --ticker takes those too."""
     now = _now()
+    preferred = _scanner_config(args).universe.preferred_listings
     ticker = _symbol(args.ticker) if args.ticker else None
+    if ticker in preferred:
+        print(f"{ticker} is read as {preferred[ticker]} ([universe] preferred_listings).", file=sys.stderr)
+        ticker = preferred[ticker]
+    since = now - timedelta(hours=args.hours)
     with open_store(settings) as store:
-        news = store.news(now - timedelta(hours=args.hours), ticker)
+        if ticker:
+            news = store.news(since, ticker, also=symbol_aliases(store, ticker, preferred, now=now))
+        else:
+            symbols: dict[str, str] = {}
+
+            def current(symbol: str) -> str:
+                if symbol not in symbols:
+                    symbols[symbol] = current_symbol(store, symbol, preferred, now=now)
+                return symbols[symbol]
+
+            news = [(article, _relabelled(impacts, current)) for article, impacts in store.news(since)]
     print(render_news_digest(news, hours=args.hours, generated=now), end="")
     if not news:
         print("(Nothing stored yet? `dip-scanner run` polls the feeds.)", file=sys.stderr)
     return EXIT_OK
+
+
+def _relabelled(impacts: list[Impact], current: Callable[[str], str]) -> list[Impact]:
+    """The impacts under their current symbols, one per symbol (the first)."""
+    result: dict[str, Impact] = {}
+    for impact in impacts:
+        symbol = current(impact.ticker)
+        result.setdefault(symbol, replace(impact, ticker=symbol))
+    return list(result.values())
 
 
 def _analyze(args: argparse.Namespace, settings: Settings) -> int:
@@ -529,6 +567,8 @@ def _analyze(args: argparse.Namespace, settings: Settings) -> int:
             opp = scanner.store.add_opportunity(opp)
             # You're reading it right now, so a running `watch` shouldn't send it to you as an alert as well.
             scanner.store.mark_notified([opp.id], when=opp.created)
+    if opp.ticker != _symbol(args.ticker):
+        print(f"{_symbol(args.ticker)} is read as {opp.ticker} ([universe] preferred_listings).", file=sys.stderr)
     print(render_markdown([opp], title=f"Analysis of {opp.ticker}", generated=opp.created), end="")
     if opp.id is not None:
         print(f"Saved as opportunity #{opp.id} (see `dip-scanner report` and `dip-scanner track`).", file=sys.stderr)
@@ -640,11 +680,32 @@ def _prices(args: argparse.Namespace, settings: Settings) -> int:
     symbol = _symbol(args.ticker)
     config = _scanner_config(args)
     with make_session() as session:
-        stats = YahooPrices(session).stats(symbol, now=_now())
+        try:
+            stats = YahooPrices(session).stats(symbol, now=_now())
+        except PriceError as exc:
+            found = _known_replacement(settings, symbol)
+            if found is None:
+                raise
+            raise PriceError(
+                f"{exc} The scanner found {found.symbol} ({found.name}) for {found.query}: try "
+                f"`dip-scanner prices {found.symbol}`."
+            ) from exc
     print(stats.as_text(display_zone()))
     reasons = dip_reasons(stats, config.dip, now=_now())
     print(f"Dip by the [dip] thresholds: {'; '.join(reasons)}" if reasons else "No dip by the [dip] thresholds.")
     return EXIT_OK
+
+
+def _known_replacement(settings: Settings, symbol: str) -> Resolution | None:
+    """The replacement a scan cycle found for a symbol without prices in the last 7 days, if there is a database."""
+    if not (settings.data_dir / DATABASE_NAME).exists():
+        return None
+    try:
+        with open_store(settings) as store:
+            return SymbolResolver(None, store).known(symbol, now=_now())
+    except sqlite3.Error as exc:  # only a hint
+        log.debug("Couldn't read the symbol lookups: %s", exc)
+        return None
 
 
 def _symbol(text: str) -> str:

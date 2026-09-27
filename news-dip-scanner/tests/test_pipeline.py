@@ -22,7 +22,15 @@ from conftest import (
     make_opportunity,
 )
 
-from dip_scanner.config import AccountConfig, AlertConfig, DipConfig, ScanConfig, ScannerConfig, Settings
+from dip_scanner.config import (
+    AccountConfig,
+    AlertConfig,
+    DipConfig,
+    ScanConfig,
+    ScannerConfig,
+    Settings,
+    UniverseConfig,
+)
 from dip_scanner.fundamentals import SecFundamentals
 from dip_scanner.llm import LLMError, LLMSetupError, LLMUnavailableError
 from dip_scanner.models import Feed
@@ -217,6 +225,24 @@ def test_a_missing_exchange_rate_never_costs_the_analysis(build):
     assert (opp.account_currency, opp.fx_rate) == ("EUR", None)
     assert any(note.startswith("No USD/EUR exchange rate for AMD, amounts in USD only") for note in result.notes)
     assert "≈" not in result.report_paths[3].read_text(encoding="utf-8")
+
+
+def test_the_benchmark_index_level_is_stored_with_the_analysis(build):
+    """Regression: the track record started the index at the quote day's close while the stock started at the price
+    of a report made during the session; the index's level at the analysis is now stored with it."""
+    index = "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC"
+    session = FakeSession({**routes(), index: fixture_json("yahoo_chart_amd.json")})  # the same session's quote
+    scanner = build(session=session)
+    [opp] = scanner.run_cycle(CYCLE).opportunities
+    assert (opp.benchmark, opp.benchmark_level) == ("^GSPC", 143.55)
+    assert scanner.store.opportunities()[0].benchmark_level == 143.55
+
+
+def test_no_quote_for_the_benchmark_index_never_costs_the_analysis(build):
+    scanner = build()  # no route for ^GSPC: a 404
+    [opp] = scanner.run_cycle(CYCLE).opportunities
+    assert (opp.benchmark, opp.benchmark_level) == ("^GSPC", None)
+    assert len(scanner.store.opportunities()) == 1
 
 
 def test_the_cycle_summary_uses_the_display_time_zone():
@@ -673,6 +699,71 @@ def test_analyze_ticker_ignores_the_thresholds_and_uses_stored_and_fresh_news(bu
     assert "Is AMD stock a buy after the guidance cut?" in prompt  # context news even with context_news = false
 
 
+def test_analyze_ticker_takes_the_news_filed_under_an_old_symbol(build):
+    """Regression (live): the hint for OPAP.AT says "try `dip-scanner analyze ALWN.AT`", but that analysis left out
+    the Allwyn story filed under OPAP.AT (no article_ids), and then held the story in the 24h cooldown."""
+    analysis_model = FakeChatModel(ANALYSIS)
+    scanner = build(analysis_model=analysis_model, feeds=[], symbols=True)
+    story = make_article(title="Advanced Micro Devices cuts guidance", published=CYCLE - timedelta(hours=3))
+    scanner.store.add_articles([story], max_age_hours=24, now=CYCLE)
+    scanner.store.record_triage([story.id], [make_impact(ticker="XMD", article_id=story.id)])
+    scanner.store.save_symbol_lookup("XMD", "Advanced Micro Devices", "AMD", "AMD", checked=CYCLE - timedelta(days=1))
+
+    opp = scanner.analyze_ticker("AMD", now=CYCLE)
+
+    assert opp.ticker == "AMD" and opp.article_ids == [story.id]
+    assert "Advanced Micro Devices cuts guidance" in analysis_model.prompts[0]
+    scanner.store.add_opportunity(opp)
+    result = scanner.run_cycle(CYCLE + timedelta(minutes=5))  # the story was seen: nothing new to analyse
+    assert result.opportunities == []
+    assert "Analysed within the 24h cooldown, no new news since: AMD (analysed 0.1h ago)" in result.notes
+
+
+def test_analyze_ticker_reads_a_symbol_as_its_preferred_listing(build):
+    """Regression: `analyze ASML` analysed the Nasdaq listing in USD without the news stored under ASML.AS."""
+    analysis_model = FakeChatModel(ANALYSIS)
+    config = ScannerConfig(universe=UniverseConfig(preferred_listings={"XMD": "AMD"}))
+    scanner = build(analysis_model=analysis_model, config=config, feeds=[])
+    old = make_article(title="AMD filed under the other listing", published=CYCLE - timedelta(hours=3))
+    new = make_article(title="AMD filed under the preferred one", published=CYCLE - timedelta(hours=10))
+    late = make_article(title="AMD news after the close", published=CYCLE - timedelta(minutes=10))
+    scanner.store.add_articles([old, new, late], max_age_hours=24, now=CYCLE)
+    scanner.store.record_triage(
+        [old.id, new.id, late.id],
+        [
+            make_impact(ticker="XMD", article_id=old.id),
+            make_impact(ticker="AMD", article_id=new.id),
+            make_impact(ticker="XMD", article_id=late.id),
+            make_impact(ticker="AMD", article_id=late.id),  # filed under both: once
+        ],
+    )
+
+    opp = scanner.analyze_ticker("XMD", now=CYCLE)
+
+    assert opp.ticker == "AMD" and opp.article_ids == [late.id, old.id, new.id]
+    assert not opp.news_after_session  # the older news came out during the session
+
+    only_late = scanner.analyze_ticker("XMD", now=CYCLE + timedelta(hours=46))  # the others: out of the lookback
+    assert only_late.article_ids == [late.id] and only_late.news_after_session
+    assert "all of this news came out after the last session (Fri 25 Sep)" in only_late.dip_reasons
+
+
+def test_a_preferred_listing_is_analysed_with_the_us_listings_sec_figures(build):
+    """Regression (live): the README's preferred_listings (ASML -> ASML.AS...) quietly dropped the SEC figures of
+    companies that file with the SEC, and the prompt said none were expected."""
+    analysis_model = FakeChatModel(ANALYSIS)
+    config = ScannerConfig(universe=UniverseConfig(preferred_listings={"AMD": "AMD.AS"}))
+    scanner = build(analysis_model=analysis_model, config=config)  # the fake chart for AMD answers AMD.AS too
+
+    [opp] = scanner.run_cycle(CYCLE).opportunities
+
+    assert opp.ticker == "AMD.AS"
+    prompt = analysis_model.prompts[0]
+    assert "From the SEC filings of the same company's US listing AMD; AMD.AS is the listing analysed" in prompt
+    assert "ADVANCED MICRO DEVICES" in prompt  # the SEC's figures for AMD (CIK 2488)
+    assert "outside the US" not in prompt
+
+
 def test_analyze_ticker_without_prices_raises_price_error(build):
     scanner = build()
     with pytest.raises(PriceError):
@@ -1061,6 +1152,35 @@ def test_a_model_unavailable_for_six_cycles_sends_one_notice_every_12_hours(buil
     scanner.triage_model = FakeChatModel(triage_reply)
     session.routes[MARKETWATCH_URL] = rss(("AMD shares slide again", "https://e.com/x", CYCLE + timedelta(hours=13)))
     scanner.run_cycle(CYCLE + timedelta(hours=13))
+    assert scanner.store.bump_streak("model_unavailable") == 1
+
+
+def test_a_model_that_answers_but_throttles_later_in_the_cycle_is_not_unavailable(build):
+    """Regression: the first triage batch of each cycle was answered and the second throttled (429); after 6 cycles
+    the notice said the model had been unavailable for 6 cycles."""
+    notifier = FakeNotifier()
+    calls = {"n": 0}
+
+    def flaky(system, prompt, json_mode):
+        calls["n"] += 1
+        if calls["n"] % 2 == 0:
+            raise LLMUnavailableError("OpenAI kept throttling requests (429).")
+        return triage_reply(system, prompt, json_mode)
+
+    session = FakeSession(routes())
+    config = ScannerConfig(scan=ScanConfig(context_news=False, triage_batch_size=1, max_candidates_per_cycle=0))
+    scanner = build(
+        session=session, feeds=FEEDS[:1], triage_model=FakeChatModel(flaky), notifiers=[notifier], config=config
+    )
+    for n in range(6):
+        when = CYCLE + timedelta(minutes=5 * n)
+        session.routes[MARKETWATCH_URL] = rss(
+            (f"AMD shares slide, update {n}", f"https://e.com/{n}a", when),
+            (f"Intel shares slide, update {n}", f"https://e.com/{n}b", when),
+        )
+        result = scanner.run_cycle(when)
+        assert result.model_calls >= 1 and result.model_unavailable is not None
+    assert notifier.sent == []
     assert scanner.store.bump_streak("model_unavailable") == 1
 
 

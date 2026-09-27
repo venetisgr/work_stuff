@@ -263,7 +263,7 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
         lines += [
             "",
             "| # | Ticker | Company | Score | Chance up in 6m | Price | Entry (limit buy) "
-            "| Target (from today's price) | Verdict |",
+            "| Target (from the reported price) | Verdict |",
             "|---:|---|---|---:|---:|---:|---:|---:|---|",
         ]
         for number, opp in enumerate(ranked, start=1):
@@ -324,9 +324,9 @@ def _opportunity_markdown(opp: Opportunity, newer: Opportunity | None = None) ->
 def key_figures(opp: Opportunity) -> list[tuple[str, str]]:
     """The (label, value) rows of an opportunity's key-figures table, shared by the Markdown and HTML reports.
 
-    The upside and downside are given twice: from today's price (the price at the analysis) and from the entry, where
-    the limit buy would fill. Price, entry and target carry their value in the [account] currency when it differs,
-    with a row naming the exchange rate.
+    The upside and downside are given twice: from the price at the analysis (reports are read days later, so not
+    "today's") and from the entry, where the limit buy would fill. Price, entry and target carry their value in the
+    [account] currency when it differs, with a row naming the exchange rate.
     """
     analysis, stats, currency, price = opp.analysis, opp.stats, opp.currency, opp.price
 
@@ -344,7 +344,7 @@ def key_figures(opp: Opportunity) -> list[tuple[str, str]]:
         ("Statistical 6-month low", level(stats.stat_low_6m)),
         ("Entry (limit buy)", level(analysis.entry_price, money=True)),
         ("Target (limit sell idea)", level(analysis.target_price, money=True)),
-        ("From today's price", f"target {format_pct(opp.upside_pct())} / low {format_pct(opp.downside_pct())}"),
+        ("From the reported price", f"target {format_pct(opp.upside_pct())} / low {format_pct(opp.downside_pct())}"),
         (
             "From the entry",
             f"target {format_pct(opp.entry_upside_pct())} / low {format_pct(opp.entry_downside_pct())}",

@@ -34,7 +34,9 @@ SYMBOL_LOOKUP_TTL = timedelta(days=7)
 ARTICLE_STATUSES = ("pending", "done", "failed", "skipped")
 _MAX_PARAMS = 500  # stay well under SQLite's bound-parameter limit in IN (...) lists
 
-SCHEMA_VERSION = 4  # 2: opportunities.alerted; 3: model_calls and system_notices; 4: symbol_lookups
+# 2: opportunities.alerted; 3: model_calls and system_notices; 4: symbol_lookups; 5: symbol_lookups.unconfirmed, and
+# the lookups of version 4 forgotten (its looser name test took HESM for Hess and a bond fund for Credit Suisse).
+SCHEMA_VERSION = 5
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -83,6 +85,7 @@ CREATE TABLE IF NOT EXISTS symbol_lookups (
     resolved TEXT,           -- the symbol found, NULL when nothing matched
     name TEXT,               -- Yahoo's name for it
     checked TEXT NOT NULL,
+    unconfirmed INTEGER NOT NULL DEFAULT 0,  -- 1: found by a longer name; taken once a story names it
     PRIMARY KEY (ticker, query)
 );
 CREATE TABLE IF NOT EXISTS opportunities (
@@ -159,6 +162,8 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             with conn:
+                if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
+                    conn.execute("DROP TABLE IF EXISTS symbol_lookups")  # see SCHEMA_VERSION
                 conn.executescript(_SCHEMA)
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)")}
                 if "alerted" not in columns:  # a version 1 database: what was notified then was sent
@@ -364,16 +369,23 @@ class Store:
             pairs.append((_impact(row, article_id=article.id), article))
         return pairs
 
-    def news(self, since: datetime, ticker: str | None = None) -> list[tuple[Article, list[Impact]]]:
+    def news(
+        self, since: datetime, ticker: str | None = None, *, also: Collection[str] = ()
+    ) -> list[tuple[Article, list[Impact]]]:
         """Articles published since the given time with their impacts, newest first.
 
-        With a ticker, only articles with an impact on that ticker are returned, each with just that impact.
+        With a ticker, only articles with an impact on that ticker, or on one of the symbols in also (whose news
+        belongs to it: an old symbol, a preferred listing's other symbol), are returned, each with one such impact
+        (its own first) relabelled as ticker.
         """
         params: list = [_ts(since)]
         where = "a.published >= ?"
+        wanted: list[str] = []
         if ticker:
-            where += " AND a.id IN (SELECT article_id FROM impacts WHERE ticker = ?)"
-            params.append(ticker.strip().upper())
+            symbol = ticker.strip().upper()
+            wanted = list(dict.fromkeys([symbol, *(item.strip().upper() for item in also)]))
+            where += f" AND a.id IN (SELECT article_id FROM impacts WHERE ticker IN ({_placeholders(len(wanted))}))"
+            params += wanted
         article_rows = self._query(
             f"SELECT {_prefixed('a', _ARTICLE_COLUMNS)} FROM articles a WHERE {where} ORDER BY a.published DESC, a.id",
             params,
@@ -383,8 +395,9 @@ class Store:
         result = []
         for article in articles:
             found = impacts.get(article.id, [])
-            if ticker:
-                found = [impact for impact in found if impact.ticker == ticker.strip().upper()]
+            if wanted:
+                mine = sorted((i for i in found if i.ticker in wanted), key=lambda impact: impact.ticker != symbol)
+                found = [replace(mine[0], ticker=symbol)] if mine else []
             result.append((article, found))
         return result
 
@@ -442,34 +455,75 @@ class Store:
 
     # --- symbol lookups (symbols.py) ---
 
-    def symbol_lookup(self, ticker: str, query: str, *, now: datetime) -> tuple[str | None, str | None] | None:
-        """(symbol found or None, its name) of a search for query made for ticker in the last 7 days, else None."""
+    def symbol_lookup(self, ticker: str, query: str, *, now: datetime) -> tuple[str | None, str | None, bool] | None:
+        """(symbol found or None, its name, whether it is unconfirmed) of a search for query made for ticker in the
+        last 7 days, else None. An unconfirmed symbol was found by a longer name (symbols.candidate) and only counts
+        once a story names it."""
         rows = self._query(
-            "SELECT resolved, name FROM symbol_lookups WHERE ticker = ? AND query = ? AND checked > ?",
+            "SELECT resolved, name, unconfirmed FROM symbol_lookups WHERE ticker = ? AND query = ? AND checked > ?",
             (ticker.strip().upper(), query, _ts(utc(now) - SYMBOL_LOOKUP_TTL)),
         )
-        return (rows[0]["resolved"], rows[0]["name"]) if rows else None
+        return (rows[0]["resolved"], rows[0]["name"], bool(rows[0]["unconfirmed"])) if rows else None
 
     def save_symbol_lookup(
-        self, ticker: str, query: str, resolved: str | None, name: str | None, *, checked: datetime
+        self,
+        ticker: str,
+        query: str,
+        resolved: str | None,
+        name: str | None,
+        *,
+        checked: datetime,
+        unconfirmed: bool = False,
     ) -> None:
         """Remember what a search for query found for ticker (resolved None: nothing matched)."""
         with self._write() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO symbol_lookups (ticker, query, resolved, name, checked) VALUES (?, ?, ?, ?, ?)",
-                (ticker.strip().upper(), query, resolved.strip().upper() if resolved else None, name, _ts(checked)),
+                "INSERT OR REPLACE INTO symbol_lookups (ticker, query, resolved, name, checked, unconfirmed) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    ticker.strip().upper(),
+                    query,
+                    resolved.strip().upper() if resolved else None,
+                    name,
+                    _ts(checked),
+                    int(bool(resolved and unconfirmed)),
+                ),
+            )
+
+    def confirm_symbol_lookup(self, ticker: str, query: str) -> None:
+        """A story named the symbol found for ticker by query: from now on it counts (resolved_symbol)."""
+        with self._write() as conn:
+            conn.execute(
+                "UPDATE symbol_lookups SET unconfirmed = 0 WHERE ticker = ? AND query = ?",
+                (ticker.strip().upper(), query),
             )
 
     def resolved_symbol(self, ticker: str, *, now: datetime) -> tuple[str, str, str] | None:
-        """(symbol, name, query) of the newest search in the last 7 days that found a replacement for ticker."""
+        """(symbol, name, query) of the newest search in the last 7 days that found a replacement for ticker (an
+        unconfirmed one doesn't count)."""
         rows = self._query(
             "SELECT resolved, name, query FROM symbol_lookups WHERE ticker = ? AND resolved IS NOT NULL "
-            "AND checked > ? ORDER BY checked DESC LIMIT 1",
+            "AND unconfirmed = 0 AND checked > ? ORDER BY checked DESC LIMIT 1",
             (ticker.strip().upper(), _ts(utc(now) - SYMBOL_LOOKUP_TTL)),
         )
         if not rows:
             return None
         return rows[0]["resolved"], rows[0]["name"] or rows[0]["resolved"], rows[0]["query"]
+
+    def renamed_to(self, symbol: str, *, now: datetime) -> list[str]:
+        """The symbols whose news goes to symbol: those whose newest replacement of the last 7 days
+        (resolved_symbol) is symbol, e.g. ["OPAP.AT"] for "ALWN.AT"."""
+        symbol = symbol.strip().upper()
+        rows = self._query(
+            "SELECT DISTINCT ticker FROM symbol_lookups WHERE resolved = ? AND unconfirmed = 0 AND checked > ? "
+            "ORDER BY ticker",
+            (symbol, _ts(utc(now) - SYMBOL_LOOKUP_TTL)),
+        )
+        return [
+            row["ticker"]
+            for row in rows
+            if (found := self.resolved_symbol(row["ticker"], now=now)) is not None and found[0] == symbol
+        ]
 
     # --- opportunities ---
 

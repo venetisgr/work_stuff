@@ -1,0 +1,417 @@
+{
+ "Hess": [
+  {
+   "symbol": "HESM",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Hess Midstream LP",
+   "shortname": "Hess Midstream LP"
+  },
+  {
+   "symbol": "HESS.L",
+   "exchange": "LSE",
+   "quoteType": "ETF",
+   "longname": "HSBC MSCI Emerging Markets Small Cap Screened UCITS ETF USD Acc",
+   "shortname": "HSBC ETFS PLC HSBC MSCI EM SC S"
+  }
+ ],
+ "Credit Suisse": [
+  {
+   "symbol": "DHY",
+   "exchange": "ASE",
+   "quoteType": "EQUITY",
+   "longname": "UBS Asset Management High Yield Credit Fund",
+   "shortname": "Credit Suisse High Yield Bond F"
+  },
+  {
+   "symbol": "CHIAX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "UBS Asst Mgmt Floating Rate Hi Inc A",
+   "shortname": "Credit Suisse High Income Fund "
+  },
+  {
+   "symbol": "AAXTZXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Credit Suisse AG, London Branch Point to Point Worst Of No Protection Note AAXTZXX"
+  },
+  {
+   "symbol": "ABKFYXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Credit Suisse AG, London Branch Issuer Callable Contingent Interest Worst Of Barrier Note ABKFYXX"
+  },
+  {
+   "symbol": "AAUELXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Credit Suisse AG, London Branch Issuer Callable Fixed Interest Fully Principally Protected Note AAUELXX"
+  },
+  {
+   "symbol": "CSHIX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "UBS Asst Mgmt Floating Rate Hi Inc Instl",
+   "shortname": "Credit Suisse High Income Fund "
+  }
+ ],
+ "Metlen": [
+  {
+   "symbol": "MTLN.L",
+   "exchange": "LSE",
+   "quoteType": "EQUITY",
+   "longname": "Metlen Energy & Metals PLC",
+   "shortname": "METLEN ENERGY & METALS PLC ORD "
+  },
+  {
+   "symbol": "MTLN.AT",
+   "exchange": "ATH",
+   "quoteType": "EQUITY",
+   "longname": "Metlen Energy & Metals PLC",
+   "shortname": "METLEN ENERGY & METALS PLC"
+  },
+  {
+   "symbol": "X4Z.MU",
+   "exchange": "MUN",
+   "quoteType": "EQUITY",
+   "shortname": "Metlen Energy & Metals PLC    R"
+  },
+  {
+   "symbol": "X4Z.SG",
+   "exchange": "STU",
+   "quoteType": "EQUITY",
+   "shortname": "Metlen Energy & Metals PLC"
+  },
+  {
+   "symbol": "X4Z.F",
+   "exchange": "FRA",
+   "quoteType": "EQUITY",
+   "longname": "Metlen Energy & Metals PLC",
+   "shortname": "Metlen Energy & Metals PLC    R"
+  },
+  {
+   "symbol": "MTLNL.XC",
+   "exchange": "CXE",
+   "quoteType": "EQUITY",
+   "longname": "Metlen Energy & Metals PLC",
+   "shortname": "Metlen Energy & Metals PLC"
+  }
+ ],
+ "OTE": [
+  {
+   "symbol": "OTEX",
+   "exchange": "NMS",
+   "quoteType": "EQUITY",
+   "longname": "Open Text Corporation",
+   "shortname": "Open Text Corporation"
+  },
+  {
+   "symbol": "OTEX.TO",
+   "exchange": "TOR",
+   "quoteType": "EQUITY",
+   "longname": "Open Text Corporation",
+   "shortname": "OPEN TEXT CORPORATION"
+  },
+  {
+   "symbol": "HTO.AT",
+   "exchange": "ATH",
+   "quoteType": "EQUITY",
+   "longname": "Hellenic Telecommunications Organization S.A.",
+   "shortname": "OTE S.A."
+  },
+  {
+   "symbol": "OTES.IL",
+   "exchange": "IOB",
+   "quoteType": "EQUITY",
+   "longname": "Hellenic Telecommunications Organization S.A.",
+   "shortname": "HELLENIC TELECOMMUNICATIONS ORG"
+  },
+  {
+   "symbol": "OTEX.NE",
+   "exchange": "NEO",
+   "quoteType": "EQUITY",
+   "shortname": "OPEN TEXT CORP"
+  },
+  {
+   "symbol": "OS3.HM",
+   "exchange": "HAM",
+   "quoteType": "EQUITY",
+   "longname": "Otello Corp ASA",
+   "shortname": "Otello Corporation ASA        N"
+  }
+ ],
+ "Block": [
+  {
+   "symbol": "PBUB",
+   "exchange": "NGM",
+   "quoteType": "EQUITY",
+   "longname": "Portfolio Building Block US Banks ETF"
+  },
+  {
+   "symbol": "PBCS",
+   "exchange": "NGM",
+   "quoteType": "EQUITY",
+   "longname": "Portfolio Building Block World Consumer Staples ETF"
+  },
+  {
+   "symbol": "PBWN",
+   "exchange": "NGM",
+   "quoteType": "EQUITY",
+   "longname": "Portfolio Building Block World Ex US Industrials ETF"
+  },
+  {
+   "symbol": "XYZ",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Block, Inc.",
+   "shortname": "Block, Inc."
+  },
+  {
+   "symbol": "HRB",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "H&R Block, Inc.",
+   "shortname": "H&R Block, Inc."
+  },
+  {
+   "symbol": "ARKF",
+   "exchange": "BTS",
+   "quoteType": "ETF",
+   "longname": "ARK Blockchain & Fintech Innovation ETF",
+   "shortname": "ARK Blockchain & Fintech Innova"
+  }
+ ],
+ "Siemens": [
+  {
+   "symbol": "ENR.DE",
+   "exchange": "GER",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Energy AG",
+   "shortname": "Siemens Energy AG             N"
+  },
+  {
+   "symbol": "SIE.DE",
+   "exchange": "GER",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Aktiengesellschaft",
+   "shortname": "SIEMENS AG                    N"
+  },
+  {
+   "symbol": "SIEGY",
+   "exchange": "PNK",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Aktiengesellschaft",
+   "shortname": "Siemens AG"
+  },
+  {
+   "symbol": "SHL.DE",
+   "exchange": "GER",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Healthineers AG",
+   "shortname": "Siemens Healthineers AG       N"
+  },
+  {
+   "symbol": "SMERY",
+   "exchange": "OQX",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Energy AG",
+   "shortname": "Siemens Energy AG"
+  },
+  {
+   "symbol": "SMEGF",
+   "exchange": "OQX",
+   "quoteType": "EQUITY",
+   "longname": "Siemens Energy AG",
+   "shortname": "Siemens Energy AG"
+  }
+ ],
+ "Shell": [
+  {
+   "symbol": "SHEL",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Shell plc",
+   "shortname": "Shell PLC"
+  },
+  {
+   "symbol": "SHELL.AS",
+   "exchange": "AMS",
+   "quoteType": "EQUITY",
+   "longname": "Shell plc",
+   "shortname": "SHELL PLC"
+  },
+  {
+   "symbol": "SHEL.L",
+   "exchange": "LSE",
+   "quoteType": "EQUITY",
+   "longname": "Shell plc",
+   "shortname": "SHELL PLC ORD EUR0.07"
+  },
+  {
+   "symbol": "SLYG.F",
+   "exchange": "FRA",
+   "quoteType": "EQUITY",
+   "longname": "Shelly Group SE",
+   "shortname": "Shelly Group PLC              R"
+  },
+  {
+   "symbol": "SHELN.MX",
+   "exchange": "MEX",
+   "quoteType": "EQUITY",
+   "longname": "Shell plc",
+   "shortname": "SHELL PLC"
+  },
+  {
+   "symbol": "SLYG.DE",
+   "exchange": "GER",
+   "quoteType": "EQUITY",
+   "longname": "Shelly Group SE",
+   "shortname": "Shelly Group PLC              R"
+  }
+ ],
+ "Marathon": [
+  {
+   "symbol": "MPC",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Marathon Petroleum Corporation",
+   "shortname": "Marathon Petroleum Corporation"
+  },
+  {
+   "symbol": "MBBC",
+   "exchange": "NCM",
+   "quoteType": "EQUITY",
+   "longname": "Marathon Bancorp, Inc.",
+   "shortname": "Marathon Bancorp, Inc."
+  },
+  {
+   "symbol": "0P0001VYJT.TW",
+   "exchange": "TAI",
+   "quoteType": "MUTUALFUND",
+   "longname": "CAPITAL MARATHON FUND TISA",
+   "shortname": "0P0001VYJT.TW"
+  },
+  {
+   "symbol": "NBFTDXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "NBC Marathon (Acclrtr) NoteSecurities (NoBarrier) LnkdTAPrtflOfCndnRnwblEnrgyCmpns SF 20280922 NL (837999A2)"
+  },
+  {
+   "symbol": "NBFTEXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "NBC Marathon Acclrtr NoteSecur MaturityMonitoredBarrier LnkdToTheSolactiveCanTelecomARIdx 20300307 DSC (838032A2)"
+  },
+  {
+   "symbol": "NBBXFXX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "NBC Marathon (Accelerator) Note Securities (Maturity-Monitored Barrier) linked to the Canadian market Class F due on 12-08-31 NL (837186A2)"
+  }
+ ],
+ "Bed Bath": [
+  {
+   "symbol": "BBBY-WT",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Bed Bath & Beyond, Inc. WT",
+   "shortname": "Bed Bath & Beyond, Inc."
+  },
+  {
+   "symbol": "BBBY.MX",
+   "exchange": "MEX",
+   "quoteType": "EQUITY",
+   "shortname": "BED BATH BEYOND INC"
+  }
+ ],
+ "Toshiba": [
+  {
+   "symbol": "6588.T",
+   "exchange": "JPX",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corporation",
+   "shortname": "TOSHIBA TEC CORP"
+  },
+  {
+   "symbol": "TSHTY",
+   "exchange": "PNK",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corporation",
+   "shortname": "Toshiba Tec Corp."
+  },
+  {
+   "symbol": "TSHTF",
+   "exchange": "PNK",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corporation",
+   "shortname": "TOSHIBA TEC CORP"
+  },
+  {
+   "symbol": "TECA.F",
+   "exchange": "FRA",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corporation",
+   "shortname": "TOSHIBA TEC CORP.             R"
+  },
+  {
+   "symbol": "TEC.F",
+   "exchange": "FRA",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corporation",
+   "shortname": "Toshiba TEC Corp.             R"
+  },
+  {
+   "symbol": "TECA.MU",
+   "exchange": "MUN",
+   "quoteType": "EQUITY",
+   "longname": "Toshiba Tec Corp",
+   "shortname": "TOSHIBA TEC CORP.             R"
+  }
+ ],
+ "Hawaiian": [
+  {
+   "symbol": "HE",
+   "exchange": "NYQ",
+   "quoteType": "EQUITY",
+   "longname": "Hawaiian Electric Industries, Inc.",
+   "shortname": "Hawaiian Electric Industries, I"
+  },
+  {
+   "symbol": "FHB",
+   "exchange": "NMS",
+   "quoteType": "EQUITY",
+   "longname": "First Hawaiian, Inc.",
+   "shortname": "First Hawaiian, Inc."
+  },
+  {
+   "symbol": "HULAX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Hawaiian Tax-Free Trust A",
+   "shortname": "Hawaiian Tax-Free Trust Class A"
+  },
+  {
+   "symbol": "HULCX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Hawaiian Tax-Free Trust C",
+   "shortname": "Hawaiian Tax-Free Trust, Class "
+  },
+  {
+   "symbol": "HULYX",
+   "exchange": "NAS",
+   "quoteType": "MUTUALFUND",
+   "longname": "Hawaiian Tax-Free Trust Y",
+   "shortname": "Hawaiian Tax-Free Trust, Class "
+  },
+  {
+   "symbol": "HWI.MU",
+   "exchange": "MUN",
+   "quoteType": "EQUITY",
+   "longname": "Hawaiian Electric Industries Inc",
+   "shortname": "HAWAIIAN ELECTRIC INDUSTR.INC.R"
+  }
+ ]
+}

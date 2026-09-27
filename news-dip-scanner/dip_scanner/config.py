@@ -79,10 +79,12 @@ class Settings:
     display_tz: tzinfo = UTC
 
 
-def load_settings(env: Mapping[str, str] | None = None) -> Settings:
+def load_settings(env: Mapping[str, str] | None = None, *, problems: list[ConfigError] | None = None) -> Settings:
     """Read settings from the environment. Missing values are fine here; they're reported when they're needed.
 
-    Values that are set but wrong (an unknown LLM_PROVIDER, a port that isn't a number...) raise ConfigError.
+    Values that are set but wrong (an unknown LLM_PROVIDER, a port that isn't a number...) raise ConfigError. Given a
+    problems list, an unknown DISPLAY_TZ is added to it instead (and UTC used): the alert channels don't depend on
+    it, so the command line can still send `run` and `watch`'s "dip-scanner stopped" notice about it.
     """
     env = os.environ if env is None else env
 
@@ -104,6 +106,14 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
     smtp_port = _positive_int(get("SMTP_PORT"), "SMTP_PORT")
     if smtp_port is not None and smtp_port > 65535:
         raise ConfigError(f"SMTP_PORT must be a port number between 1 and 65535 (got {smtp_port}).")
+
+    try:
+        display_tz = display_zone(get("DISPLAY_TZ"))
+    except ConfigError as exc:
+        if problems is None:
+            raise
+        problems.append(exc)
+        display_tz = UTC
 
     return Settings(
         llm=LLMSettings(
@@ -136,7 +146,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ),
         sec_user_agent=get("SEC_USER_AGENT"),
         data_dir=_data_dir(get("DATA_DIR")),
-        display_tz=display_zone(get("DISPLAY_TZ")),
+        display_tz=display_tz,
     )
 
 
@@ -255,6 +265,12 @@ class UniverseConfig:
     # The listing to use for a company listed in several places, e.g. {"ASML": "ASML.AS"} for a euro account: news the
     # triage files under the key goes to the value, and watchlist and exclude entries are read the same way.
     preferred_listings: dict[str, str] = field(default_factory=dict)
+
+    def sec_symbol(self, ticker: str) -> str:
+        """The US symbol a preferred listing's company files with the SEC under (ASML.AS -> ASML, when "ASML" =
+        "ASML.AS"), else ticker. Only a key without an exchange suffix counts: "SAP.F" has no SEC filings either."""
+        us = (key for key, value in self.preferred_listings.items() if value == ticker and "." not in key)
+        return next(us, ticker)
 
 
 @dataclass(frozen=True)
@@ -439,6 +455,12 @@ def _account_currency(value: str | None, path: Path) -> str | None:
     return code
 
 
+def _listing_suffix(symbol: str) -> str:
+    """The Yahoo exchange suffix of a symbol (".AS" for "ASML.AS"), "" for a US listing."""
+    _, dot, suffix = symbol.rpartition(".")
+    return f".{suffix.upper()}" if dot else ""
+
+
 def _suffix(value: str) -> str:
     value = value.strip().upper()
     return value if not value or value.startswith(".") else f".{value}"
@@ -469,6 +491,19 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
     for ok, message in checks:
         if not ok:
             raise ConfigError(f"{message} (in {path}).")
+    if universe.allowed_suffixes is not None:
+        # A preferred listing on an exchange that isn't allowed would only drop the company's news, every cycle.
+        blocked = [
+            f'"{key}" = "{value}"'
+            for key, value in universe.preferred_listings.items()
+            if _listing_suffix(value) not in universe.allowed_suffixes
+        ]
+        if blocked:
+            raise ConfigError(
+                f"universe.preferred_listings in {path} moves news to exchanges that universe.allowed_suffixes leaves "
+                f"out, so that news would be dropped: {', '.join(blocked)}. Add their suffixes to allowed_suffixes or "
+                "remove those entries."
+            )
     for where, values, allowed in (
         ("dip.directions", dip.directions, DIRECTIONS),
         ("alerts.verdicts", alerts.verdicts, VERDICTS),
@@ -570,13 +605,19 @@ def default_file(name: str, env_var: str, *, env: Mapping[str, str] | None = Non
 
 
 def _read_toml(path: Path, what: str) -> dict[str, Any]:
+    """A TOML file's contents. A leading byte-order mark (Windows Notepad and PowerShell 5 write one) is skipped."""
     try:
-        with path.open("rb") as fh:
-            return tomllib.load(fh)
+        raw = path.read_bytes()
     except FileNotFoundError:
         raise ConfigError(f"{what} not found: {path}") from None
     except OSError as exc:  # a folder, no permission...
         raise ConfigError(f"{what} can't be read: {path} ({exc.strerror or exc})") from None
+    try:
+        return tomllib.loads(raw.removeprefix(b"\xef\xbb\xbf").decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ConfigError(
+            f"{path} is not valid TOML: it isn't UTF-8 text (byte {exc.start}); save it as UTF-8."
+        ) from None
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path} is not valid TOML: {exc}") from None
 

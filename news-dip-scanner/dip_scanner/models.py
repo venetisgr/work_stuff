@@ -266,7 +266,7 @@ class Opportunity:
     score: float  # 0..100 composite, see analyze.score
     analysis: Analysis
     stats: PriceStats
-    article_ids: list[str]
+    article_ids: list[str] | None  # the flagged articles it saw; None for records from before these were stored
     headlines: list[dict]  # [{"title", "link", "source", "published" (ISO str), "direction", "magnitude"}]
     dip_reasons: list[str]
     model: str  # model/deployment that wrote the analysis
@@ -279,6 +279,11 @@ class Opportunity:
     # Yahoo had no rate (fx_rate only).
     account_currency: str | None = None
     fx_rate: float | None = None
+    # The benchmark index of the ticker's exchange (track.benchmark_for) and its level when this was analysed, from
+    # the same session as the price, so `track` measures the index from the same moment as the stock. None when
+    # unknown (records from before these were stored, or no quote for the index then).
+    benchmark: str | None = None
+    benchmark_level: float | None = None
 
     def upside_pct(self) -> float:
         """How far the target price is above the price at the time of the analysis, in %."""
@@ -308,13 +313,15 @@ class Opportunity:
             "score": self.score,
             "analysis": analysis_to_dict(self.analysis),
             "stats": stats_to_dict(self.stats),
-            "article_ids": list(self.article_ids),
+            "article_ids": None if self.article_ids is None else list(self.article_ids),
             "headlines": [_json_safe(headline) for headline in self.headlines],
             "dip_reasons": list(self.dip_reasons),
             "model": self.model,
             "news_after_session": self.news_after_session,
             "account_currency": self.account_currency,
             "fx_rate": self.fx_rate,
+            "benchmark": self.benchmark,
+            "benchmark_level": self.benchmark_level,
         }
 
     @classmethod
@@ -329,7 +336,7 @@ class Opportunity:
             score=data["score"],
             analysis=analysis_from_dict(data["analysis"]),
             stats=stats_from_dict(data["stats"]),
-            article_ids=list(data.get("article_ids") or []),
+            article_ids=None if data.get("article_ids") is None else list(data["article_ids"]),
             headlines=[dict(headline) for headline in data.get("headlines") or []],
             dip_reasons=list(data.get("dip_reasons") or []),
             model=data.get("model") or "",
@@ -337,6 +344,8 @@ class Opportunity:
             news_after_session=bool(data.get("news_after_session", False)),
             account_currency=data.get("account_currency") or None,
             fx_rate=_positive_or_none(data.get("fx_rate")),
+            benchmark=data.get("benchmark") or None,
+            benchmark_level=_positive_or_none(data.get("benchmark_level")),
         )
 
 

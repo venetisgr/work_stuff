@@ -18,12 +18,12 @@ from pathlib import Path
 
 from .analyze import analyze_candidate
 from .config import ConfigError, ScannerConfig, Settings
-from .detect import dip_reasons, select_candidates, severity
+from .detect import dip_reasons, news_after_session, select_candidates, session_day, severity
 from .feeds import CONTACT_USER_AGENT_MISSING, fetch_all, needs_contact_user_agent, ticker_news, user_agent_for
 from .fundamentals import SecFundamentals
 from .fx import FxRates
 from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError, Usage
-from .models import Candidate, Feed, ModelUsage, Opportunity, utc
+from .models import Article, Candidate, Feed, Impact, ModelUsage, Opportunity, utc
 from .notices import FEEDS_FAILING, MODEL_UNAVAILABLE, one_line, secrets_of, send_notice
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
 from .prices import PriceError, PriceFetchError, YahooPrices
@@ -38,7 +38,8 @@ from .report import (
     write_reports,
 )
 from .store import Store
-from .symbols import Resolution, SymbolResolver
+from .symbols import Resolution, SymbolResolver, symbol_aliases
+from .track import benchmark_for, quote_day
 from .triage import normalise_ticker, triage
 
 log = logging.getLogger(__name__)
@@ -390,10 +391,13 @@ class Scanner:
     def _check_health(self, now: datetime, result: CycleResult) -> None:
         """Count the cycles in a row in which the model couldn't be used, or every feed failed, and send a system
         notice once a count reaches [alerts] notice_after_cycles (see notices.py). A cycle in which the model
-        answered (or a feed did) resets its count; a cycle that didn't need the model leaves it. Never raises."""
+        answered (or a feed did) resets its count, also when a later request of it was throttled; a cycle that didn't
+        need the model leaves it. Never raises."""
         needed = self.config.alerts.notice_after_cycles
         try:
-            if result.model_unavailable is not None:
+            if result.model_calls:
+                self.store.reset_streak(MODEL_UNAVAILABLE)
+            elif result.model_unavailable is not None:
                 streak = self.store.bump_streak(MODEL_UNAVAILABLE)
                 if streak >= needed:
                     self._notice(
@@ -408,8 +412,6 @@ class Scanner:
                             "status page, the network, and your rate limits and quota.",
                         ],
                     )
-            elif result.model_calls:
-                self.store.reset_streak(MODEL_UNAVAILABLE)
             if result.feeds_failed and not result.feeds_ok:
                 streak = self.store.bump_streak(FEEDS_FAILING)
                 if streak >= needed:
@@ -472,14 +474,37 @@ class Scanner:
             extra = ticker_news(
                 self.session, candidate.ticker, company=candidate.company, now=now, limit=CONTEXT_NEWS_LIMIT
             )
-        fundamentals = self.fundamentals.get(candidate.ticker) if self.fundamentals is not None else None
+        # A preferred listing (ASML.AS) gets the SEC figures of the company's US listing (ASML).
+        sec_ticker = self.config.universe.sec_symbol(candidate.ticker)
+        fundamentals = self.fundamentals.get(sec_ticker) if self.fundamentals is not None else None
         model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
         try:
-            opportunity = analyze_candidate(model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
+            opportunity = analyze_candidate(
+                model, candidate, fundamentals=fundamentals, extra_news=extra, now=now, sec_ticker=sec_ticker
+            )
         finally:
             if result is not None:
                 result.model_calls += model.answered
-        return self._with_fx(opportunity, now, result)
+        return self._with_benchmark_level(self._with_fx(opportunity, now, result), now)
+
+    def _with_benchmark_level(self, opp: Opportunity, now: datetime) -> Opportunity:
+        """The opportunity with its exchange's benchmark index and that index's level now, when the index's quote is
+        from the same session as the opportunity's price (so `track` compares both from the same moment, also for
+        a report made while the market is open). Without one the level stays None; the analysis is never lost."""
+        symbol = benchmark_for(opp.ticker)
+        try:
+            index = self.prices.stats(symbol, now=now)  # cached: one request per index and cycle
+        except Exception as exc:  # PriceError, PriceFetchError, or a bug: only the track record's start point
+            log.warning(
+                "No quote for the benchmark index %s of %s: %s",
+                symbol,
+                opp.ticker,
+                exc,
+                exc_info=not isinstance(exc, PriceError | PriceFetchError),
+            )
+            return replace(opp, benchmark=symbol)
+        same_session = session_day(index) == quote_day(opp)
+        return replace(opp, benchmark=symbol, benchmark_level=index.price if same_session else None)
 
     def _with_fx(self, opp: Opportunity, now: datetime, result: CycleResult | None) -> Opportunity:
         """The opportunity with [account] currency and today's exchange rate into it (Yahoo). Without a rate the
@@ -666,20 +691,34 @@ class Scanner:
     def analyze_ticker(self, ticker: str, now: datetime | None = None) -> Opportunity:
         """Analyse one ticker on demand, ignoring dip thresholds and the cooldown. The result isn't stored.
 
-        Uses the ticker's stored impacts from the [scan] lookback window plus fresh per-ticker headlines (always
-        fetched here, whatever [scan] context_news says). Raises PriceError / PriceFetchError when there are no
-        prices, LLMError when the model's reply is unusable. A PriceError names the symbol that replaces this one
-        when the scanner found one (see symbols.py), e.g. "try `dip-scanner analyze ALWN.AT`" for OPAP.AT.
+        A symbol with a [universe] preferred_listings entry is analysed as that listing ("ASML" as ASML.AS), like a
+        scan cycle reads it. Uses the ticker's stored impacts from the [scan] lookback window, those filed under the
+        symbols whose news belongs to it included (the preferred listing's other symbols, an old symbol replaced by
+        it: OPAP.AT's for ALWN.AT), plus fresh per-ticker headlines (always fetched here, whatever [scan]
+        context_news says). Raises PriceError / PriceFetchError when there are no prices, LLMError when the model's
+        reply is unusable. A PriceError names the symbol that replaces this one when the scanner found one (see
+        symbols.py), e.g. "try `dip-scanner analyze ALWN.AT`" for OPAP.AT.
         """
         now = utc(now) if now is not None else utc(self._clock())
         symbol = normalise_ticker(ticker) or ticker.strip().upper()
+        preferred = self.config.universe.preferred_listings
+        if symbol in preferred:
+            log.info("%s is read as %s ([universe] preferred_listings).", symbol, preferred[symbol])
+            symbol = preferred[symbol]
+        aliases = symbol_aliases(self.store, symbol, preferred, now=now)
         since = now - timedelta(hours=self.config.scan.lookback_hours)
-        impacts = [(impact, article) for impact, article in self.store.recent_impacts(since) if impact.ticker == symbol]
+        impacts: list[tuple[Impact, Article]] = []
+        seen: set[str] = set()
+        for impact, article in self.store.recent_impacts(since):
+            if impact.ticker in aliases and article.id not in seen:
+                seen.add(article.id)
+                impacts.append((replace(impact, ticker=symbol), article))
         names = Counter(impact.company for impact, _ in impacts if impact.company)
         try:
             stats = self.prices.stats(symbol, now=now)
         except PriceError as exc:
-            found = self._replacement(symbol, [name for name, _ in names.most_common()], now)
+            texts = [f"{article.title} {article.summary}" for _, article in impacts]
+            found = self._replacement(symbol, [name for name, _ in names.most_common()], texts, now)
             if found is None:
                 raise
             raise PriceError(
@@ -687,23 +726,29 @@ class Scanner:
                 f"`dip-scanner analyze {found.symbol}`."
             ) from exc
         company = (stats.name or "").strip() or (names.most_common(1)[0][0] if names else symbol)
+        reasons = dip_reasons(stats, self.config.dip, now=now)
+        unpriced = news_after_session(stats, impacts)  # as in a cycle, so its cooldown ends when the market moves
+        if unpriced:
+            reasons.append(f"all of this news came out after the last session ({session_day(stats):%a %d %b})")
         candidate = Candidate(
             ticker=symbol,
             company=company,
             stats=stats,
             impacts=impacts,
-            dip_reasons=dip_reasons(stats, self.config.dip, now=now),
+            dip_reasons=reasons,
             severity=severity(stats, impacts),
+            news_after_session=unpriced,
         )
         return self._analyze(candidate, now, context_news=True)
 
-    def _replacement(self, symbol: str, companies: list[str], now: datetime) -> Resolution | None:
+    def _replacement(self, symbol: str, companies: list[str], texts: list[str], now: datetime) -> Resolution | None:
         """The symbol found for one without prices: remembered from a scan cycle, or searched for by the company
-        names the triage gave it. None when there is no resolver, nothing matches or the search fails."""
+        names the triage gave it (texts: its stories). None when there is no resolver, nothing matches or the search
+        fails."""
         if self.symbols is None:
             return None
         try:
-            return self.symbols.known(symbol, now=now) or self.symbols.resolve(symbol, companies, now=now)
+            return self.symbols.known(symbol, now=now) or self.symbols.resolve(symbol, companies, now=now, texts=texts)
         except Exception as exc:  # only a hint: the price error is what counts
             log.debug("Couldn't look up a new symbol for %s: %s", symbol, exc)
             return None

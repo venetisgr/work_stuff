@@ -33,11 +33,15 @@ evaluate() replays an opportunity's limit orders against the daily bars that fol
   then the returns are shown as "–" and the outcome counts in no rate or average (right after a report there is
   nothing to measure, and 0 of 8 higher, +0.0% would look like a result).
 
-with_benchmark() adds the return of the exchange's benchmark index over the same days (from its close on the quote
-day to its close on the day of last_price; BENCHMARKS lists the index per exchange), so a rising market doesn't pass
-for skill: excess_return_pct is return_pct minus it. with_account_return() adds the return in the [account]
-currency: (1 + return) * rate at the end / rate at the report - 1, with the rate stored with the report when there is
-one, else the day's closing rate.
+with_benchmark() adds the return of the exchange's benchmark index over the same days (BENCHMARKS lists the index per
+exchange), so a rising market doesn't pass for skill: from the index's level stored with the report (taken with the
+report's price, also while the market was open) to its close on the day of last_price, and excess_return_pct is
+return_pct minus it. A record without a stored level starts the index at its close on the quote day; when that report
+was made while the session was running, the stock's return for the comparison then starts at that close too
+(index_aligned_return_pct), so the rest of the report's day doesn't count for one and not the other.
+
+with_account_return() adds the return in the [account] currency: (1 + return) * rate at the end / rate at the report
+- 1, with the rate stored with the report when there is one, else the day's closing rate.
 """
 
 from __future__ import annotations
@@ -115,13 +119,18 @@ class Outcome:
     benchmark_return_pct: float | None = None  # its return over the same days; None when unknown
     account_currency: str | None = None  # [account] currency of account_return_pct
     account_return_pct: float | None = None  # return_pct in the account currency; None when a rate is missing
+    # The close of the report's session when the report was made while it was running (split basis), else None.
+    session_close: float | None = None
+    # The stock's return from where the index's starts (see with_benchmark); None: the same as return_pct.
+    index_aligned_return_pct: float | None = None
 
     @property
     def excess_return_pct(self) -> float | None:
         """The return minus the benchmark index's over the same days (None when either is unknown)."""
         if not self.priced or self.benchmark_return_pct is None:
             return None
-        return self.return_pct - self.benchmark_return_pct
+        stock = self.return_pct if self.index_aligned_return_pct is None else self.index_aligned_return_pct
+        return stock - self.benchmark_return_pct
 
 
 def _local_date(moment: datetime, zone: str | None) -> date:
@@ -203,6 +212,8 @@ def evaluate(opp: Opportunity, bars: list[PriceBar], *, now: datetime, splits: S
         for bar in window
     )
     quoted = {bar.day: bar for bar in bars}.get(quoted_day) or (window[0] if window else None)
+    during_session = opp.stats.session_elapsed is not None and quoted_day == start
+    session_close = quoted.close if during_session and quoted is not None and quoted.day == quoted_day else None
     mismatch = quoted is not None and price > 0 and max(quoted.close / price, price / quoted.close) > MAX_PRICE_MISMATCH
     if mismatch:
         log.warning(
@@ -231,6 +242,7 @@ def evaluate(opp: Opportunity, bars: list[PriceBar], *, now: datetime, splits: S
         price_mismatch=mismatch,
         priced=priced,
         last_day=window[-1].day if window else None,
+        session_close=session_close,
     )
 
 
@@ -265,14 +277,23 @@ def benchmark_for(ticker: str) -> str:
 
 
 def with_benchmark(outcome: Outcome, symbol: str, bars: Sequence[PriceBar]) -> Outcome:
-    """The outcome with the index's return over the same days: from its last close on or before the report's quote
-    day to its last close on or before last_day. None (the symbol kept) when nothing has traded since the report or
-    the index has no close for one of the two days."""
+    """The outcome with the index's return over the same days: from its level stored with the report (the same
+    session as the report's price) to its last close on or before last_day.
+
+    Records without a stored level (older ones, or no index quote then) start at the index's last close on or before
+    the quote day; when such a report was made while the session was running, index_aligned_return_pct measures the
+    stock from that session's close as well. None (the symbol kept) when nothing has traded since the report or the
+    index has no close for one of the two days."""
+    opp = outcome.opportunity
     closes = sorted(((bar.day, bar.close) for bar in bars if bar.close > 0), key=lambda item: item[0])
-    start = rate_on(closes, quote_day(outcome.opportunity))
+    stored = opp.benchmark_level if opp.benchmark == symbol and opp.benchmark_level else None
+    start = stored or rate_on(closes, quote_day(opp))
     end = rate_on(closes, outcome.last_day) if outcome.last_day is not None else None
     value = _change(end, start) if outcome.priced and start and end else None
-    return replace(outcome, benchmark=symbol, benchmark_return_pct=value)
+    aligned = None
+    if stored is None and outcome.session_close:
+        aligned = _change(outcome.last_price, outcome.session_close)
+    return replace(outcome, benchmark=symbol, benchmark_return_pct=value, index_aligned_return_pct=aligned)
 
 
 def with_account_return(outcome: Outcome, account: str, rates: Sequence[tuple[date, float]] | None) -> Outcome:
@@ -507,9 +528,10 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
         "",
         "_Returns are from the price in the report to the last close within 6 months; limit-order returns from the "
         "entry to the target (when hit) or that close. A target only counts on a day after the entry filled. Index is "
-        "the exchange's benchmark (^GSPC for US listings, GD.AT for Athens, ^GDAXI for Xetra...) from its close on the "
-        "day of the report's price to its close on the day of the last price, and vs index the return minus that: a "
-        f"rising market lifts every dip, and this shows what the picks added.{currency_note} Prices are shown as "
+        "the exchange's benchmark (^GSPC for US listings, GD.AT for Athens, ^GDAXI for Xetra...) from its level at "
+        "the report (stored with it; for older reports its close on the day of the report's price) to its close on the "
+        "day of the last price, and vs index the return minus that, both from the same moment: a rising market lifts "
+        f"every dip, and this shows what the picks added.{currency_note} Prices are shown as "
         "reported; after a split they are compared with the split-adjusted history. Past results say little about "
         "future ones, and this is not investment advice._",
     ]

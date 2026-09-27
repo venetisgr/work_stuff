@@ -518,9 +518,12 @@ def ticker_news(
 
     Google News is searched for "<company or ticker> stock when:30d" in its US English edition, and for listings on
     the exchanges in GOOGLE_NEWS_LOCAL (Athens, Xetra, Paris, Milan, Madrid, Amsterdam) also in the local edition,
-    with the local word for "share" ("Jumbo μετοχή when:30d" in Greek for BELA.AT). Only headlines that are about the
-    company are kept (the title or summary names it, or its symbol; Yahoo's per-ticker feed is full of unrelated
-    roundups) and only those at most MAX_CONTEXT_AGE (30 days) old. They are deduplicated by title_key (so "AMD
+    with the local word for "share" ("Jumbo μετοχή when:30d" in Greek for BELA.AT). When the company's name is one
+    word without its legal form, the English edition is searched for the name as given, quoted, or the symbol
+    ('"Titan S.A." OR TITC stock when:30d'): "Titan stock" finds Titan Company, Titan Mining and Titan Machinery.
+    Only headlines that are about the company are kept (the title or summary names it, or its symbol, see
+    _mentions_matcher; Yahoo's per-ticker feed is full of unrelated roundups) and only those at most MAX_CONTEXT_AGE
+    (30 days) old. They are deduplicated by title_key (so "AMD
     slides - Reuters" on Google and "AMD slides" on Yahoo count once), and no source gets more than its share of the
     places (half, or a third with a local edition) unless the others have too few. Every article's source is
     "ticker:<SYM>"; Google News items are credited to their publisher when the feed names one.
@@ -530,12 +533,19 @@ def ticker_news(
     source = f"ticker:{symbol}"
     name = company_core(company or "") or symbol
     sources = [(Feed(key=source, name="Yahoo Finance", url=YAHOO_TICKER_RSS.format(symbol=quote(symbol))), False)]
-    _, dot, suffix = symbol.rpartition(".")
+    bare, dot, suffix = symbol.rpartition(".")
+    bare = bare if dot else symbol
     editions = [GOOGLE_NEWS_ENGLISH]
     if dot and (local := GOOGLE_NEWS_LOCAL.get(f".{suffix}")) is not None:
         editions.append(local)
+    # A one-word name is often a common word or shared by other companies ("Titan": Titan Company, Titan Machinery,
+    # "tech titan"): the English edition is searched for the full name as Yahoo writes it, or the symbol.
+    english = name
+    if company and len(name.split()) == 1:
+        english = f'"{" ".join(company.replace(chr(34), "").split())}" OR {bare}'
     for hl, gl, ceid, word in editions:
-        query = quote_plus(f"{name} {word} when:{MAX_CONTEXT_AGE.days}d")
+        what = english if (hl, gl, ceid, word) == GOOGLE_NEWS_ENGLISH else name
+        query = quote_plus(f"{what} {word} when:{MAX_CONTEXT_AGE.days}d")
         url = GOOGLE_NEWS_RSS.format(query=query, hl=hl, gl=gl, ceid=ceid)
         sources.append((Feed(key=source, name="Google News", url=url, languages=()), True))
     about = _mentions_matcher(symbol, company)
@@ -590,7 +600,7 @@ def strip_legal_forms(company: str) -> str:
     and "Inc Research" keep their names."""
     name = " ".join((company or "").split())
     while True:
-        first = name.split(" ", 1)[0]
+        first = re.split(r"[\s,]+", name, maxsplit=1)[0]  # "Tesla, Inc." -> "Tesla", not "Tesla,"
         stripped = _TRAILING_JOINER.sub("", _LEGAL_SUFFIX.sub("", name))
         if stripped == name or len(stripped) < len(first):
             return name
@@ -612,20 +622,36 @@ def company_core(company: str) -> str:
 
 def _mentions_matcher(symbol: str, company: str | None):
     """A test for "is this article about the company": its name (without legal-form words) as whole words, or its
-    symbol without the exchange suffix, case-sensitive; symbols of one or two letters only as $T, (T) or :T."""
+    symbol without the exchange suffix, case-sensitive; symbols of one or two letters only as $T, (T) or :T.
+
+    The headline is read without the " - Publisher" of the publisher the item is credited to (every item from "Stock
+    Titan" ends in "Titan"). A one-word name only counts as a name: capitalised ("Titan", "TITAN", "Nike" for "NIKE")
+    or exactly as written ("eBay"), not the common word ("tech titan", "a jumbo rate cut"). Longer names match in any
+    case."""
     bare = symbol.split(".")[0]  # BELA.AT -> BELA
     if len(bare) <= 2:
         symbol_pattern = re.compile(rf"(?:\$|\(|:){re.escape(bare)}\b")
     else:
         symbol_pattern = re.compile(rf"(?<![\w$-]){re.escape(bare)}(?![\w-])|\${re.escape(bare)}\b")
-    core = company_core(company or "").casefold()
-    name_pattern = re.compile(rf"\b{re.escape(core)}\b") if core else None
+    core = company_core(company or "")
+    name_pattern = re.compile(rf"\b{re.escape(core)}\b", re.IGNORECASE) if core else None
+    one_word = len(core.split()) == 1
+
+    def named(match: re.Match[str]) -> bool:
+        return not one_word or match.group() == core or match.group()[:1].isupper()
 
     def about(article: Article) -> bool:
-        text = f"{article.title} {article.summary}"
+        text = f"{_without_publisher(article)} {article.summary}"
         if symbol_pattern.search(text):
             return True
-        plain = " ".join(_PUNCTUATION.sub(" ", text.replace("&", " and ").casefold()).split())
-        return bool(name_pattern and name_pattern.search(plain))
+        plain = " ".join(_PUNCTUATION.sub(" ", text.replace("&", " and ")).split())
+        return bool(name_pattern and any(named(match) for match in name_pattern.finditer(plain)))
 
     return about
+
+
+def _without_publisher(article: Article) -> str:
+    """The headline without a trailing " - Publisher" naming the publisher the item is credited to."""
+    if not article.source_name:
+        return article.title
+    return re.sub(rf"{_SEPARATOR.pattern}{re.escape(article.source_name)}\s*$", "", article.title)

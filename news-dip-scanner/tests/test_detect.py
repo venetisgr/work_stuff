@@ -537,6 +537,19 @@ def test_funds_and_indices_are_not_candidates():
     assert ("SOXL", False, NOW) in store.marked
 
 
+def test_funds_yahoo_types_as_equity_are_not_candidates_either():
+    """Regression (live): Yahoo types DHY (a closed-end bond fund) and PBUB (an ETF) as EQUITY."""
+    dhy = make_stats(ticker="DHY", name="UBS Asset Management High Yield Credit Fund", instrument_type="EQUITY")
+    pbub = make_stats(ticker="PBUB", name="Portfolio Building Block US Banks ETF", instrument_type="EQUITY")
+    trust = make_stats(ticker="NTRS", name="Northern Trust Corporation", instrument_type="EQUITY")
+    store = FakeStore()
+    candidates, notes = select(
+        [news("DHY"), news("PBUB"), news("NTRS")], FakePrices({"DHY": dhy, "PBUB": pbub, "NTRS": trust}), store
+    )
+    assert [candidate.ticker for candidate in candidates] == ["NTRS"]  # a company with "Trust" in its name is one
+    assert notes == ["Not a company's shares (a fund, index or other instrument; marked invalid): DHY, PBUB"]
+
+
 # --- no trading since the last analysis ----------------------------------------------------------------------------
 
 
@@ -768,3 +781,93 @@ def test_without_a_resolver_nothing_is_searched():
     candidates, notes = select([news("OPAP.AT", company="Allwyn")], FakePrices({"ALWN.AT": allwyn()}))
     assert candidates == []
     assert notes == ["No prices (unknown symbol or no data; marked invalid): OPAP.AT (No chart data for OPAP.AT)"]
+
+
+def test_excluding_the_triage_symbol_undoes_a_stored_replacement():
+    """Regression: a stored lookup (HES -> HESM, CS -> DHY: wrong matches) moved the old symbol's news before the
+    [universe] exclude test, so excluding the old symbol had no effect for 7 days."""
+    impacts = [news("OPAP.AT", company="Allwyn")]
+    symbols, session = resolver()
+    store = FakeStore()
+    select_candidates(impacts, FakePrices({"ALWN.AT": allwyn()}), store, config(), now=NOW, symbols=symbols)
+
+    own = news("ALWN.AT", company="Allwyn", title="Allwyn cuts its outlook", hours_ago=2)
+    cfg = config(universe={"exclude": ("OPAP.AT",)})
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    [candidate], notes = select_candidates(impacts + [own], prices, store, cfg, now=NOW, symbols=symbols)
+
+    assert candidate.ticker == "ALWN.AT" and candidate.impacts == [own]  # the found company's own news still counts
+    assert notes == ["Excluded in [universe] exclude: OPAP.AT"]
+    assert prices.tickers == ["ALWN.AT"] and len(session.calls) == 1
+
+
+def test_only_watchlist_resolves_the_old_symbol_before_the_watchlist_test():
+    """Regression (live): with ALWN.AT on the watchlist and only_watchlist, an Allwyn story filed as OPAP.AT was
+    dropped every cycle as "Not on the watchlist: OPAP.AT", never looked up."""
+    impacts = [news("OPAP.AT", company="Allwyn", hours_ago=2, magnitude=3)]
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    store = FakeStore()
+    symbols, session = resolver()
+    cfg = config(universe={"watchlist": ("ALWN.AT",), "only_watchlist": True})
+
+    [candidate], notes = select_candidates(impacts, prices, store, cfg, now=NOW, symbols=symbols)
+
+    assert candidate.ticker == "ALWN.AT" and notes == [RENAMED]
+    assert prices.tickers == ["OPAP.AT", "ALWN.AT"]
+    assert store.marked == [("OPAP.AT", False, NOW), ("ALWN.AT", True, NOW)]
+    # The next cycle takes the replacement from the store: no request for OPAP.AT.
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    [candidate], notes = select_candidates(impacts, prices, store, cfg, now=NOW, symbols=symbols)
+    assert candidate.ticker == "ALWN.AT" and prices.tickers == ["ALWN.AT"] and len(session.calls) == 1
+
+
+def test_only_watchlist_checks_other_tickers_on_the_watchlists_exchanges_once():
+    impacts = [news("ETE.AT", company="National Bank of Greece"), news("AMD", company="AMD")]
+    prices = FakePrices({"ETE.AT": make_stats(ticker="ETE.AT", currency="EUR")})
+    store = FakeStore()
+    symbols, session = resolver()
+    cfg = config(universe={"watchlist": ("ALWN.AT",), "only_watchlist": True})
+
+    candidates, notes = select_candidates(impacts, prices, store, cfg, now=NOW, symbols=symbols)
+
+    assert candidates == [] and notes == ["Not on the watchlist ([universe] only_watchlist): ETE.AT, AMD"]
+    assert prices.tickers == ["ETE.AT"] and session.calls == []  # AMD: no US symbol on the watchlist
+    prices = FakePrices({"ETE.AT": make_stats(ticker="ETE.AT", currency="EUR")})
+    select_candidates(impacts, prices, store, cfg, now=NOW, symbols=symbols)
+    assert prices.tickers == []  # ETE.AT has prices: remembered
+
+
+def test_the_watchlists_leniency_applies_to_the_found_symbol():
+    impacts = [news("OPAP.AT", company="Allwyn", hours_ago=2, magnitude=1)]
+    symbols, _ = resolver()
+    cfg = config(universe={"watchlist": ("ALWN.AT",)})
+    [candidate], notes = select_candidates(
+        impacts, FakePrices({"ALWN.AT": allwyn()}), FakeStore(), cfg, now=NOW, symbols=symbols
+    )
+    assert candidate.ticker == "ALWN.AT" and notes == [RENAMED]
+
+
+def test_an_old_symbol_nothing_replaces_is_still_left_out_by_only_watchlist():
+    symbols, _ = resolver({"quotes": []})
+    store = FakeStore()
+    cfg = config(universe={"watchlist": ("ALWN.AT",), "only_watchlist": True})
+    candidates, notes = select_candidates(
+        [news("OPAP.AT", company="OPAP")], FakePrices(), store, cfg, now=NOW, symbols=symbols
+    )
+    assert candidates == [] and notes == ["Not on the watchlist ([universe] only_watchlist): OPAP.AT"]
+    assert store.marked == [("OPAP.AT", False, NOW)]
+
+
+def test_an_analysis_that_saw_no_news_doesnt_hold_older_news_in_the_cooldown():
+    """Regression (live): `analyze ALWN.AT` saw none of the Allwyn news filed under OPAP.AT (article_ids []), and
+    the cooldown's time test then counted that older news as seen for 24 hours."""
+    impacts = [news(hours_ago=5)]
+    manual = make_opportunity(created=NOW - timedelta(hours=1), article_ids=[])
+    cfg = config(scan={"reanalyse_same_session_hours": 0})
+    candidates, notes = select(impacts, FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": manual}), cfg)
+    assert [candidate.ticker for candidate in candidates] == ["AMD"] and notes == []
+
+    legacy = replace(manual, article_ids=None)  # a record from before article_ids were stored: the time test
+    candidates, notes = select(impacts, FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": legacy}), cfg)
+    assert candidates == []
+    assert notes == ["Analysed within the 24h cooldown, no new news since: AMD (analysed 1.0h ago)"]

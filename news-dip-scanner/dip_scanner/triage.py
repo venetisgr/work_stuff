@@ -70,28 +70,32 @@ _US_RIC = re.compile(r"([A-Z]{1,5})\.(O|OQ|N)")
 # What models write when they don't know the symbol.
 _PLACEHOLDERS = {"N/A", "NONE", "NULL", "UNKNOWN", "PRIVATE", "TBD", "UNLISTED", "NOT LISTED"}
 _YAHOO_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9&-]{0,11}(\.[A-Z]{1,3})?")
-# Greek and Cyrillic capitals that look like Latin ones. A model reading Greek news can copy "ΕΤΕ.ΑΤ" in Greek letters,
-# which looks exactly like ETE.AT but is no Yahoo symbol. Letters without a Latin twin (Π, Σ, Δ...) stay, so a name
-# written in Greek ("ΟΠΑΠ") is still rejected.
-_HOMOGLYPHS = str.maketrans(
-    "ΑΆΒΕΈΖΗΉΙΊΪΚΜΝΟΌΡΤΥΎΫΧАВЕЁКМНОРСТУХІЈЅҮ",
-    "AABEEZHHIIIKMNOOPTYYYXABEEKMHOPCTYXIJSY",
-)
+# Greek capitals with a Latin twin, as the Athens Exchange writes its codes in Latin letters. A model reading Greek
+# news can copy "ΕΤΕ.ΑΤ" in Greek letters, which looks exactly like ETE.AT but is no Yahoo symbol. Ρ is R, as in
+# ATHEX's codes (ΚΡΙ is KRI.AT, ΑΚΤΡ is AKTR.AT), not the P it looks like. Letters without a Latin twin (Π, Σ, Δ...)
+# stay, so a name written in Greek ("ΟΠΑΠ") is still rejected.
+_GREEK = str.maketrans("ΑΆΒΕΈΖΗΉΙΊΪΚΜΝΟΌΡΤΥΎΫΧ", "AABEEZHHIIIKMNOORTYYYX")
+# Cyrillic capitals that look like Latin ones.
+_CYRILLIC = str.maketrans("АВЕЁКМНОРСТУХІЈЅҮ", "ABEEKMHOPCTYXIJSY")
 
 
 def normalise_ticker(raw: Any) -> str | None:
     """A Yahoo Finance symbol for what the model wrote, or None when it isn't a usable single-company ticker.
 
-    Strips whitespace, "$" and "NASDAQ:"/"NYSE:" prefixes, uppercases, turns Greek and Cyrillic letters that look like
-    Latin ones into those ("ΕΤΕ.ΑΤ" in Greek letters -> "ETE.AT"; see _HOMOGLYPHS) and fullwidth characters into
-    plain ones, turns other exchange prefixes ("LON:VOD") and
+    Strips whitespace, "$" and "NASDAQ:"/"NYSE:" prefixes, uppercases, turns Greek letters into the Latin ones of
+    Athens codes ("ΕΤΕ.ΑΤ" in Greek letters -> "ETE.AT"; a Greek code without an exchange is an Athens one: "ΜΟΗ" ->
+    "MOH.AT", not Molina Healthcare's MOH; see _GREEK), Cyrillic letters that look like Latin ones into those, and
+    fullwidth characters into plain ones, turns other exchange prefixes ("LON:VOD") and
     Bloomberg codes ("VOD LN") into Yahoo suffixes ("VOD.L"), turns Reuters codes of US listings into plain symbols
     ("AMZN.O" -> "AMZN"), writes US share classes the Yahoo way ("BRK.B" -> "BRK-B"), pads Hong Kong codes ("700.HK"
     -> "0700.HK"), and rejects placeholders ("N/A", "unknown"), indices, ETFs, currencies and crypto pairs.
     """
     if not isinstance(raw, str):
         return None
-    text = " ".join(unicodedata.normalize("NFKC", raw).upper().translate(_HOMOGLYPHS).split())
+    upper = unicodedata.normalize("NFKC", raw).upper()
+    latin = upper.translate(_GREEK)
+    athens = latin != upper  # written in Greek letters
+    text = " ".join(latin.translate(_CYRILLIC).split())
     if text in _PLACEHOLDERS:
         return None
     text = re.sub(r"\s*\(.*\)$", "", text)  # "TSM (NYSE)"
@@ -116,6 +120,8 @@ def normalise_ticker(raw: Any) -> str | None:
     match = _CLASS_SHARE.fullmatch(text) if suffix in (None, "") else None
     if match and (match.group(2) not in _ONE_LETTER_SUFFIXES or suffix == ""):
         text = f"{match.group(1)}-{match.group(2)}"
+    if suffix is None and athens and "." not in text:
+        suffix = ".AT"
     if suffix and "." not in text:
         text += suffix
     if (match := re.fullmatch(r"(\d{1,4})\.HK", text)) is not None:

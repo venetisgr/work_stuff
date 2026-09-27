@@ -293,10 +293,11 @@ def test_log_times_use_the_display_time_zone():
     record.msecs = 250
     brief = cli._DisplayTimeFormatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
     verbose = cli._DisplayTimeFormatter("%(asctime)s %(message)s")
-    assert brief.format(record) == "2026-09-25 20:30:05 Cycle done"  # UTC by default, not the machine's time
+    assert brief.format(record) == "2026-09-25 20:30:05 UTC Cycle done"  # UTC by default, not the machine's time
     set_display_zone(ZoneInfo("Europe/Athens"))
-    assert brief.format(record) == "2026-09-25 23:30:05 Cycle done"
-    assert verbose.format(record) == "2026-09-25 23:30:05,250 Cycle done"
+    # Regression: the zone wasn't named, so a log line couldn't be told from local time.
+    assert brief.format(record) == "2026-09-25 23:30:05 EEST Cycle done"
+    assert verbose.format(record) == "2026-09-25 23:30:05,250 EEST Cycle done"
 
 
 # --- prices --------------------------------------------------------------------------------------------------------
@@ -312,6 +313,15 @@ def test_prices_prints_the_statistics_and_whether_it_is_a_dip(workdir, web, caps
 def test_prices_of_an_unknown_ticker_is_an_error(workdir, web, capsys):
     assert cli.main(["prices", "NOSUCH"]) == 1
     assert capsys.readouterr().err.startswith("Error: Yahoo Finance has no prices for NOSUCH")
+
+
+def test_prices_of_an_old_symbol_names_the_one_the_scanner_found(workdir, web, capsys):
+    with store_at(workdir) as store:
+        store.save_symbol_lookup("OPAP.AT", "Allwyn", "ALWN.AT", "Allwyn AG", checked=CYCLE - timedelta(days=1))
+    assert cli.main(["prices", "OPAP.AT"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("Error: Yahoo Finance has no prices for OPAP.AT")
+    assert "The scanner found ALWN.AT (Allwyn AG) for Allwyn: try `dip-scanner prices ALWN.AT`." in err
 
 
 # --- feeds ---------------------------------------------------------------------------------------------------------
@@ -413,6 +423,26 @@ def test_a_setup_problem_sends_one_stop_notice_through_the_channels(workdir, web
     assert len(hook_posts(web)) == 2
 
 
+@pytest.mark.parametrize("command", ["run", "watch"])
+def test_a_wrong_display_tz_stops_run_and_watch_with_a_notice(workdir, web, models, capsys, command):
+    """Regression: an unknown DISPLAY_TZ (Athens, UTC+3, or any name on Windows without tzdata) stopped every cron
+    run before the stop notice was set up, so the scanner went quiet without telling anyone."""
+    web.routes[HOOK] = {"ok": True}
+    (workdir / ".env").write_text(f"OPENAI_API_KEY=sk-test\nWEBHOOK_URL={HOOK}\nDISPLAY_TZ=Athens\n", encoding="utf-8")
+
+    assert cli.main([command]) == 2
+
+    assert "Configuration problem: DISPLAY_TZ must be an IANA time zone name" in capsys.readouterr().err
+    [payload] = hook_posts(web)
+    assert payload["subject"].startswith(
+        "dip-scanner stopped: Configuration problem: DISPLAY_TZ must be an IANA time zone name"
+    )
+    assert f"dip-scanner {command} stopped at 2026-09-25 20:30 UTC" in payload["markdown"]
+    assert models[0].calls == [] and not any(url == MARKETWATCH_URL for url in web.urls)  # nothing ran
+    assert cli.main(["feeds"]) == 2  # other commands report it at once, without a notice
+    assert len(hook_posts(web)) == 1
+
+
 def test_no_stop_notice_with_no_notify_or_when_switched_off(workdir, web):
     web.routes[HOOK] = {"ok": True}
     (workdir / ".env").write_text(f"LLM_PROVIDER=openai\nWEBHOOK_URL={HOOK}\n", encoding="utf-8")
@@ -472,6 +502,14 @@ def test_analyze_prints_the_report_and_saves_it(workdir, web, models, capsys):
         assert store.unnotified() == []  # already seen: a running watch won't send it as an alert
 
 
+def test_analyze_says_when_it_reads_a_symbol_as_its_preferred_listing(workdir, web, models, capsys):
+    (workdir / "scanner.toml").write_text('[universe]\npreferred_listings = { "XMD" = "AMD" }\n', encoding="utf-8")
+    assert cli.main(["analyze", "XMD", "--no-save"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out.startswith("# Analysis of AMD")
+    assert "XMD is read as AMD ([universe] preferred_listings)." in captured.err
+
+
 def test_analyze_of_an_unknown_ticker_is_an_error(workdir, web, models, capsys):
     assert cli.main(["analyze", "NOSUCH"]) == 1
     assert "no prices for NOSUCH" in capsys.readouterr().err
@@ -496,6 +534,38 @@ def test_news_prints_the_digest_from_the_database(workdir, capsys):
     assert cli.main(["news", "--hours", "1"]) == 0
     captured = capsys.readouterr()
     assert "No articles in the last hour." in captured.out and "dip-scanner run" in captured.err
+
+
+def test_news_shows_stories_under_the_symbol_a_scan_reads_them_as(workdir, capsys):
+    """Regression (live): `news --ticker ALWN.AT` was empty while the Allwyn story sat under the dead OPAP.AT, and
+    `news --ticker ASML.AS` left out what was filed under ASML before preferred_listings was set."""
+    (workdir / "scanner.toml").write_text('[universe]\npreferred_listings = { "XMD" = "AMD" }\n', encoding="utf-8")
+    allwyn = make_article(title="Allwyn shares slide on Italian costs", published=CYCLE - timedelta(hours=2))
+    amd = make_article(title="AMD filed under XMD", published=CYCLE - timedelta(hours=3))
+    with store_at(workdir) as store:
+        store.add_articles([allwyn, amd], max_age_hours=24, now=CYCLE)
+        store.record_triage(
+            [allwyn.id, amd.id],
+            [
+                make_impact(ticker="OPAP.AT", company="Allwyn", article_id=allwyn.id),
+                make_impact(ticker="XMD", article_id=amd.id),
+            ],
+        )
+        store.save_symbol_lookup("OPAP.AT", "Allwyn", "ALWN.AT", "Allwyn AG", checked=CYCLE - timedelta(days=1))
+
+    assert cli.main(["news", "--ticker", "ALWN.AT"]) == 0
+    out = capsys.readouterr().out
+    assert "ALWN.AT — Allwyn" in out and allwyn.title in out and "OPAP.AT" not in out
+
+    assert cli.main(["news", "--ticker", "XMD"]) == 0
+    captured = capsys.readouterr()
+    assert "AMD — Advanced Micro Devices" in captured.out and amd.title in captured.out
+    assert "XMD is read as AMD ([universe] preferred_listings)." in captured.err
+
+    assert cli.main(["news"]) == 0
+    out = capsys.readouterr().out
+    assert "ALWN.AT — Allwyn" in out and "AMD — Advanced Micro Devices" in out
+    assert "OPAP.AT —" not in out and "XMD —" not in out
 
 
 def test_report_prints_markdown_and_writes_html(workdir, capsys):

@@ -140,7 +140,7 @@ def test_render_markdown_reads_like_a_newsletter():
         f"| Statistical 6-month low | {format_price(opp.stats.stat_low_6m, 'USD')} ({stat_low}) |",
         "| Entry (limit buy) | $132.00 (7.4% below) |",
         "| Target (limit sell idea) | $168.00 (17.9% above) |",
-        "| From today's price | target +17.9% / low -17.2% |",
+        "| From the reported price | target +17.9% / low -17.2% |",
         "| From the entry | target +27.3% / low -10.6% |",  # what the two limit orders would make or lose
         "| Verdict | Temporary fear |",
         "| Confidence | Medium |",
@@ -159,7 +159,7 @@ def test_render_markdown_reads_like_a_newsletter():
     assert "_Analysis by fake-model; prices as of 2026-09-25 14:45 UTC._" in text
     assert "Numbers fixed" not in text
     assert "≈" not in text and "Exchange rate" not in text  # no [account] currency
-    assert "| Target (from today's price) |" in text
+    assert "| Target (from the reported price) |" in text  # regression: read days later, it isn't today's
     assert text.rstrip().endswith(f"_{DISCLAIMER}_")
     assert "Not investment advice" in DISCLAIMER and "the tool never places orders" in DISCLAIMER
 

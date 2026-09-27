@@ -269,7 +269,7 @@ watchlist = [" amd", "sap.de", "AMD"]
 only_watchlist = true
 exclude = ["tsla"]
 min_price = 5
-allowed_suffixes = ["", "de", ".at", ".DE"]
+allowed_suffixes = ["", "de", ".at", ".DE", "as"]
 preferred_listings = { asml = "asml.as", "NASDAQ:SAP" = "SAP.DE", "ETE.AT" = "ETE.AT" }
 
 [alerts]
@@ -301,7 +301,7 @@ currency = " eur "
     assert isinstance(config.scan.interval_minutes, float)
     assert config.dip == DipConfig(4.0, 7.5, 12.0, 3, ("negative",), False)
     assert config.universe == UniverseConfig(
-        ("AMD", "SAP.DE"), True, ("TSLA",), 5.0, ("", ".DE", ".AT"), {"ASML": "ASML.AS", "SAP": "SAP.DE"}
+        ("AMD", "SAP.DE"), True, ("TSLA",), 5.0, ("", ".DE", ".AT", ".AS"), {"ASML": "ASML.AS", "SAP": "SAP.DE"}
     )
     assert config.alerts == AlertConfig(70.5, 65, ("temporary_fear",), system_notices=False, notice_after_cycles=12)
     assert config.account == AccountConfig(currency="EUR")
@@ -399,6 +399,11 @@ def test_a_section_must_be_a_table(tmp_path):
         (
             '[universe]\npreferred_listings = { ASML = "SPY" }\n',
             "universe.preferred_listings in .*: 'SPY' isn't a company's Yahoo Finance symbol",
+        ),
+        # Regression: the README's Athens and euro-account snippets together silently dropped ASML/SAP news.
+        (
+            '[universe]\nallowed_suffixes = ["", ".AT"]\npreferred_listings = { "ASML" = "ASML.AS", "X" = "Y" }\n',
+            'universe.preferred_listings in .* leaves out, so that news would be dropped: "ASML" = "ASML.AS". Add',
         ),
         ("[scan\n", "is not valid TOML"),
     ],
@@ -594,3 +599,21 @@ def test_default_file_prefers_the_env_var_then_the_current_folder_then_the_proje
     )
     monkeypatch.setenv("FEEDS_FILE", str(tmp_path / "other.toml"))
     assert default_file("feeds.toml", "FEEDS_FILE") == tmp_path / "other.toml"
+
+
+def test_sec_symbol_maps_a_preferred_listing_back_to_its_us_symbol():
+    universe = UniverseConfig(preferred_listings={"ASML": "ASML.AS", "SAP.F": "SAP.DE"})
+    assert universe.sec_symbol("ASML.AS") == "ASML"
+    assert universe.sec_symbol("SAP.DE") == "SAP.DE"  # a key with a suffix files nothing with the SEC either
+    assert universe.sec_symbol("ETE.AT") == "ETE.AT"
+
+
+def test_a_toml_file_saved_with_a_byte_order_mark_is_read(tmp_path):
+    """Regression: scanner.toml saved by Windows Notepad or PowerShell 5 (UTF-8 with a BOM) failed with "Invalid
+    statement (at line 1, column 1)"."""
+    path = tmp_path / "bom.toml"
+    path.write_bytes(b'\xef\xbb\xbf[account]\ncurrency = "EUR"\n')
+    assert load_scanner_config(path).account.currency == "EUR"
+    path.write_bytes('[account]\ncurrency = "€"\n'.encode("cp1253"))
+    with pytest.raises(ConfigError, match="isn't UTF-8 text"):
+        load_scanner_config(path)

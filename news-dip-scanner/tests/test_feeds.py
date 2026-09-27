@@ -569,7 +569,7 @@ def test_ticker_news_keeps_only_headlines_about_the_company_and_recent_ones():
         "Investors eye $NVDA ahead of earnings",
         "NVIDIA Corp. faces a new antitrust probe - Reuters",
     ]
-    assert "q=NVIDIA+stock+when%3A30d" in session.urls[1]
+    assert parse_qs(urlsplit(session.urls[1]).query)["q"] == ['"NVIDIA Corporation" OR NVDA stock when:30d']
 
 
 def test_ticker_news_short_symbols_only_match_as_symbols():
@@ -619,6 +619,16 @@ def test_ticker_news_gives_each_source_half_the_places_unless_the_other_has_too_
         ("The Walt Disney Company", "Walt Disney"),
         # Only whole words at the end go, and never the first word.
         ("Group 1 Automotive, Inc.", "Group 1 Automotive"),
+        ("Group, Inc.", "Group"),
+        ("Inc Research Holdings, Inc.", "Inc Research"),
+        # Regression (live): the comma after a one-word name counted as part of the first word, so "Tesla, Inc."
+        # kept its "Inc" and headlines that just say "Tesla" were dropped.
+        ("Tesla, Inc.", "Tesla"),
+        ("NIKE, Inc.", "NIKE"),
+        ("Amazon.com, Inc.", "Amazon com"),
+        ("Iberdrola, S.A.", "Iberdrola"),
+        ("Telefónica, S.A.", "Telefónica"),
+        ("Tesla,Inc.", "Tesla"),
         ("Chase", "Chase"),
         ("Coface SA", "Coface"),
         ("Holding", "Holding"),
@@ -646,6 +656,52 @@ def test_ticker_news_matches_names_with_dotted_legal_forms():
     assert parse_qs(urlsplit(session.urls[1]).query)["q"] == ["National Bank of Greece stock when:30d"]
 
 
+def test_ticker_news_one_word_names_count_only_as_names():
+    """Regression (live TITC.AT): 12 of 15 context headlines for Titan S.A. were about Titan Company (India), Titan
+    Mining, "tech titan" or came from the publisher "Stock Titan"; BELA.AT got "CBN's jumbo rate cut"."""
+    google = rss(
+        _item("Titan Cement stock trades 15.6 percent below its yearly high - AD HOC NEWS", NOW - timedelta(hours=1)),
+        _item("Tech stocks gain after tech titan dinner - AOL.com", NOW - timedelta(hours=2)),
+        _item("RENOWORKS SOFTWARE (ROWKF) Stock Price, News &amp; Analysis - Stock Titan", NOW - timedelta(hours=3)),
+        _item("TITAN shares rise on cement demand", NOW - timedelta(hours=4)),
+    )
+    session = FakeSession({YAHOO: rss(), GOOGLE: google})
+
+    articles = ticker_news(session, "TITC.AT", company="Titan S.A.", now=NOW)
+
+    assert [a.title for a in articles] == [
+        "Titan Cement stock trades 15.6 percent below its yearly high - AD HOC NEWS",
+        "TITAN shares rise on cement demand",
+    ]
+    queries = [parse_qs(urlsplit(url).query)["q"][0] for url in session.urls[1:]]
+    assert queries == ['"Titan S.A." OR TITC stock when:30d', "Titan μετοχή when:30d"]  # the local press keeps "Titan"
+
+    jumbo = rss(
+        _item("CBN’s jumbo rate cut sparks surge in OMO demand", NOW - timedelta(hours=1)),
+        _item("Jumbo raises its dividend", NOW - timedelta(hours=2)),
+    )
+    articles = ticker_news(FakeSession({YAHOO: rss(), GOOGLE: jumbo}), "BELA.AT", company="Jumbo S.A.", now=NOW)
+    assert [a.title for a in articles] == ["Jumbo raises its dividend"]
+
+
+@pytest.mark.parametrize(
+    ("ticker", "company", "headline", "query"),
+    [
+        ("EBAY", "eBay Inc.", "eBay stock slides on weak guidance", '"eBay Inc." OR EBAY stock when:30d'),
+        ("NKE", "NIKE, Inc.", "Nike cuts its outlook as tariffs bite", '"NIKE, Inc." OR NKE stock when:30d'),
+        ("TSLA", "Tesla, Inc.", "Tesla deliveries miss estimates", '"Tesla, Inc." OR TSLA stock when:30d'),
+        ("AMD", "Advanced Micro Devices, Inc.", "advanced micro devices dips", "Advanced Micro Devices stock when:30d"),
+    ],
+)
+def test_ticker_news_keeps_headlines_naming_the_company_as_written(ticker, company, headline, query):
+    """Regression (live): "Tesla, Inc." searched and matched "Tesla Inc", so "Nike Is Down 77% From Its Peak" and the
+    like were dropped. A one-word name matches capitalised or as written; longer names in any case."""
+    session = FakeSession({YAHOO: rss(), GOOGLE: rss(_item(headline, NOW - timedelta(hours=1)))})
+    articles = ticker_news(session, ticker, company=company, now=NOW)
+    assert [a.title for a in articles] == [headline]
+    assert parse_qs(urlsplit(session.urls[1]).query)["q"] == [query]
+
+
 def test_ticker_news_also_searches_the_local_edition_for_athens_listings():
     english = rss(
         _item("Jumbo S.A. (ATH:BELA) beats estimates - Simply Wall St", NOW - timedelta(hours=2)),
@@ -663,7 +719,7 @@ def test_ticker_news_also_searches_the_local_edition_for_athens_listings():
 
     queries = [parse_qs(urlsplit(url).query) for url in session.urls[1:]]
     assert [(q["q"][0], q["hl"][0], q["gl"][0], q["ceid"][0]) for q in queries] == [
-        ("Jumbo stock when:30d", "en-US", "US", "US:en"),
+        ('"Jumbo S.A." OR BELA stock when:30d', "en-US", "US", "US:en"),
         ("Jumbo μετοχή when:30d", "el", "GR", "GR:el"),
     ]
     titles = [a.title for a in articles]
@@ -694,6 +750,7 @@ def test_ticker_news_local_editions_by_exchange(ticker, edition):
     session = FakeSession({YAHOO: rss(), GOOGLE: rss()})
     ticker_news(session, ticker, company="SAP SE", now=NOW)
     queries = [parse_qs(urlsplit(url).query) for url in session.urls[1:]]
-    assert (queries[0]["q"][0], queries[0]["hl"][0]) == ("SAP stock when:30d", "en-US")
+    bare = ticker.rpartition(".")[0] or ticker
+    assert (queries[0]["q"][0], queries[0]["hl"][0]) == (f'"SAP SE" OR {bare} stock when:30d', "en-US")
     local = [(q["q"][0], q["hl"][0], q["gl"][0], q["ceid"][0]) for q in queries[1:]]
     assert local == ([edition] if edition else [])

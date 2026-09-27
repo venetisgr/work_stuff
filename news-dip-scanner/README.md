@@ -133,15 +133,25 @@ UTC) stay in UTC.
 
 Tickers are Yahoo Finance symbols: `AMD`, `BRK-B`, `SAP.DE`, `ASML.AS`, `ALWN.AT`, `7203.T`, `0700.HK` (in the
 watchlist and exclude lists `BRK.B` or `NASDAQ:TSLA` work too). Only company shares become candidates: ETFs, funds
-and indices are left out.
+and indices are left out, and so is a fund that Yahoo lists as a share but whose name says "Fund" or "ETF".
 
 The triage model knows the symbols of its training data, and some have changed since: OPAP became Allwyn (`OPAP.AT`
 is now `ALWN.AT`), Mytilineos became Metlen (`MYTIL.AT` is now `MTLN.AT`). When Yahoo has no prices for a symbol, the
-scanner searches Yahoo Finance for the company name the triage gave and takes a listing on the same exchange whose
-name matches (company shares only; for a symbol without a suffix, a main US exchange, not OTC). Its news moves to that
-symbol, the notes say `OPAP.AT -> ALWN.AT (Allwyn AG)`, and the answer is kept for 7 days. This needs the current
-name: Yahoo no longer finds "OPAP", so a story the model filed as "OPAP" stays unresolved (the prompt asks for the
-name the article uses). Greek or Cyrillic letters that look like Latin ones (`ΕΤΕ.ΑΤ`) are read as Latin.
+scanner searches Yahoo Finance for the company name the triage gave and takes the same company's shares on the same
+exchange (for a symbol without a suffix, a main US exchange, not OTC): a listing with the same name or its initials,
+anywhere in Yahoo's list ("Allwyn" is Allwyn AG, "PPC" Public Power Corporation), or one with a longer name that
+starts with it ("Metlen": Metlen Energy & Metals PLC) only when no other company on Yahoo's list starts the same way
+and one of the stories names it. Funds, notes, partnerships and warrants never match. Its news moves to that symbol,
+the notes say `OPAP.AT -> ALWN.AT (Allwyn AG)`, the answer is kept for 7 days, and `analyze ALWN.AT` and `news
+--ticker ALWN.AT` include that news too. News about companies that were taken over or delisted (Hess, Credit Suisse)
+stays in the "No prices" note: Yahoo's search lists related instruments for them (Hess Midstream LP, a bond fund),
+which are not the company. A wrong match is undone by adding the symbol before the arrow to `[universe] exclude`.
+With `only_watchlist`, or news that only the watchlist's leniency lets through, the old symbol is looked up first when
+the watchlist has a symbol on its exchange, so an Allwyn story filed as `OPAP.AT` still reaches `ALWN.AT`. This needs
+the current name: Yahoo no longer finds "OPAP", so a story the model filed as "OPAP" stays unresolved (the prompt asks
+for the name the article uses). Greek letters are read as the Latin ones of Athens codes (`ΕΤΕ.ΑΤ` is `ETE.AT`, and a
+Greek code without an exchange is an Athens one: `ΜΟΗ` is `MOH.AT`), Cyrillic ones that look like Latin letters as
+those.
 
 ## Scanning Athens stocks
 
@@ -154,7 +164,8 @@ The enabled feeds are English and mostly about US and large European companies. 
    from your own connection. Capital.gr refuses feed requests from cloud servers and was left out. Each enabled
    feed adds triage requests for its non-company stories (see [Costs](#costs)).
 2. **Exchanges.** Every exchange is allowed by default. To look at US and Athens listings only, set
-   `[universe] allowed_suffixes = ["", ".AT"]` in `scanner.toml`.
+   `[universe] allowed_suffixes = ["", ".AT"]` in `scanner.toml` (with `preferred_listings`, add their exchanges
+   too, e.g. `".AS"` for `ASML.AS`: a preferred listing the setting leaves out is a configuration error).
 3. **Watchlist.** Any negative or mixed news about a watchlist ticker counts, however small or indirect. Current
    Yahoo codes, each checked with `dip-scanner prices` on 2026-09-27:
 
@@ -187,9 +198,12 @@ Known limits:
 - **Thinner news.** Few English sources follow Athens companies, and the Greek feeds mix them with much else. The
   per-ticker context headlines of an analysis come from Google News in Greek as well as English ("Jumbo μετοχή" for
   BELA.AT; the same for Xetra, Paris, Milan, Madrid and Amsterdam listings in their languages), but only headlines
-  that name the company in Latin letters or its symbol are kept. Companies the Greek press calls by a Greek name
-  (ΔΕΗ for PPC, ΕΤΕ or Εθνική for National Bank of Greece) get fewer: on 2026-09-27 Jumbo and Allwyn got 15 context
-  headlines each (a few of Jumbo's about Australia's Jumbo Interactive), National Bank of Greece 8, PPC and OTE 1.
+  that name the company in Latin letters or its symbol are kept. A one-word name counts only as a name (capitalised,
+  and not in the publisher's name at the end of a Google headline), and the English search looks for Yahoo's full
+  name or the symbol (`"Titan S.A." OR TITC stock`): "Titan stock" finds Titan Company in India, Titan Mining and
+  "tech titan". Companies the Greek press calls by a Greek name (ΔΕΗ for PPC, ΕΤΕ or Εθνική for National Bank of
+  Greece) get fewer: on 2026-09-27 Jumbo and Allwyn got 15 context headlines each, Titan 4 (3 about the Greek company;
+  12 of 15 had been about other Titans before these rules), National Bank of Greece 8, PPC and OTE 1.
 - **Greek text.** The triage prompt says that articles can be in any language and asks for English answers,
   symbols in Latin letters and the company's current name. The prompts haven't been tested against a live model
   (see [Limitations](#limitations)); run `dip-scanner news` after a few cycles to see what it made of the Greek
@@ -212,7 +226,7 @@ euro account, a US stock is also a bet on the dollar:
   order pays 1.4% to buy and 1.4% to sell, before any currency cost. Fewer, larger orders cost less.
 
 `[account] currency = "EUR"` in `scanner.toml` makes this visible. Reports and alerts then show price, entry and
-target in euros too (`$132.00 ≈ €115.94`), at Yahoo Finance's exchange rate when the analysis was made (the report
+target in euros too (`$132.00 ≈ €115.93`), at Yahoo Finance's exchange rate when the analysis was made (the report
 names the rate; your broker's rate and fee differ), and `track` adds the return in euros, exchange-rate moves
 included, next to the return in the trading currency (see [Track record](#track-record)). The rate is fetched from
 Yahoo's chart API like the prices (`EURUSD=X`, `EURGBP=X`...; pence, cents and agorot are converted through pounds,
@@ -229,10 +243,12 @@ preferred_listings = { "ASML" = "ASML.AS", "SAP" = "SAP.DE", "TTE" = "TTE.PA", "
 ```
 
 All eight symbols answered on 2026-09-27. The map applies to every new triage answer and to news stored before it was
-set, watchlist and exclude entries are read through it (`"ASML"` on the watchlist means `ASML.AS`), and news filed
-under both symbols counts once, for the preferred one. Pick the company's home exchange (Amsterdam for ASML, Xetra
-for SAP): secondary listings trade less, at wider spreads. Keep `[universe] allowed_suffixes` in line, or the
-preferred listing is filtered out.
+set (in scans, `analyze` and `news`), watchlist and exclude entries are read through it (`"ASML"` on the watchlist
+means `ASML.AS`), and news filed under both symbols counts once, for the preferred one. The analysis still gets the
+company's SEC figures, looked up under the US symbol (ASML, SAP, TotalEnergies and Stellantis all file with the SEC).
+Pick the company's home exchange (Amsterdam for ASML, Xetra for SAP): secondary listings trade less, at wider
+spreads. A preferred listing on an exchange that `[universe] allowed_suffixes` leaves out is a configuration error:
+add its suffix there.
 
 ## Commands
 
@@ -243,8 +259,8 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 | `dip-scanner run [--no-notify]` | One cycle; prints a summary, the day's model use, notes on what was skipped and why, and the report's path. | yes |
 | `dip-scanner watch [--interval MIN] [--no-notify]` | Cycles on the interval until Ctrl+C; each logs a summary ending with the day's model use. | yes |
 | `dip-scanner feeds [--check]` | Lists the feeds and how their last fetch went; `--check` fetches each one now. | no |
-| `dip-scanner news [--hours 24] [--ticker T]` | The news digest ("newsletter"): companies with negative news first, then the other headlines. | no |
-| `dip-scanner analyze TICKER [--no-save]` | Analyses one ticker now, whatever its price did and ignoring the cooldown. | yes |
+| `dip-scanner news [--hours 24] [--ticker T]` | The news digest ("newsletter"): companies with negative news first, then the other headlines. Stories are listed under the symbol a scan reads them as (the preferred listing, or the symbol found for an old one). | no |
+| `dip-scanner analyze TICKER [--no-save]` | Analyses one ticker now, whatever its price did and ignoring the cooldown, with the news filed under its old symbol or its preferred listing's other symbol. | yes |
 | `dip-scanner report [--days 7] [--min-score N] [--html PATH]` | The stored opportunities of the last days. | no |
 | `dip-scanner track [--days 365]` | How past opportunities played out, next to their exchange's index (see [Track record](#track-record)). | no |
 | `dip-scanner prices TICKER` | Price statistics and whether they count as a dip. | no |
@@ -265,10 +281,10 @@ Everything goes to `data/` (or `DATA_DIR`):
 
 Each opportunity in the report shows the price and recent moves, the chance of being higher in 6 months, the
 potential low and the statistical low, the entry (limit buy) and target (limit sell idea), the upside to the target
-and downside to the low twice (from today's price, and from the entry, which is what the two limit orders would make
-or lose), the verdict and confidence, what the market fears, the fundamental impact, the thesis, risks, catalysts,
-what to check before buying, and the headlines that flagged it. With `[account] currency` set, price, entry and target
-also show their value in your currency, with the exchange rate used.
+and downside to the low twice (from the price at the analysis, and from the entry, which is what the two limit
+orders would make or lose), the verdict and confidence, what the market fears, the fundamental impact, the thesis,
+risks, catalysts, what to check before buying, and the headlines that flagged it. With `[account] currency` set,
+price, entry and target also show their value in your currency, with the exchange rate used.
 
 Alerts go to every configured channel. Email and generic webhooks get the full report; Slack, Discord and Telegram
 get one line per opportunity. The rules:
@@ -325,7 +341,7 @@ the target near the pre-drop high, so `reward_risk` is usually 0.2-0.4. A score 
 about 76-85% for a "temporary fear" verdict at high confidence, and 93% or more for "mixed" at high confidence,
 above the 90% the model is told not to exceed. So with the defaults only confident temporary-fear calls alert; set
 `min_score = 55` if you want mixed verdicts too (mixed, high confidence, 80%, reward_risk 0.3 scores 55.2).
-`min_probability` only matters when the upside is over about 3.5 times the downside.
+`min_probability` only matters when the upside is over about 3.8 times the downside.
 
 Listings outside the US (Athens, Xetra, Paris...) get no fundamentals: they come from SEC filings only. The model is
 told that this is expected for such a listing and to judge its confidence on the news and the price data, not to
@@ -347,8 +363,8 @@ about twice as often (roughly 1 in 10), and the price block says so. The model i
 
 ## Costs
 
-All numbers below were measured on a live run (real feeds, 2026-09-27) and are estimates, not quotes. Check your
-provider's current prices.
+The request counts and prompt sizes below come from a live run of the feeds (2026-09-27); the output token counts are
+assumptions, since no live model was run. All of it is an estimate, not a quote. Check your provider's current prices.
 
 - **Triage**: one request per cycle that has new articles, with up to 20 articles each. Every request carries a
   fixed prompt of about 5,200 characters (about 1,300 tokens) plus about 300 characters per article, and gets a
@@ -380,8 +396,15 @@ provider's page), and the request counts above, 30 days of `watch` at the 5-minu
 Input is 1,500 tokens per triage request and 3,500 per analysis; the output counts include reasoning at
 `LLM_TRIAGE_REASONING_EFFORT=low` and the analysis model's default effort, and are assumptions: no live model was run
 for this README. The euro figures use 1 EUR = 1.1386 USD. Anthropic's defaults (claude-haiku-4-5 at $1 and $5,
-claude-sonnet-5 at $2 and $10) come to about $18-95 a month for the same days, mostly because Haiku's input costs
-four times as much.
+claude-sonnet-5 at $2 and $10) come to about $18-95 a month for the same days. Haiku gets no reasoning (it doesn't
+take the effort setting), so that assumes a triage reply of about 300 output tokens every day; the difference is
+mostly Haiku's input, which costs four times gpt-5-mini's.
+
+The six Greek feeds (see [Scanning Athens stocks](#scanning-athens-stocks)) add about 60% more articles to triage
+(148 of 396 on the Sunday measured, with slightly longer items, and Greek takes more tokens per character than
+English). Most of a triage request is the fixed prompt, so the cost is mostly more cycles with something new: at most
+one request per cycle, 288 a day at the 5-minute interval instead of about 220, which is roughly $3 a month more on
+typical days with the default OpenAI models.
 
 Next to the Reddit author's starting capital of €2,500, a year of typical days costs about €280, 11% of the account,
 and a year of busy ones about €900, 36%, before a single trade and before broker fees (see
@@ -390,7 +413,8 @@ for itself on an account that size. To keep the bill down:
 
 - Set `LLM_TRIAGE_REASONING_EFFORT=low`: triage only maps headlines to companies, all day long. If a triage reply
   takes about 1,800 output tokens at the model's default effort instead of 500, the typical month costs about $17
-  more. `LLM_ANALYSIS_REASONING_EFFORT=low` (or `medium`) makes the analysis cheaper too, at some cost in quality.
+  more. `LLM_ANALYSIS_REASONING_EFFORT=low` makes the analysis cheaper too, at some cost in quality (`medium` only
+  helps with Claude, whose default is high; gpt-5's default is already medium).
 - Use a longer `[scan] interval_minutes` (15 minutes: about 96 triage requests a day) and a lower
   `[scan] max_analyses_per_day`.
 - Set a monthly spend limit or budget in the provider's console, and keep automatic recharge of prepaid credit off or
@@ -443,7 +467,7 @@ and nothing is logged. If you set `DATA_DIR`, point the log there as well (`mkdi
 "$DATA_DIR/cron.log"`). macOS has no `flock`: use `lockf -t 0 /tmp/dip-scanner.lock .venv/bin/dip-scanner run`
 (it ships with macOS) or `brew install flock`, or run `dip-scanner watch` instead.
 
-**systemd** (a user service that restarts after crashes or reboots):
+**systemd** (a user service that restarts after crashes or reboots, but not after a setup problem):
 
 ```ini
 # ~/.config/systemd/user/dip-scanner.service
@@ -455,17 +479,24 @@ WorkingDirectory=/path/to/news-dip-scanner
 ExecStart=/path/to/news-dip-scanner/.venv/bin/dip-scanner watch
 Restart=on-failure
 RestartSec=60
+RestartPreventExitStatus=2
 
 [Install]
 WantedBy=default.target
 ```
 
+Exit code 2 means a setup problem (a rejected key, no credit, a broken setting). Restarting can't fix it, so systemd
+leaves the service stopped instead of polling every feed and calling the model once a minute: fix what the
+"dip-scanner stopped" notice or `journalctl --user -u dip-scanner` names, check with `dip-scanner run --no-notify`,
+then `systemctl --user restart dip-scanner`.
+
 Then `systemctl --user enable --now dip-scanner` and `journalctl --user -u dip-scanner -f` for the log. A user
 service only runs while you are logged in, unless you run `loginctl enable-linger "$USER"` once: do that on a server
 you log out of, or it stops when you disconnect and doesn't start after a reboot.
 
-**Windows Task Scheduler**, one cycle every 5 minutes with its output in `data\scanner.log` (run `dip-scanner run
---no-notify` once first, so that `data\` exists: the redirect needs it). In a Command Prompt:
+**Windows Task Scheduler**, one cycle every 5 minutes with its output in `data\scanner.log`. Create the folder first
+(`mkdir data` in the project folder): the redirect needs it, and a run that stops on a setup problem doesn't create it,
+so nothing would run or be logged. In a Command Prompt:
 
 ```bat
 schtasks /Create /TN dip-scanner /SC MINUTE /MO 5 /TR "cmd /c cd /d C:\path\to\news-dip-scanner && set PYTHONUTF8=1&& .venv\Scripts\dip-scanner.exe run >> data\scanner.log 2>&1"
@@ -514,15 +545,17 @@ verdicts and probabilities mean anything before trusting them:
 - **No trading yet**: until a session has traded after the report (a report written at the weekend or after the
   close), its returns show "–" and it counts in no rate or average, so a fresh report doesn't read as "0 of 8 higher,
   +0.0%". The header says how many are waiting.
-- **Benchmark**: every opportunity is compared with its exchange's index over the same days, from the index's close
-  on the day of the report's price to its close on the day of the last price: `^GSPC` (S&P 500) for US listings,
-  `^GDAXI` for Xetra, `^FCHI` Paris, `^AEX` Amsterdam, `FTSEMIB.MI` Milan, `^IBEX` Madrid, `GD.AT` Athens, `^FTSE`
-  London, and the local index for Brussels, Lisbon, Stockholm, Copenhagen, Helsinki, Oslo, Vienna, Dublin, Zurich,
-  Tokyo, Hong Kong and a few more (all checked on 2026-09-27); other European exchanges get the Euro Stoxx 50
-  (`^STOXX50E`), anything else the S&P 500. "vs index" is the return minus the index's. In a rising market almost
-  every dip bounces, and "higher after 6 months" looks good; the average excess return, overall and per verdict and
-  score band, is what says whether the picks beat simply holding the market. An index without prices shows "–" and a
-  note.
+- **Benchmark**: every opportunity is compared with its exchange's index over the same days, from the index's level
+  at the report (stored with it, from the same session as the report's price, also while the market is open) to its
+  close on the day of the last price; for reports from before the level was stored, from its close on the day of the
+  report's price, and a report made during the session then compares the stock from that close too. The indices:
+  `^GSPC` (S&P 500) for US listings, `^GDAXI` for Xetra, `^FCHI` Paris, `^AEX` Amsterdam, `FTSEMIB.MI` Milan, `^IBEX`
+  Madrid, `GD.AT` Athens, `^FTSE` London, and the local index for Brussels, Lisbon, Stockholm, Copenhagen, Helsinki,
+  Oslo, Vienna, Dublin, Zurich, Tokyo, Hong Kong and a few more (all checked on 2026-09-27); other European exchanges
+  get the Euro Stoxx 50 (`^STOXX50E`), anything else the S&P 500. "vs index" is the return minus the index's. In a
+  rising market almost every dip bounces, and "higher after 6 months" looks good; the average excess return, overall
+  and per verdict and score band, is what says whether the picks beat simply holding the market. An index without
+  prices shows "–" and a note.
 - **Account currency**: with `[account] currency` set, a column shows each return in that currency, exchange-rate
   moves included: the rate stored with the report (else that day's close) against the close on the day of the last
   price. Broker fees are not in it.
@@ -558,8 +591,9 @@ your open orders against them is still yours to do.
   cost. A feed's `exclude_titles` drops known non-news pages before triage (the Reuters feed lists company, fund and
   quote pages among the stories: 42 of 100 items on 2026-09-27). Google News links are redirects. The per-ticker
   context headlines for an analysis keep only items that name the company (without "S.A.", "N.V.", "Inc." and the
-  like) or its symbol and are at most 30 days old; a common word as a name lets some strays in (Australia's Jumbo
-  Interactive among the headlines about Jumbo S.A.).
+  like; a one-word name only capitalised, and not as the publisher's name) or its symbol and are at most 30 days old;
+  a name other companies share still lets a few strays in (one of Titan S.A.'s four on 2026-09-27 was about India's
+  Titan).
 - **News after the close.** A dip is often matched with news that came out after the last session (evenings,
   weekends): the drop can't be a reaction to it, unless the article only reports an earlier event or the drop itself.
   Such candidates say "all of this news came out after the last session (Fri 25 Sep)", the model is told to compare
@@ -594,11 +628,11 @@ money:
 |---|---|
 | `Configuration problem: Set OPENAI_API_KEY ...` | `.env` is in the folder you run from (or pass `--env-file`), and the key for your `LLM_PROVIDER` is set. |
 | `Configuration problem: Scanner config not found` | The file named by `--config` or `SCANNER_CONFIG` doesn't exist; fix the path (without either, `./scanner.toml` or the defaults are used). |
-| `The language model can't be used: ... billing or usage-limit reasons` | The provider refused the account (credit, spend limit). Articles stay pending meanwhile; fix it and start again. |
+| `The language model can't be used: ... no quota left (insufficient_quota)` (OpenAI) or `... billing or usage-limit reasons` (Anthropic) | The provider refused the account (credit, spend limit). Articles stay pending meanwhile; fix it and start again. |
 | `sec-8k-filings` fails or is skipped | Set `SEC_USER_AGENT` to your name and email. |
 | A feed fails in `feeds --check` | Some sites block cloud IP addresses; feeds.toml notes the ones known to. Switch it off or use an alternate. |
-| `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know, and Yahoo's search found no listing with the company's name on the same exchange (or couldn't be reached: then it is asked again next cycle). The symbol is rechecked after 7 days. If you know the current symbol, add it to the watchlist. |
-| `Symbol renamed/resolved via Yahoo search ...: OPAP.AT -> ALWN.AT` | The triage's symbol has no prices and the company was found under another one, which was checked instead. If the match is wrong, add the found symbol to `[universe] exclude`. |
+| `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know, and Yahoo's search found no listing of that company on the same exchange (or couldn't be reached: then it is asked again next cycle). Companies that were taken over or delisted end here. The symbol is rechecked after 7 days. If you know the current symbol, add it to the watchlist. |
+| `Symbol renamed/resolved via Yahoo search ...: OPAP.AT -> ALWN.AT` | The triage's symbol has no prices and the company was found under another one, which was checked instead. If the match is wrong, add the triage's symbol, the one before the arrow, to `[universe] exclude`: its news is then skipped, and the found company's own news still counts. Excluding the found symbol drops all of that company's news. |
 | `Daily limit of 40 analyses reached ...` in the notes | `[scan] max_analyses_per_day` was used up in the last 24 hours; the named candidates are analysed once there is room. Raise it, or set 0 for no limit, if the bill allows. |
 | `Already analysed on the latest session's prices, so new news waits ...` | More news (often in the evening or at the weekend) about a ticker analysed on the same session's prices; it is analysed after the next session, 12 hours after the last analysis (`[scan] reanalyse_same_session_hours`) or when the price falls by another `min_drop_1d_pct`. |
 | A "dip-scanner stopped" notice | The reason is in it (the same message `run` prints). Fix that setting; `dip-scanner run --no-notify` checks it. |

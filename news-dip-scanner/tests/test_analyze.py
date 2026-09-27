@@ -457,6 +457,23 @@ def test_a_listing_outside_the_us_is_not_penalised_for_having_no_sec_figures():
     assert NO_FUNDAMENTALS in model.prompts[0] and "outside the US, so none" not in model.prompts[0]
 
 
+def test_a_preferred_listing_gets_the_figures_of_the_companys_us_listing():
+    """Regression (live): with preferred_listings "ASML" = "ASML.AS" the analysis of ASML.AS got no SEC figures,
+    and the prompt said none were expected, although ASML files with the SEC."""
+    stats = make_stats(ticker="ASML.AS", currency="EUR", exchange="Amsterdam")
+    candidate = make_candidate(ticker="ASML.AS", stats=stats)
+    model = FakeChatModel(reply())
+    analyze_candidate(model, candidate, fundamentals=fundamentals(), extra_news=[], now=NOW, sec_ticker="ASML")
+    prompt = model.prompts[0]
+    assert "From the SEC filings of the same company's US listing ASML; ASML.AS is the listing analysed" in prompt
+    assert "outside the US" not in prompt
+
+    # The SEC couldn't be reached (or no SEC_USER_AGENT): figures were expected, so the plain note.
+    model = FakeChatModel(reply())
+    analyze_candidate(model, candidate, fundamentals=None, extra_news=[], now=NOW, sec_ticker="ASML")
+    assert NO_FUNDAMENTALS in model.prompts[0] and "outside the US" not in model.prompts[0]
+
+
 def test_analyze_candidate_lists_each_article_once():
     first = make_article(title="AMD cuts guidance", published=NOW - timedelta(hours=1))
     second = make_article(title="AMD guidance cut hits suppliers", published=NOW - timedelta(hours=2))
@@ -529,3 +546,22 @@ def test_the_readme_scoring_example_and_the_alert_calibration_notes_hold():
     assert "about 76-85%" in readme and "about 76-85%" in toml and "93% or more" in readme and "93% or more" in toml
     mixed = make_analysis(verdict="mixed", confidence="high", probability_up_6m=80, target_price=130, potential_low=30)
     assert score(mixed, 100.0) == 55.2 and "scores 55.2" in readme
+
+
+def test_the_readme_says_when_min_probability_matters():
+    """Probabilities are whole numbers: below the default min_probability of 60 the best is 59, and a "temporary fear"
+    at high confidence needs an upside about 3.8 times the downside to score 65 with it (not 3.3, the continuous
+    break-even at 60%)."""
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    toml = (PROJECT_ROOT / "scanner.toml").read_text(encoding="utf-8")
+    below = AlertConfig().min_probability - 1
+
+    def alerts(ratio: float) -> bool:  # upside = ratio x downside, with a 10% downside
+        analysis = make_analysis(
+            probability_up_6m=below, confidence="high", potential_low=90, target_price=100 + 10 * ratio
+        )
+        return score(analysis, 100.0) >= AlertConfig().min_score
+
+    ratio = next(r / 100 for r in range(100, 1000) if alerts(r / 100))
+    assert 3.7 <= ratio <= 3.8  # 3.76 exactly; the score is rounded to one decimal
+    assert "over about 3.8 times the downside" in readme and "over about 3.8 times the downside" in toml

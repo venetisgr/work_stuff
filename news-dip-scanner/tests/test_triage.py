@@ -101,6 +101,14 @@ def articles(count: int, **overrides) -> list[Article]:
         ("\u0410\u041cD", "AMD"),  # Cyrillic А and М
         ("ＡＭＤ", "AMD"),
         ("ΟΠΑΠ.ΑΤ", None),  # Π has no Latin twin: a Greek name is still no symbol
+        # Regression: a Greek code without an exchange became a US symbol of another company (ΜΟΗ -> MOH, Molina
+        # Healthcare), and Ρ became P although ATHEX writes it R (ΚΡΙ is Kri-Kri, KRI.AT).
+        ("ΜΟΗ", "MOH.AT"),
+        ("ΤΕΝ", "TEN.AT"),
+        ("ΚΡΙ.ΑΤ", "KRI.AT"),
+        ("ΑΚΤΡ", "AKTR.AT"),
+        ("ATH:ΜΟΗ", "MOH.AT"),
+        ("\u0420\u0421", "PC"),  # Cyrillic Р and С keep their looks
         ("ΔΕΗ", None),
         ("TSE:7203", "7203.T"),
         ("TSE:SHOP", "SHOP.TO"),

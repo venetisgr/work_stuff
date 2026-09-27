@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from conftest import NOW, make_analysis, make_opportunity, make_stats
 
-from dip_scanner.models import PriceBar, Split
+from dip_scanner.models import Opportunity, PriceBar, Split
 from dip_scanner.track import (
     HORIZON_DAYS,
     STATUSES,
@@ -601,6 +601,44 @@ def test_the_benchmark_covers_the_same_days():
     assert missing.benchmark_return_pct is None and missing.excess_return_pct is None
     waiting = with_benchmark(evaluate(make_opportunity(), [], now=NOW), "^GSPC", SP500)
     assert waiting.benchmark_return_pct is None
+
+
+MONDAY, TUESDAY = date(2026, 9, 21), date(2026, 9, 22)
+# The market and AMD both fall 2% from 11:00 New York time into Monday's close, then stay flat on Tuesday.
+MARKET_FALLS = [bar(MONDAY, high=5000, low=4900, close=4900), bar(TUESDAY, high=4900, low=4900, close=4900)]
+AMD_FALLS = [bar(MONDAY, high=100, low=98, close=98), bar(TUESDAY, high=98, low=98, close=98)]
+
+
+def _reported_at_eleven(**overrides) -> Opportunity:
+    when = datetime(2026, 9, 21, 15, 0, tzinfo=UTC)  # 11:00 in New York, the session running
+    stats = make_stats(price=100.0, as_of=when, timezone="America/New_York", session_elapsed=0.23)
+    analysis = make_analysis(potential_low=80.0, entry_price=90.0, target_price=120.0)
+    return make_opportunity(stats=stats, created=when, analysis=analysis, **overrides)
+
+
+def test_the_index_starts_where_the_stock_does_for_a_report_during_the_session():
+    """Regression: a report at 11:00 started the stock at its 11:00 price and the index at that day's close, so a
+    stock that moved exactly with the market showed -2.00% vs index."""
+    stored = _reported_at_eleven(benchmark="^GSPC", benchmark_level=5000.0)
+    outcome = with_benchmark(evaluate(stored, AMD_FALLS, now=LATER), "^GSPC", MARKET_FALLS)
+    assert outcome.return_pct == pytest.approx(-2.0)
+    assert outcome.benchmark_return_pct == pytest.approx(-2.0)  # from the stored 5,000
+    assert outcome.excess_return_pct == pytest.approx(0.0)
+
+    # An older record without a stored level: the index starts at Monday's close, and for the comparison so does
+    # the stock (its return itself is still from the report's price).
+    legacy = with_benchmark(evaluate(_reported_at_eleven(), AMD_FALLS, now=LATER), "^GSPC", MARKET_FALLS)
+    assert legacy.return_pct == pytest.approx(-2.0) and legacy.benchmark_return_pct == pytest.approx(0.0)
+    assert legacy.excess_return_pct == pytest.approx(0.0)
+
+    # A level stored for another index isn't used.
+    other = _reported_at_eleven(benchmark="^NDX", benchmark_level=20000.0)
+    assert with_benchmark(evaluate(other, AMD_FALLS, now=LATER), "^GSPC", MARKET_FALLS).excess_return_pct == (
+        pytest.approx(0.0)
+    )
+    # After the close the report's price is the close: nothing to align.
+    closed = evaluate(make_opportunity(), GAIN, now=LATER)
+    assert closed.session_close is None and with_benchmark(closed, "^GSPC", SP500).index_aligned_return_pct is None
 
 
 def test_the_account_currency_return_adds_the_exchange_rate_move():

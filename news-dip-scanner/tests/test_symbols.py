@@ -18,13 +18,18 @@ from dip_scanner.symbols import (
     SymbolResolver,
     SymbolSearchError,
     best_match,
+    candidate,
+    named_in,
+    same_name,
     search_queries,
-    similar_names,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # Yahoo's answer to q=Allwyn on 2026-09-27: ALWN.AT (Athens) first, then the OTC ADR and German listings.
 ALLWYN = json.loads((FIXTURES / "yahoo_search_allwyn.json").read_text(encoding="utf-8"))
+# Yahoo's quotes[] for acquired, delisted and renamed companies (2026-09-27), by query: symbol, exchange, quoteType,
+# longname and shortname as Yahoo gave them.
+RENAMES = json.loads((FIXTURES / "yahoo_search_renames.json").read_text(encoding="utf-8"))
 QUERY2, QUERY1 = SEARCH_URLS
 
 
@@ -161,24 +166,31 @@ def test_search_queries_split_names_and_drop_legal_forms():
     [
         ("Allwyn", "Allwyn AG", True),
         ("National Bank of Greece", "National Bank of Greece S.A.", True),
-        ("Eurobank Ergasias", "Eurobank S.A.", True),
-        ("Motor Oil", "Motor Oil (Hellas) Corinth Refineries S.A.", True),
+        ("Block", "Block, Inc.", True),
         ("OTE", "OTE S.A.", True),
         ("NBG", "National Bank of Greece S.A.", True),  # initials
         ("PPC", "Public Power Corporation S.A.", True),
         ("Metlen Energy & Metals", "METLEN ENERGY & METALS PLC", True),
-        # Spelled almost alike.
+        # Spelled almost alike, two words or more.
         ("Hellenic Telecommunications Organisation", "Hellenic Telecommunication Organization SA", True),
         ("OPAP", "Allwyn AG", False),
         ("Bank", "Piraeus Bank S.A.", False),  # a shared word isn't enough
         ("AB", "Alpha Bank", False),  # initials need 3 letters
         ("Jumbo", "Mumbo Jumbo Holdings", False),
         ("", "Allwyn AG", False),
+        # Regression (live): a shared first word was enough, in either order, so "Hess" was Hess Midstream LP and
+        # "Credit Suisse" a bond fund; one-word names alike ("Shell", "Shelly Group") passed the spelling test.
+        ("Hess", "Hess Midstream LP", False),
+        ("Credit Suisse", "Credit Suisse High Yield Bond F", False),
+        ("Eurobank Ergasias", "Eurobank S.A.", False),
+        ("Hitachi Metals", "Hitachi, Ltd.", False),
+        ("Shell", "Shelly Group SE", False),
+        ("Motor Oil", "Motor Oil (Hellas) Corinth Refineries S.A.", False),  # a longer name: see best_match
     ],
 )
-def test_similar_names(a, b, same):
-    assert similar_names(a, b) is same
-    assert similar_names(b, a) is same
+def test_same_name(a, b, same):
+    assert same_name(a, b) is same
+    assert same_name(b, a) is same
 
 
 def test_best_match_skips_the_bad_symbol_funds_other_exchanges_and_other_names():
@@ -197,6 +209,85 @@ def test_best_match_skips_the_bad_symbol_funds_other_exchanges_and_other_names()
     assert best_match(us[1:], "Meta Platforms", "FB") is None  # OTC
 
 
+@pytest.mark.parametrize(
+    ("ticker", "query", "found"),
+    [
+        # Acquired or delisted: Yahoo lists a related but different instrument, which must not be taken.
+        ("HES", "Hess", None),  # Hess Midstream LP
+        ("CS", "Credit Suisse", None),  # DHY, a bond fund typed EQUITY, whose old short name says Credit Suisse
+        ("MRO", "Marathon", None),  # Marathon Petroleum and Marathon Bancorp: which one?
+        ("BBBY", "Bed Bath", None),  # only the warrants (BBBY-WT, typed EQUITY)
+        ("SHBA.DE", "Shell", None),  # Shelly Group
+        ("SIEM.DE", "Siemens", "SIE.DE"),  # Siemens AG, although Siemens Energy (ENR.DE) is listed first
+        # Renamed.
+        ("OTE.AT", "OTE", "HTO.AT"),  # by its short name "OTE S.A."
+        ("SQ", "Block", "XYZ"),  # after three ETFs named "Portfolio Building Block ..." typed EQUITY
+    ],
+)
+def test_best_match_takes_only_the_same_company(ticker, query, found):
+    """Regression (live): the first same-exchange EQUITY quote whose long or short name loosely matched was taken:
+    HES -> HESM, CS -> DHY, MRO -> MPC, BBBY -> BBBY-WT, SIEM.DE -> ENR.DE, SHBA.DE -> SLYG.DE."""
+    match = best_match(RENAMES[query], query, ticker, texts=[f"{query} news"])
+    assert (match.symbol if match else None) == found
+
+
+def test_a_longer_name_counts_only_when_a_story_names_it():
+    """Regression (live): "Toshiba" (delisted) found Toshiba Tec, "Hawaiian" (acquired) Hawaiian Electric: a longer
+    name that starts with the query looks exactly like a rename ("Metlen" -> "Metlen Energy & Metals PLC")."""
+    metlen = RENAMES["Metlen"]
+    assert candidate(metlen, "Metlen", "MYTIL.AT") == (
+        Resolution("MTLN.AT", "Metlen Energy & Metals PLC", "Metlen"),
+        True,
+    )
+    assert best_match(metlen, "Metlen", "MYTIL.AT", texts=["Metlen wins a new contract"]) is None
+    story = "Metlen Energy and Metals raises its guidance"
+    assert best_match(metlen, "Metlen", "MYTIL.AT", texts=["other", story]).symbol == "MTLN.AT"
+    assert best_match(metlen, "Metlen Energy & Metals", "MYTIL.AT").symbol == "MTLN.AT"  # the same name: no story
+
+    toshiba = RENAMES["Toshiba"]
+    assert candidate(toshiba, "Toshiba", "6502.T")[0].symbol == "6588.T"
+    assert best_match(toshiba, "Toshiba", "6502.T", texts=["Toshiba's new owners plan job cuts"]) is None
+    hawaiian = RENAMES["Hawaiian"]  # Hawaiian Electric (and First Hawaiian, which doesn't start with it)
+    assert best_match(hawaiian, "Hawaiian", "HA", texts=["Hawaiian Airlines cancels flights"]) is None
+    assert best_match(hawaiian, "Hawaiian", "HA", texts=["Hawaiian Electric Industries"]).symbol == "HE"
+
+    motor_oil = [quote("MOH.AT", "Motor Oil (Hellas) Corinth Refineries S.A.")]
+    assert best_match(motor_oil, "Motor Oil", "MOH2.AT", texts=["Motor Oil Hellas Corinth Refineries: results"])
+    assert best_match(motor_oil, "Motor Oil", "MOH2.AT", texts=["Motor Oil results"]) is None
+
+
+def test_named_in_reads_names_as_company_core_writes_them():
+    assert named_in("Metlen Energy & Metals PLC", ["METLEN ENERGY & METALS: results"])
+    assert named_in("Toshiba Tec Corporation", ["Toshiba Tec, the printer maker"])
+    assert not named_in("Toshiba Tec Corporation", ["Toshiba Technologies"])
+    assert not named_in("", ["anything"])
+
+
+def test_resolve_keeps_a_longer_name_until_a_story_names_it(store):
+    session = FakeSession({QUERY2: {"quotes": RENAMES["Metlen"]}})
+    resolver = SymbolResolver(session, store)
+
+    assert resolver.resolve("MYTIL.AT", ["Metlen"], now=NOW, texts=["Metlen wins a contract"]) is None
+    assert store.symbol_lookup("MYTIL.AT", "Metlen", now=NOW) == ("MTLN.AT", "Metlen Energy & Metals PLC", True)
+    assert resolver.known("MYTIL.AT", now=NOW) is None  # not moved without a story naming it
+
+    story = ["Metlen Energy & Metals books a record quarter"]
+    found = resolver.resolve("MYTIL.AT", ["Metlen"], now=NOW + timedelta(hours=1), texts=story)
+    assert found == Resolution("MTLN.AT", "Metlen Energy & Metals PLC", "Metlen")
+    assert len(session.calls) == 1  # answered from the store
+    assert resolver.known("MYTIL.AT", now=NOW + timedelta(hours=2)) == found  # confirmed: counts from now on
+
+
+def test_a_query_yahoo_refuses_is_no_match_and_remembered(store):
+    """Regression (live): Yahoo answers HTTP 400 to a name in Greek letters only ("ΟΠΑΠ"); it was taken for an
+    outage and searched again on both hosts every cycle."""
+    session = FakeSession({QUERY2: 400, QUERY1: 400})
+    resolver = SymbolResolver(session, store)
+    assert resolver.resolve("OPAP.AT", ["ΟΠΑΠ"], now=NOW) is None
+    assert resolver.resolve("OPAP.AT", ["ΟΠΑΠ"], now=NOW + timedelta(minutes=5)) is None
+    assert len(session.calls) == 1
+
+
 # --- the store -----------------------------------------------------------------------------------------------------
 
 
@@ -205,8 +296,8 @@ def test_the_store_keeps_symbol_lookups_for_seven_days_and_prune_drops_old_ones(
     store.save_symbol_lookup("OPAP.AT", "Allwyn", "alwn.at", "Allwyn AG", checked=NOW - timedelta(days=1))
     store.save_symbol_lookup("MYTIL.AT", "Metlen", "MTLN.AT", "Metlen Energy & Metals PLC", checked=NOW - timedelta(8))
 
-    assert store.symbol_lookup("OPAP.AT", "OPAP", now=NOW) == (None, None)
-    assert store.symbol_lookup("OPAP.AT", "Allwyn", now=NOW) == ("ALWN.AT", "Allwyn AG")
+    assert store.symbol_lookup("OPAP.AT", "OPAP", now=NOW) == (None, None, False)
+    assert store.symbol_lookup("OPAP.AT", "Allwyn", now=NOW) == ("ALWN.AT", "Allwyn AG", False)
     assert store.symbol_lookup("OPAP.AT", "Jumbo", now=NOW) is None
     assert store.resolved_symbol("OPAP.AT", now=NOW) == ("ALWN.AT", "Allwyn AG", "Allwyn")
     assert store.resolved_symbol("MYTIL.AT", now=NOW) is None  # older than 7 days
@@ -217,3 +308,13 @@ def test_the_store_keeps_symbol_lookups_for_seven_days_and_prune_drops_old_ones(
     store.prune(older_than=NOW - timedelta(days=3))
     assert store.resolved_symbol("MYTIL.AT", now=NOW - timedelta(days=2)) is None
     assert store.resolved_symbol("OPAP.AT", now=NOW) is not None
+
+
+def test_renamed_to_lists_the_old_symbols_whose_news_goes_to_a_symbol(store):
+    store.save_symbol_lookup("OPAP.AT", "Allwyn", "ALWN.AT", "Allwyn AG", checked=NOW - timedelta(days=1))
+    store.save_symbol_lookup("OPAP.AT", "OPAP", "OPAPX.AT", "Other", checked=NOW - timedelta(days=2))  # older
+    store.save_symbol_lookup("GOFPY.AT", "Allwyn", "ALWN.AT", "Allwyn AG", checked=NOW - timedelta(days=8))  # expired
+    store.save_symbol_lookup("MYTIL.AT", "Metlen", "MTLN.AT", "Metlen", checked=NOW, unconfirmed=True)
+    assert store.renamed_to("alwn.at", now=NOW) == ["OPAP.AT"]
+    assert store.renamed_to("OPAPX.AT", now=NOW) == []  # OPAP.AT's newest replacement is ALWN.AT
+    assert store.renamed_to("MTLN.AT", now=NOW) == []  # unconfirmed

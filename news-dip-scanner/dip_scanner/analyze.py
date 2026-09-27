@@ -189,12 +189,23 @@ def _safe(text: str) -> str:
     return text.replace("<", "‹").replace(">", "›")
 
 
-def fundamentals_block(ticker: str, fundamentals: Fundamentals | None, *, today: date) -> str:
+def fundamentals_block(
+    ticker: str, fundamentals: Fundamentals | None, *, today: date, sec_ticker: str | None = None
+) -> str:
     """The fundamentals for the prompt, or why there are none: a listing outside the US (a Yahoo exchange suffix such
-    as .DE or .AT) never has SEC figures, which the model must not count against its confidence."""
+    as .DE or .AT) never has SEC figures, which the model must not count against its confidence. sec_ticker is the
+    US symbol the figures were looked up under when it isn't ticker ([universe] preferred_listings: ASML for
+    ASML.AS); then they are expected, and the figures say where they come from."""
+    sec_ticker = sec_ticker or ticker
     if fundamentals is not None:
-        return fundamentals.as_text(today=today)
-    if not is_us_listing(ticker):
+        text = fundamentals.as_text(today=today)
+        if sec_ticker != ticker:
+            text = (
+                f"From the SEC filings of the same company's US listing {sec_ticker}; {ticker} is the listing "
+                f"analysed here (its prices may be in another currency than these figures).\n{text}"
+            )
+        return text
+    if not is_us_listing(sec_ticker):
         return NON_US_FUNDAMENTALS.format(ticker=ticker)
     return NO_FUNDAMENTALS
 
@@ -443,8 +454,10 @@ def analyze_candidate(
     fundamentals: Fundamentals | None,
     extra_news: list[Article],
     now: datetime,
+    sec_ticker: str | None = None,
 ) -> Opportunity:
-    """Ask the model for a verdict on one candidate and turn it into a scored Opportunity.
+    """Ask the model for a verdict on one candidate and turn it into a scored Opportunity. sec_ticker: the US symbol
+    the fundamentals were looked up under, when it isn't the candidate's (see fundamentals_block).
 
     Raises LLMError when the reply is unusable even after a corrective retry (LLMSetupError when no call can work).
     """
@@ -455,7 +468,7 @@ def analyze_candidate(
         company=candidate.company,
         today=f"{now:%Y-%m-%d} ({now:%A})",
         price_block=price_block(stats),
-        fundamentals_block=fundamentals_block(candidate.ticker, fundamentals, today=now.date()),
+        fundamentals_block=fundamentals_block(candidate.ticker, fundamentals, today=now.date(), sec_ticker=sec_ticker),
         news_block=news_block(candidate.impacts, extra_news),
         dip_reasons="; ".join(candidate.dip_reasons) or "manual analysis (no dip thresholds applied)",
         currency=stats.currency,
