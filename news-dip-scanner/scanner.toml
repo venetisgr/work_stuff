@@ -64,6 +64,11 @@ min_price = 1.0
 # Only these exchanges, by Yahoo suffix: "" is US (AMD), ".DE" Xetra, ".PA" Paris, ".AS" Amsterdam, ".L" London,
 # ".AT" Athens, ".T" Tokyo, ".HK" Hong Kong... Leave it commented out to allow every exchange.
 # allowed_suffixes = ["", ".DE", ".PA", ".AS", ".AT"]
+# The listing you buy for a company listed in several places. The triage names the one the article is about, often
+# the US one; with a euro account the euro listing saves the currency conversion and its fee. News filed under a key
+# goes to its value, and watchlist and exclude entries are read the same way. Mind allowed_suffixes.
+preferred_listings = {}
+# preferred_listings = { "ASML" = "ASML.AS", "SAP" = "SAP.DE", "TTE" = "TTE.PA", "STLA" = "STLAM.MI" }
 
 [alerts]
 # Which new opportunities are sent as notifications (all of them are in the reports).
@@ -90,3 +95,9 @@ min_score_change = 10
 # 5-minute interval). Each kind at most once every 12 hours; secrets are never included.
 system_notices = true
 notice_after_cycles = 6
+
+[account]
+# The currency of your broker account (ISO code). When set, reports and alerts show price, entry and target in it
+# too ("$132.00 ≈ €115.93") for stocks that trade in another currency, at Yahoo Finance's rate at the analysis, and
+# `dip-scanner track` shows returns in it next to the local ones, exchange-rate moves included. Unset: no conversion.
+# currency = "EUR"

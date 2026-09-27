@@ -10,12 +10,15 @@ from dip_scanner.track import (
     HORIZON_DAYS,
     STATUSES,
     Outcome,
+    benchmark_for,
     evaluate,
     quote_day,
     render_track_record,
     score_bucket,
     signal_day,
     summarize,
+    with_account_return,
+    with_benchmark,
 )
 
 # make_opportunity(): AMD reported at NOW (Friday 2026-09-25 15:00 UTC) at $142.50 with the price taken 14:45 UTC the
@@ -285,6 +288,45 @@ def test_no_bars_yet():
     assert outcome.days == 0
     assert outcome.status == "waiting_entry"
     assert (outcome.entry_filled, outcome.target_hit, outcome.low_breached) == (None, None, None)
+    assert not outcome.priced and outcome.last_day is None
+
+
+def test_before_any_trading_after_the_report_the_figures_show_dashes():
+    """Regression (recheck): right after a weekend report `track` said "Higher now than when reported 0 of 9 (0%)",
+    "Average return +0.0%" and "Max loss +0.0%", which read like results."""
+    created = datetime(2026, 9, 27, 20, 40, tzinfo=UTC)  # Sunday; the price is Friday's close
+    stats = make_stats(as_of=datetime(2026, 9, 25, 20, 0, tzinfo=UTC), timezone="America/New_York")
+    weekend = make_opportunity(stats=stats, created=created)
+    friday_bar = bar(date(2026, 9, 25), high=150, low=140, close=142.5)
+    waiting = evaluate(weekend, [friday_bar], now=created)
+    assert not waiting.priced
+    summary = summarize([waiting])
+    assert summary["priced"] == 0 and summary["avg_return_pct"] is None and summary["positive_rate"] is None
+    text = render_track_record([waiting], summary)
+    assert "1 opportunity has had no trading since the report yet" in text
+    assert "| Higher now than when reported | – |" in text
+    assert "| Entry filled (limit buy reached) | – |" in text
+    assert "| Average return since the report | – |" in text
+    row = next(line for line in text.splitlines() if "**AMD**" in line)
+    assert row.endswith("| waiting for entry | – | – | – | – | – | – | – | – |")
+
+    # Monday's session is the first after the report: from then on it counts.
+    monday = evaluate(weekend, [friday_bar, bar(date(2026, 9, 28), high=146, low=141, close=145)], now=LATER)
+    assert monday.priced and monday.return_pct == pytest.approx((145 / 142.5 - 1) * 100)
+    mixed = summarize([waiting, monday])
+    assert (mixed["count"], mixed["priced"], mixed["positive"]) == (2, 1, 1)
+    assert "| Higher now than when reported | 1 of 1 (100%) |" in render_track_record([waiting, monday], mixed)
+
+
+def test_the_report_days_own_bar_counts_when_it_traded_after_the_report():
+    # Written after the close: the day's bar closes at the report's price, nothing has traded since.
+    after_close = make_opportunity(stats=make_stats(as_of=NOW - timedelta(minutes=15)))
+    assert not evaluate(after_close, [bar(SIGNAL, high=150, low=140, close=142.5)], now=NOW).priced
+    # Written during the session (session_elapsed set): the day's close came after it.
+    running = make_opportunity(stats=make_stats(session_elapsed=0.4))
+    assert evaluate(running, [bar(SIGNAL, high=150, low=140, close=142.5)], now=LATER).priced
+    # Or the close simply differs from the report's price.
+    assert evaluate(after_close, [bar(SIGNAL, high=150, low=140, close=141.0)], now=LATER).priced
 
 
 def test_bars_are_sorted_and_the_last_duplicate_wins():
@@ -464,8 +506,11 @@ def test_render_track_record():
     assert "| Average return of filled limit orders | +8.5% |" in text
     assert "Status: 1 waiting for entry · 1 target hit · 1 below the low · 1 expired" in text
     assert "## By verdict" in text
-    assert "| Temporary fear | 2 | 2 of 2 (100%) | 1 of 2 (50%) | 1 of 2 (50%) | 1 of 2 (50%) | +2.5% | +8.5% |" in text
-    assert "| Mixed | 1 | 0 of 1 (0%) | – | 0 of 1 (0%) | – | +5.0% | – |" in text
+    assert (
+        "| Temporary fear | 2 | 2 of 2 (100%) | 1 of 2 (50%) | 1 of 2 (50%) | 1 of 2 (50%) | +2.5% | – | +8.5% |"
+    ) in text
+    assert "| Mixed | 1 | 0 of 1 (0%) | – | 0 of 1 (0%) | – | +5.0% | – | – |" in text
+    assert "| Average return of the benchmark index over the same days | – |" in text  # none given here
     assert "## By score" in text
     assert "| 80+ | 1 |" in text
     # Newest first; AAA and BBB share a timestamp, so they keep their order.
@@ -485,7 +530,7 @@ def test_render_track_record_end_to_end_from_bars():
     outcomes = [evaluate(make_opportunity(), bars, now=LATER)]
     text = render_track_record(outcomes, summarize(outcomes))
     row = next(line for line in text.splitlines() if "**AMD**" in line)
-    assert "| target hit | 2026-09-28 | 2026-09-29 | +15.8% | +19.3% | -8.1% | – |" in row
+    assert "| target hit | 2026-09-28 | 2026-09-29 | +15.8% | – | – | +19.3% | -8.1% | – |" in row  # no index given
     assert "| Average return of filled limit orders | +27.3% |" in text
 
 
@@ -508,3 +553,110 @@ def test_render_track_record_escapes_and_handles_empty():
     assert "No stored opportunities to track yet." in render_track_record([], summarize([]))
     odd = [outcome(score=70, verdict="mixed", probability=55, ticker="A|B")]
     assert "**A\\|B**" in render_track_record(odd, summarize(odd))
+
+
+# --- benchmark index and account currency --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("ticker", "index"),
+    [
+        ("AMD", "^GSPC"),
+        ("BRK-B", "^GSPC"),
+        ("SAP.DE", "^GDAXI"),
+        ("MC.PA", "^FCHI"),
+        ("ASML.AS", "^AEX"),
+        ("ENI.MI", "FTSEMIB.MI"),
+        ("ITX.MC", "^IBEX"),
+        ("ALWN.AT", "GD.AT"),
+        ("VOD.L", "^FTSE"),
+        ("7203.T", "^N225"),
+        ("PKO.WA", "^STOXX50E"),  # another European exchange
+        ("XYZ.QQ", "^GSPC"),  # anything else
+    ],
+)
+def test_each_exchange_has_its_benchmark_index(ticker, index):
+    assert benchmark_for(ticker) == index
+
+
+# AMD bought at 142.50 on Fri 25 Sep; on Tue 29 Sep it closes at 150 (+5.3%) while the S&P 500 went 7,000 -> 7,210.
+GAIN = [bar(date(2026, 9, 28), high=146, low=141, close=145), bar(date(2026, 9, 29), high=151, low=144, close=150)]
+SP500 = [
+    bar(date(2026, 9, 24), high=6990, low=6990, close=6990),
+    bar(SIGNAL, high=7000, low=7000, close=7000),
+    bar(date(2026, 9, 28), high=7100, low=7100, close=7100),
+    bar(date(2026, 9, 29), high=7210, low=7210, close=7210),
+    bar(date(2026, 9, 30), high=7300, low=7300, close=7300),  # after the last price's day: not used
+]
+
+
+def test_the_benchmark_covers_the_same_days():
+    outcome = with_benchmark(evaluate(make_opportunity(), GAIN, now=LATER), "^GSPC", SP500)
+    assert outcome.last_day == date(2026, 9, 29)
+    assert outcome.benchmark == "^GSPC"
+    assert outcome.benchmark_return_pct == pytest.approx(3.0)  # 7,000 on the quote day -> 7,210
+    assert outcome.excess_return_pct == pytest.approx((150 / 142.5 - 1) * 100 - 3.0)
+
+    missing = with_benchmark(evaluate(make_opportunity(), GAIN, now=LATER), "GD.AT", [])
+    assert missing.benchmark_return_pct is None and missing.excess_return_pct is None
+    waiting = with_benchmark(evaluate(make_opportunity(), [], now=NOW), "^GSPC", SP500)
+    assert waiting.benchmark_return_pct is None
+
+
+def test_the_account_currency_return_adds_the_exchange_rate_move():
+    """A euro investor: +5.3% in dollars, but the dollar fell from 0.88 to 0.85 euros."""
+    rates = [(date(2026, 9, 24), 0.87), (SIGNAL, 0.88), (date(2026, 9, 29), 0.85)]
+    local = evaluate(make_opportunity(), GAIN, now=LATER)
+    outcome = with_account_return(local, "EUR", rates)
+    assert outcome.account_return_pct == pytest.approx(((150 / 142.5) * 0.85 / 0.88 - 1) * 100)  # +1.7%
+    assert outcome.account_currency == "EUR"
+
+    # The rate stored with the report wins over the day's close.
+    stored = evaluate(make_opportunity(account_currency="EUR", fx_rate=0.86), GAIN, now=LATER)
+    assert with_account_return(stored, "EUR", rates).account_return_pct == pytest.approx(
+        ((150 / 142.5) * 0.85 / 0.86 - 1) * 100
+    )
+    # A euro stock needs no rates; missing rates give None, and so does no trading yet.
+    euro = evaluate(make_opportunity(ticker="SAP.DE", currency="EUR"), GAIN, now=LATER)
+    assert with_account_return(euro, "EUR", None).account_return_pct == pytest.approx(euro.return_pct)
+    assert with_account_return(local, "EUR", None).account_return_pct is None
+    assert with_account_return(local, "EUR", [(date(2026, 9, 29), 0.85)]).account_return_pct is None  # none before
+    waiting = evaluate(make_opportunity(), [], now=NOW)
+    assert with_account_return(waiting, "EUR", rates).account_return_pct is None
+
+
+def test_the_track_record_shows_index_excess_and_account_returns():
+    rates = [(SIGNAL, 0.88), (date(2026, 9, 29), 0.85)]
+    amd = with_account_return(
+        with_benchmark(evaluate(make_opportunity(), GAIN, now=LATER), "^GSPC", SP500), "EUR", rates
+    )
+    summary = summarize([amd])
+    assert summary["account_currency"] == "EUR"
+    assert summary["avg_benchmark_return_pct"] == pytest.approx(3.0)
+    assert summary["avg_excess_return_pct"] == pytest.approx(amd.excess_return_pct)
+    text = render_track_record([amd], summary)
+    assert "| Average return in EUR (exchange-rate moves included) | +1.7% |" in text
+    assert "| Average return of the benchmark index over the same days | +3.0% |" in text
+    assert "| Average excess return (return minus the index's) | +2.3% |" in text
+    assert "| Return | In EUR | Index | vs index |" in text
+    row = next(line for line in text.splitlines() if "**AMD**" in line)
+    assert "| +5.3% | +1.7% | +3.0% (^GSPC) | +2.3% |" in row
+    assert "| Temporary fear | 1 | 0 of 1 (0%) | – | 0 of 1 (0%) | – | +5.3% | +2.3% | – |" in text
+    assert "The EUR return adds the exchange-rate move" in text
+
+    plain = render_track_record([evaluate(make_opportunity(), GAIN, now=LATER)], summarize([amd]))
+    assert "In EUR" in plain  # the summary says which account
+    assert "In EUR" not in render_track_record([amd], summarize([evaluate(make_opportunity(), GAIN, now=LATER)]))
+
+
+def test_the_reported_dates_follow_the_display_time_zone():
+    from zoneinfo import ZoneInfo
+
+    from dip_scanner.report import set_display_zone
+
+    created = datetime(2026, 9, 25, 22, 30, tzinfo=UTC)  # already the 26th in Athens
+    outcomes = [evaluate(make_opportunity(created=created), GAIN, now=LATER)]
+    assert "| 2026-09-25 | **AMD** |" in render_track_record(outcomes, summarize(outcomes))
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    text = render_track_record(outcomes, summarize(outcomes))
+    assert "| 2026-09-26 | **AMD** |" in text and "reported on 2026-09-26" in text

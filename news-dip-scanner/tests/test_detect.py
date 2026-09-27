@@ -264,6 +264,17 @@ def test_universe_exclude_only_watchlist_and_suffixes():
     assert notes == ["Not on the watchlist ([universe] only_watchlist): BRK-B, 7203.T, TSLA, GME"]
 
 
+def test_preferred_listings_gather_the_news_of_every_listing():
+    """Impacts stored under the US symbol before the setting count for the preferred listing, with its news."""
+    impacts = [news("ASML", title="ASML export curbs"), news("ASML.AS", title="ASML shares slide in Amsterdam")]
+    prices = FakePrices({"ASML.AS": make_stats(ticker="ASML.AS", currency="EUR"), "ASML": make_stats(ticker="ASML")})
+    cfg = config(universe={"preferred_listings": {"ASML": "ASML.AS"}})
+    [candidate], notes = select(impacts, prices, cfg=cfg)
+    assert candidate.ticker == "ASML.AS" and len(candidate.impacts) == 2
+    assert {impact.ticker for impact, _ in candidate.impacts} == {"ASML.AS"}
+    assert prices.tickers == ["ASML.AS"] and notes == []
+
+
 def test_cooldown_skips_a_recently_analysed_ticker_without_new_news():
     impacts = [news(hours_ago=3)]
     last = make_opportunity(created=NOW - timedelta(hours=2), article_ids=[impacts[0][1].id])

@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
+from datetime import UTC, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from .models import DIRECTIONS, VERDICTS, Feed
 
@@ -71,6 +74,9 @@ class Settings:
     notify: NotifySettings = field(default_factory=NotifySettings)
     sec_user_agent: str | None = None  # SEC_USER_AGENT, e.g. "Jane Doe jane@example.com"; None -> fundamentals off
     data_dir: Path = field(default_factory=lambda: Path.cwd() / "data")  # DATA_DIR: database, reports/, cache/
+    # DISPLAY_TZ, e.g. Europe/Athens: the time zone of every time people read (reports, alerts, summaries, notes and
+    # the log). Everything is still stored and compared in UTC.
+    display_tz: tzinfo = UTC
 
 
 def load_settings(env: Mapping[str, str] | None = None) -> Settings:
@@ -130,6 +136,7 @@ def load_settings(env: Mapping[str, str] | None = None) -> Settings:
         ),
         sec_user_agent=get("SEC_USER_AGENT"),
         data_dir=_data_dir(get("DATA_DIR")),
+        display_tz=display_zone(get("DISPLAY_TZ")),
     )
 
 
@@ -163,6 +170,35 @@ def _address_list(value: str | None) -> list[str]:
     if not value:
         return []
     return [part.strip() for part in value.replace(";", ",").split(",") if part.strip()]
+
+
+def display_zone(name: str | None) -> tzinfo:
+    """The time zone named by DISPLAY_TZ (an IANA name like Europe/Athens; the case doesn't matter), UTC when unset.
+
+    An unknown name is a ConfigError. Windows has no time zone database of its own: there the tzdata package provides
+    it (a dependency of this project on Windows).
+    """
+    if name is None or name.upper() in ("UTC", "Z", "ETC/UTC", "GMT"):
+        return UTC
+    try:
+        return ZoneInfo(name)
+    except (ZoneInfoNotFoundError, ValueError, OSError):
+        pass
+    try:
+        known = {zone.casefold(): zone for zone in available_timezones()}
+    except OSError:
+        known = {}
+    if name.casefold() in known:
+        return ZoneInfo(known[name.casefold()])
+    hint = ""
+    if not known:
+        hint = " No time zone database was found: install it with pip install tzdata."
+    elif sys.platform == "win32":
+        hint = " On Windows the names come from the tzdata package (pip install tzdata)."
+    raise ConfigError(
+        f"DISPLAY_TZ must be an IANA time zone name such as Europe/Athens, Europe/Berlin or America/New_York (got "
+        f"{name!r}).{hint}"
+    )
 
 
 def _data_dir(value: str | None) -> Path:
@@ -216,6 +252,9 @@ class UniverseConfig:
     exclude: tuple[str, ...] = ()
     min_price: float = 1.0
     allowed_suffixes: tuple[str, ...] | None = None  # e.g. ("", ".DE", ".AT"); "" = no suffix (US). None = all
+    # The listing to use for a company listed in several places, e.g. {"ASML": "ASML.AS"} for a euro account: news the
+    # triage files under the key goes to the value, and watchlist and exclude entries are read the same way.
+    preferred_listings: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -236,14 +275,31 @@ class AlertConfig:
 
 
 @dataclass(frozen=True)
+class AccountConfig:
+    """[account]: the currency of your broker account. When set, reports and alerts show prices in it too (≈ €) for
+    stocks that trade in another currency, and `track` shows the returns in it (exchange-rate moves included)."""
+
+    currency: str | None = None  # ISO code, e.g. "EUR"; None = trading currencies only
+
+
+@dataclass(frozen=True)
 class ScannerConfig:
     scan: ScanConfig = field(default_factory=ScanConfig)
     dip: DipConfig = field(default_factory=DipConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
+    account: AccountConfig = field(default_factory=AccountConfig)
 
 
-_SECTIONS: dict[str, type] = {"scan": ScanConfig, "dip": DipConfig, "universe": UniverseConfig, "alerts": AlertConfig}
+_SECTIONS: dict[str, type] = {
+    "scan": ScanConfig,
+    "dip": DipConfig,
+    "universe": UniverseConfig,
+    "alerts": AlertConfig,
+    "account": AccountConfig,
+}
+# Codes Yahoo uses for hundredths of a currency (pence, cents, agorot) once uppercased; an account is in the main unit.
+_MINOR_ACCOUNT_CODES = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}
 
 
 def load_scanner_config(path: Path | None) -> ScannerConfig:
@@ -278,7 +334,7 @@ def _load_section(cls: type, name: str, raw: Any, path: Path) -> Any:
             f"Known settings: {', '.join(known)}."
         )
     values = {key: _convert(value, str(known[key].type), f"{name}.{key}", path) for key, value in raw.items()}
-    return _normalise(cls(**values))
+    return _normalise(cls(**values), path)
 
 
 def _convert(value: Any, kind: str, where: str, path: Path) -> Any:
@@ -301,10 +357,20 @@ def _convert(value: Any, kind: str, where: str, path: Path) -> Any:
         if isinstance(value, list) and all(isinstance(item, str) for item in value):
             return tuple(item.strip() for item in value)
         raise ConfigError(f'{where} in {path} must be a list of strings, e.g. ["a", "b"] (got {value!r}).')
+    if kind == "str | None":
+        if isinstance(value, str):
+            return value.strip() or None
+        raise ConfigError(f'{where} in {path} must be a string, e.g. "EUR" (got {value!r}).')
+    if kind == "dict[str, str]":
+        if isinstance(value, dict) and all(isinstance(k, str) and isinstance(v, str) for k, v in value.items()):
+            return dict(value)
+        raise ConfigError(
+            f'{where} in {path} must be a table of symbols, e.g. {{ "ASML" = "ASML.AS" }} (got {value!r}).'
+        )
     raise AssertionError(f"No converter for field type {kind}")  # a new field type in this module
 
 
-def _normalise(section: Any) -> Any:
+def _normalise(section: Any, path: Path) -> Any:
     if isinstance(section, DipConfig):
         return replace(
             section,
@@ -315,22 +381,62 @@ def _normalise(section: Any) -> Any:
         )
     if isinstance(section, UniverseConfig):
         suffixes = section.allowed_suffixes
+        preferred = _listings(section.preferred_listings, path)
         return replace(
             section,
-            watchlist=_tickers(section.watchlist),
-            exclude=_tickers(section.exclude),
+            watchlist=_tickers(section.watchlist, preferred),
+            exclude=_tickers(section.exclude, preferred),
             allowed_suffixes=None if suffixes is None else tuple(dict.fromkeys(_suffix(item) for item in suffixes)),
+            preferred_listings=preferred,
         )
     if isinstance(section, AlertConfig):
         return replace(section, verdicts=tuple(item.lower() for item in section.verdicts))
+    if isinstance(section, AccountConfig):
+        return replace(section, currency=_account_currency(section.currency, path))
     return section
 
 
-def _tickers(values: tuple[str, ...]) -> tuple[str, ...]:
-    """Symbols written the way triage writes them ("BRK.B" -> "BRK-B", "NASDAQ:TSLA" -> "TSLA"), so they match."""
+def _tickers(values: tuple[str, ...], preferred: Mapping[str, str] | None = None) -> tuple[str, ...]:
+    """Symbols written the way triage writes them ("BRK.B" -> "BRK-B", "NASDAQ:TSLA" -> "TSLA"), so they match, and
+    moved to the preferred listing when there is one ("ASML" -> "ASML.AS")."""
     from .triage import normalise_ticker  # here: triage imports this module
 
-    return tuple(dict.fromkeys(normalise_ticker(value) or value.strip().upper() for value in values if value.strip()))
+    preferred = preferred or {}
+    symbols = (normalise_ticker(value) or value.strip().upper() for value in values if value.strip())
+    return tuple(dict.fromkeys(preferred.get(symbol, symbol) for symbol in symbols))
+
+
+def _listings(values: Mapping[str, str], path: Path) -> dict[str, str]:
+    """[universe] preferred_listings with both sides written the way triage writes symbols ("asml" -> "ASML")."""
+    from .triage import normalise_ticker
+
+    listings: dict[str, str] = {}
+    for key, value in values.items():
+        source, target = normalise_ticker(key), normalise_ticker(value)
+        if source is None or target is None:
+            wrong = key if source is None else value
+            raise ConfigError(
+                f"universe.preferred_listings in {path}: {wrong!r} isn't a company's Yahoo Finance symbol; write "
+                'each entry like "ASML" = "ASML.AS".'
+            )
+        if source != target:
+            listings[source] = target
+    return listings
+
+
+def _account_currency(value: str | None, path: Path) -> str | None:
+    if value is None:
+        return None
+    code = value.strip().upper()
+    if code in _MINOR_ACCOUNT_CODES:
+        raise ConfigError(
+            f"account.currency in {path} is {value!r}, a hundredth of a currency; use {_MINOR_ACCOUNT_CODES[code]}."
+        )
+    if not re.fullmatch(r"[A-Z]{3}", code):
+        raise ConfigError(
+            f'account.currency in {path} must be a three-letter currency code like "EUR" (got {value!r}).'
+        )
+    return code
 
 
 def _suffix(value: str) -> str:

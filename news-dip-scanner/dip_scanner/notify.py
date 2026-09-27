@@ -27,7 +27,7 @@ import requests
 
 from .config import WEBHOOK_FORMATS, ConfigError, NotifySettings
 from .models import Opportunity, utc
-from .report import format_pct, format_price, format_when, safe_url, verdict_label
+from .report import format_money, format_pct, format_price, format_when, safe_url, verdict_label
 
 log = logging.getLogger(__name__)
 
@@ -570,9 +570,10 @@ def short_alert(opps: list[Opportunity], *, now: datetime | None = None) -> str:
     """Compact text for chat notifiers: a count line, then one line per opportunity (best score first), e.g.
 
     - AMD (Advanced Micro Devices) · score 72.4 · 68% chance up in 6m · price $142.50 · entry $132.00 ·
-      target $168.00 (+17.9%) · low $118.00 · Temporary fear, medium confidence
+      target $168.00 (+17.9% from price, +27.3% from entry) · low $118.00 · Temporary fear, medium confidence
 
     (on one line), and a reminder that the numbers are an uncalibrated model estimate and not investment advice.
+    Price, entry and target carry their value in the [account] currency when it differs ("$132.00 ≈ €115.93").
     Given now, opportunities analysed before it (alerts that couldn't be sent earlier) say how old they are.
     """
     if not opps:
@@ -593,9 +594,10 @@ def short_alert(opps: list[Opportunity], *, now: datetime | None = None) -> str:
             f"{_one_line(opp.ticker)} ({_one_line(opp.company)})" if opp.company else _one_line(opp.ticker),
             f"score {opp.score:.1f}",
             f"{analysis.probability_up_6m}% chance up in 6m",
-            f"price {format_price(opp.price, currency)}",
-            f"entry {format_price(analysis.entry_price, currency)}",
-            f"target {format_price(analysis.target_price, currency)} ({format_pct(opp.upside_pct())})",
+            f"price {format_money(opp.price, opp)}",
+            f"entry {format_money(analysis.entry_price, opp)}",
+            f"target {format_money(analysis.target_price, opp)} ({format_pct(opp.upside_pct())} from price, "
+            f"{format_pct(opp.entry_upside_pct())} from entry)",
             f"low {format_price(analysis.potential_low, currency)}",
             f"{verdict_label(analysis.verdict)}, {analysis.confidence} confidence",
         ]

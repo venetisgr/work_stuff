@@ -122,3 +122,18 @@ def test_stopped_lines_say_what_stopped_and_what_to_do():
     assert "Every `dip-scanner run` stops with this error until it is fixed" in run[1]
     assert "`dip-scanner run --no-notify`" in run[2]
     assert "has exited" in stopped_lines("watch", "x", NOW)[1]
+
+
+def test_notices_use_the_display_time_zone_and_show_commands_as_code(store):
+    from zoneinfo import ZoneInfo
+
+    from dip_scanner.report import set_display_zone
+
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    lines = stopped_lines("run", "Configuration problem: x", NOW)
+    assert lines[0].startswith("dip-scanner run stopped at 2026-09-25 18:00 EEST:")
+    channel = Channel()
+    assert notice([channel], store, lines=lines)
+    [(_, markdown, html)] = channel.sent
+    assert "`dip-scanner run --no-notify`" in markdown
+    assert ">dip-scanner run --no-notify</code>" in html and "`" not in html

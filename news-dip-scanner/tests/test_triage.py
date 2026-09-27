@@ -284,6 +284,14 @@ def test_triage_batch_keeps_the_strongest_entry_per_ticker_and_at_most_five():
     ]
 
 
+def test_triage_batch_moves_tickers_to_their_preferred_listing():
+    """A euro investor buys ASML in Amsterdam: the US and Dutch symbols of one article become one ASML.AS impact."""
+    entries = [company("ASML", magnitude=4), company("ASML.AS", relation="indirect", magnitude=2), company("AMD")]
+    model = FakeChatModel(replier({"chips": entries}))
+    impacts = triage_batch(model, [make_article(title="chips")], now=NOW, preferred={"ASML": "ASML.AS"})
+    assert [(i.ticker, i.relation, i.magnitude) for i in impacts] == [("ASML.AS", "direct", 4), ("AMD", "direct", 4)]
+
+
 def test_triage_batch_treats_omitted_articles_as_unaffected_and_ignores_unknown_ids():
     first, second = make_article(title="one"), make_article(title="two")
     reply = {"articles": [{"id": "a2", "companies": [company()]}, {"id": "zz", "companies": [company("X")]}]}

@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import DipConfig, ScannerConfig
+from .fx import major_units
 from .models import Article, Candidate, Impact, Opportunity, PriceStats, utc
 from .prices import PriceError
 from .symbols import Resolution, SymbolSearchError
@@ -32,14 +33,6 @@ log = logging.getLogger(__name__)
 _EPSILON = 1e-9
 # Yahoo's instrumentType of single-company shares (ADRs included); ETFs, funds and indices aren't candidates.
 _EQUITY_TYPES = frozenset({"EQUITY"})
-# Currencies Yahoo quotes in hundredths: London pence, Johannesburg cents, Tel Aviv agorot.
-_MINOR_UNITS = {"GBp": 100, "GBX": 100, "ZAc": 100, "ILA": 100}
-
-
-def major_units(price: float, currency: str) -> float:
-    """A price in the currency's main unit: 150 GBp (pence) is 1.50 (pounds); other currencies are unchanged."""
-    return price / _MINOR_UNITS.get((currency or "").strip(), 1)
-
 
 # severity() weights, see its docstring.
 _RELATION_WEIGHTS = {"direct": 1.0, "indirect": 0.5}
@@ -170,7 +163,9 @@ def select_candidates(
     """Candidates sorted by severity (highest first, capped per cycle) and notes about every ticker left out.
 
     Steps, cheapest first:
-    1. Impacts whose article was published before the lookback window ([scan] lookback_hours) are ignored.
+    1. Impacts whose article was published before the lookback window ([scan] lookback_hours) are ignored. A ticker
+       with a listing in [universe] preferred_listings is read as that listing (triage stores new impacts that way
+       already; this covers ones stored before the setting).
     2. Tickers are checked against [universe]: exclude, only_watchlist and allowed_suffixes.
     3. Each ticker's impacts must match [dip]: directions, min_magnitude and include_indirect. Watchlist tickers
        skip the magnitude and relation tests (any relation, magnitude >= 1) but not the direction test.
@@ -207,8 +202,12 @@ def select_candidates(
     by_ticker: dict[str, list[tuple[Impact, Article]]] = {}
     seen: set[tuple[str, str]] = set()
     too_old: Counter[str] = Counter()
+    preferred = cfg.universe.preferred_listings
     for impact, article in impacts:
         ticker = impact.ticker.strip().upper()
+        if ticker in preferred:
+            ticker = preferred[ticker]
+            impact = replace(impact, ticker=ticker)
         if (ticker, article.id) in seen:
             continue
         seen.add((ticker, article.id))

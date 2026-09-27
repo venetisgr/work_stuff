@@ -6,6 +6,9 @@ no external images or fonts). JSON is [Opportunity.to_dict(), ...] for other too
 
 Every piece of text that came from a feed or a model is escaped for the format it goes into, and only http(s) links
 are turned into links (anything else, e.g. javascript:, is shown as plain text).
+
+Times are shown in the display time zone (DISPLAY_TZ, set once by the command line with set_display_zone; UTC by
+default); amounts in another currency than the [account] one get "≈ €121.31" next to them (format_money).
 """
 
 from __future__ import annotations
@@ -17,10 +20,11 @@ import math
 import os
 import re
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from .fx import main_currency, same_money
 from .models import Article, Impact, Opportunity, from_iso, utc
 
 log = logging.getLogger(__name__)
@@ -60,6 +64,7 @@ _DIRECTION_RANK = {direction: rank for rank, (direction, _) in enumerate(_DIRECT
 # (from a feed or a prompt-injected model reply) shows as text in any viewer that renders HTML. The backslash itself
 # too, so "\<" can't undo the escape. notify.py undoes exactly these for the chat services.
 _MD_SPECIAL = re.compile(r"([\\`*_\[\]|<>])")
+_CODE_SPAN = re.compile(r"`([^`]+)`")  # `dip-scanner track` in our own texts (DISCLAIMER): <code> in HTML
 
 # HTML palette (light, email-safe).
 _FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
@@ -71,6 +76,51 @@ _CARD = "#ffffff"
 _LINK = "#0969da"
 _WARN_BG = "#fff8c5"
 _WARN_LINE = "#d4a72c"
+_CODE_BG = "#eff2f5"
+
+_display_zone: tzinfo = UTC
+
+
+# --- times -----------------------------------------------------------------------------------------------------------
+
+
+def set_display_zone(zone: tzinfo | None) -> None:
+    """Show every time people read in zone (DISPLAY_TZ; None means UTC). The command line sets it before any output;
+    everything stored or compared stays in UTC."""
+    global _display_zone
+    _display_zone = zone if zone is not None else UTC
+
+
+def display_zone() -> tzinfo:
+    """The time zone times are shown in (see set_display_zone)."""
+    return _display_zone
+
+
+def local_time(dt: datetime) -> datetime:
+    """dt in the display time zone (naive datetimes are taken to be UTC)."""
+    return utc(dt).astimezone(_display_zone)
+
+
+def zone_label(local: datetime) -> str:
+    """The zone abbreviation of an aware datetime: UTC, EEST, CET; +04 where the zone has no abbreviation."""
+    return local.tzname() or local.strftime("%z")
+
+
+def format_when(dt: datetime) -> str:
+    """A timestamp in the display time zone: 2026-09-25 15:00 UTC, or 2026-09-25 18:00 EEST with Europe/Athens."""
+    local = local_time(dt)
+    return f"{local:%Y-%m-%d %H:%M} {zone_label(local)}"
+
+
+def format_clock(dt: datetime) -> str:
+    """A time of day in the display time zone: 15:00 UTC, 18:00 EEST."""
+    local = local_time(dt)
+    return f"{local:%H:%M} {zone_label(local)}"
+
+
+def display_date(dt: datetime) -> date:
+    """The calendar date of dt in the display time zone."""
+    return local_time(dt).date()
 
 
 # --- formatting helpers (also used by notify.py and track.py) ---------------------------------------------------------
@@ -98,9 +148,31 @@ def format_pct(value: float) -> str:
     return f"{round(value, 1) + 0.0:+.1f}%"
 
 
-def format_when(dt: datetime) -> str:
-    """A timestamp as 2026-09-25 15:00 UTC."""
-    return f"{utc(dt):%Y-%m-%d %H:%M} UTC"
+def in_account(value: float, opp: Opportunity) -> str:
+    """ " ≈ €121.31": value (in the opportunity's currency) in the [account] currency at the exchange rate of the
+    analysis; "" when the account has the same currency or no rate is known."""
+    if opp.fx_rate is None or not opp.account_currency or same_money(opp.currency, opp.account_currency):
+        return ""
+    return f" ≈ {format_price(value * opp.fx_rate, opp.account_currency)}"
+
+
+def format_money(value: float, opp: Opportunity) -> str:
+    """A price in the opportunity's currency, plus its value in the [account] currency when that differs:
+    "$132.00 ≈ €115.93"."""
+    return format_price(value, opp.currency) + in_account(value, opp)
+
+
+def fx_text(opp: Opportunity) -> str | None:
+    """The exchange rate behind the ≈ amounts, e.g. "1 USD = 0.8783 EUR at the analysis (Yahoo Finance); your
+    broker's rate and conversion fee differ"; None when nothing is converted."""
+    if opp.fx_rate is None or not in_account(1.0, opp):
+        return None
+    main, factor = main_currency(opp.currency)
+    rate = opp.fx_rate * factor  # per main unit: 1 GBP, not 1 penny
+    return (
+        f"1 {main} = {rate:.4g} {opp.account_currency} at the analysis (Yahoo Finance); your broker's rate and "
+        "conversion fee differ"
+    )
 
 
 def relative_to(value: float, base: float) -> str:
@@ -152,6 +224,17 @@ def md_escape(text: object) -> str:
     return _MD_SPECIAL.sub(r"\\\1", " ".join(str(text).split()))
 
 
+def html_text(text: object) -> str:
+    """Our own text (not a feed's or a model's) as HTML: escaped, with `code` spans as <code>."""
+    return _CODE_SPAN.sub(
+        lambda match: (
+            f'<code style="font-family:Menlo,Consolas,monospace;font-size:0.95em;background:{_CODE_BG};'
+            f'padding:0 3px;border-radius:3px;">{match.group(1)}</code>'
+        ),
+        html.escape(str(text), quote=True),
+    )
+
+
 def md_link(text: object, url: object) -> str:
     """A Markdown link, or just the escaped text when the URL isn't a safe http(s) link."""
     label = md_escape(text) or "link"
@@ -179,7 +262,8 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
     if ranked:
         lines += [
             "",
-            "| # | Ticker | Company | Score | Chance up in 6m | Price | Entry (limit buy) | Target | Verdict |",
+            "| # | Ticker | Company | Score | Chance up in 6m | Price | Entry (limit buy) "
+            "| Target (from today's price) | Verdict |",
             "|---:|---|---|---:|---:|---:|---:|---:|---|",
         ]
         for number, opp in enumerate(ranked, start=1):
@@ -190,9 +274,9 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
                 md_escape(opp.company),
                 f"{opp.score:.1f}",
                 f"{analysis.probability_up_6m}%",
-                format_price(opp.price, opp.currency),
-                format_price(analysis.entry_price, opp.currency),
-                f"{format_price(analysis.target_price, opp.currency)} ({format_pct(opp.upside_pct())})",
+                format_money(opp.price, opp),
+                format_money(analysis.entry_price, opp),
+                f"{format_money(analysis.target_price, opp)} ({format_pct(opp.upside_pct())})",
                 verdict_label(analysis.verdict) + (" (superseded)" if number - 1 in newer else ""),
             ]
             lines.append("| " + " | ".join(cells) + " |")
@@ -238,26 +322,40 @@ def _opportunity_markdown(opp: Opportunity, newer: Opportunity | None = None) ->
 
 
 def key_figures(opp: Opportunity) -> list[tuple[str, str]]:
-    """The (label, value) rows of an opportunity's key-figures table, shared by the Markdown and HTML reports."""
+    """The (label, value) rows of an opportunity's key-figures table, shared by the Markdown and HTML reports.
+
+    The upside and downside are given twice: from today's price (the price at the analysis) and from the entry, where
+    the limit buy would fill. Price, entry and target carry their value in the [account] currency when it differs,
+    with a row naming the exchange rate.
+    """
     analysis, stats, currency, price = opp.analysis, opp.stats, opp.currency, opp.price
 
-    def level(value: float) -> str:
-        return f"{format_price(value, currency)} ({relative_to(value, price)})"
+    def level(value: float, *, money: bool = False) -> str:
+        amount = format_money(value, opp) if money else format_price(value, currency)
+        return f"{amount} ({relative_to(value, price)})"
 
     moves = f"{format_pct(stats.change_1d_pct)} 1 day, {format_pct(stats.change_5d_pct)} 5 days"
-    return [
+    rows = [
         ("Reported", format_when(opp.created)),
-        ("Price", f"{format_price(price, currency)} ({moves})"),
+        ("Price", f"{format_money(price, opp)} ({moves})"),
         ("From 52-week high", format_pct(stats.drawdown_52w_pct)),
         ("Chance of being higher in 6 months", f"{analysis.probability_up_6m}%"),
         ("Potential low", level(analysis.potential_low)),
         ("Statistical 6-month low", level(stats.stat_low_6m)),
-        ("Entry (limit buy)", level(analysis.entry_price)),
-        ("Target (limit sell idea)", level(analysis.target_price)),
-        ("Upside / downside", f"{format_pct(opp.upside_pct())} / {format_pct(opp.downside_pct())}"),
+        ("Entry (limit buy)", level(analysis.entry_price, money=True)),
+        ("Target (limit sell idea)", level(analysis.target_price, money=True)),
+        ("From today's price", f"target {format_pct(opp.upside_pct())} / low {format_pct(opp.downside_pct())}"),
+        (
+            "From the entry",
+            f"target {format_pct(opp.entry_upside_pct())} / low {format_pct(opp.entry_downside_pct())}",
+        ),
         ("Verdict", verdict_label(analysis.verdict)),
         ("Confidence", analysis.confidence.capitalize()),
     ]
+    rate = fx_text(opp)
+    if rate is not None:
+        rows.append(("Exchange rate", rate))
+    return rows
 
 
 def _paragraphs(opp: Opportunity) -> list[tuple[str, str]]:
@@ -319,7 +417,7 @@ def render_html(opps: list[Opportunity], *, title: str, generated: datetime, not
     rows.append(
         _row(
             f'<p style="margin:8px 0 0 0;padding-top:12px;border-top:1px solid {_LINE};font-size:12px;'
-            f'color:{_MUTED};">{_e(DISCLAIMER)}</p>'
+            f'color:{_MUTED};">{html_text(DISCLAIMER)}</p>'
         )
     )
     return "\n".join(
@@ -404,13 +502,19 @@ def _html_overview(ranked: list[Opportunity], newer: dict[int, Opportunity]) -> 
         analysis = opp.analysis
         company = f'<span style="font-size:12px;color:{_MUTED};">{_e(opp.company)}</span>'
         name = f"<strong>{_e(opp.ticker)}</strong><br>{company}"
+
+        def money(value: float, opp: Opportunity = opp) -> str:
+            converted = in_account(value, opp).strip()
+            extra = f'<br><span style="font-size:12px;color:{_MUTED};">{_e(converted)}</span>' if converted else ""
+            return _e(format_price(value, opp.currency)) + extra
+
         values = [
             (name, "left"),
             (_badge(opp.score), "right"),
             (f"{analysis.probability_up_6m}%", "right"),
-            (_e(format_price(opp.price, opp.currency)), "right"),
-            (_e(format_price(analysis.entry_price, opp.currency)), "right"),
-            (_e(format_price(analysis.target_price, opp.currency)), "right"),
+            (money(opp.price), "right"),
+            (money(analysis.entry_price), "right"),
+            (money(analysis.target_price), "right"),
             (_e(verdict_label(analysis.verdict) + (" (superseded)" if index in newer else "")), "left"),
         ]
         lines.append(
@@ -673,7 +777,8 @@ def _hours_text(hours: float) -> str:
 
 
 def _short_time(dt: datetime) -> str:
-    return f"{utc(dt):%b %d, %H:%M} UTC"
+    local = local_time(dt)
+    return f"{local:%b %d, %H:%M} {zone_label(local)}"
 
 
 def _parse_time(value: object) -> datetime | None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, field, fields
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, tzinfo
 from typing import Any
 
 RELATIONS = ("direct", "indirect")
@@ -149,8 +149,8 @@ class PriceStats:
     timezone: str | None = None  # the exchange's IANA time zone (e.g. America/New_York), when Yahoo gives it
     instrument_type: str | None = None  # Yahoo's instrumentType: EQUITY, ETF, MUTUALFUND, INDEX...
 
-    def as_text(self) -> str:
-        """A compact block of the price picture, readable by people and by the analysis model."""
+    def as_text(self, tz: tzinfo = UTC) -> str:
+        """A compact block of the price picture, readable by people and by the analysis model (times in tz)."""
         cur = self.currency
         title = self.ticker
         if self.name:
@@ -171,7 +171,7 @@ class PriceStats:
             volume = f"; latest volume {self.volume_ratio:.1f}x the 20-day average"
         return "\n".join(
             [
-                f"{title}, prices in {cur}, as of {utc(self.as_of):%Y-%m-%d %H:%M} UTC",
+                f"{title}, prices in {cur}, as of {_when(self.as_of, tz)}",
                 f"Price {_price(self.price)} {cur} (previous close {_price(self.previous_close)}): "
                 f"1 day {_pct(self.change_1d_pct)}, 5 days {_pct(self.change_5d_pct)}, "
                 f"20 days {_pct(self.change_20d_pct)}",
@@ -274,6 +274,11 @@ class Opportunity:
     # Every flagged article came out after the last session in the price data: the price hadn't reacted to the
     # news yet when this was analysed (see detect.select_candidates).
     news_after_session: bool = False
+    # [account] currency when this was analysed, and the exchange rate then: account-currency units per unit of
+    # currency as quoted (a price times fx_rate is in account_currency). None without [account] currency, or when
+    # Yahoo had no rate (fx_rate only).
+    account_currency: str | None = None
+    fx_rate: float | None = None
 
     def upside_pct(self) -> float:
         """How far the target price is above the price at the time of the analysis, in %."""
@@ -282,6 +287,14 @@ class Opportunity:
     def downside_pct(self) -> float:
         """How far the potential low is below the price at the time of the analysis, in % (<= 0)."""
         return _change(self.analysis.potential_low, self.price)
+
+    def entry_upside_pct(self) -> float:
+        """How far the target is above the entry (the limit buy), in %: the gain of the two limit orders."""
+        return _change(self.analysis.target_price, self.analysis.entry_price)
+
+    def entry_downside_pct(self) -> float:
+        """How far the potential low is below the entry, in % (<= 0): the loss from a filled limit buy to the low."""
+        return _change(self.analysis.potential_low, self.analysis.entry_price)
 
     def to_dict(self) -> dict:
         """A JSON-safe dict (datetimes and dates as ISO 8601 strings); from_dict turns it back."""
@@ -300,6 +313,8 @@ class Opportunity:
             "dip_reasons": list(self.dip_reasons),
             "model": self.model,
             "news_after_session": self.news_after_session,
+            "account_currency": self.account_currency,
+            "fx_rate": self.fx_rate,
         }
 
     @classmethod
@@ -320,6 +335,8 @@ class Opportunity:
             model=data.get("model") or "",
             id=data.get("id"),
             news_after_session=bool(data.get("news_after_session", False)),
+            account_currency=data.get("account_currency") or None,
+            fx_rate=_positive_or_none(data.get("fx_rate")),
         )
 
 
@@ -427,6 +444,18 @@ def _json_safe(value: Any) -> Any:
 
 def _change(value: float, base: float) -> float:
     return (value / base - 1) * 100 if base else 0.0
+
+
+def _positive_or_none(value: Any) -> float | None:
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0 and value != float("inf"):
+        return float(value)
+    return None
+
+
+def _when(moment: datetime, tz: tzinfo) -> str:
+    """2026-09-25 14:45 UTC, or the same moment in tz with its abbreviation (2026-09-25 17:45 EEST)."""
+    local = utc(moment).astimezone(tz)
+    return f"{local:%Y-%m-%d %H:%M} {local.tzname() or local.strftime('%z')}"
 
 
 def _pct(value: float) -> str:

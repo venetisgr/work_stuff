@@ -34,16 +34,33 @@ from .config import (
 from .detect import dip_reasons
 from .feeds import USER_AGENT, FeedResult, fetch_feed, needs_contact_user_agent, user_agent_for
 from .fundamentals import SecFundamentals
+from .fx import FxRates, main_currency, same_money
 from .llm import LLMError, LLMSetupError, build_models
-from .models import Feed, Opportunity, utc
+from .models import Feed, Opportunity, PriceBar, utc
 from .notices import STOPPED, one_line, scrub, secrets_of, send_notice, stopped_lines
 from .notify import build_notifiers
 from .pipeline import Scanner, thesis_change_line, usage_lines
 from .prices import PriceError, PriceFetchError, YahooPrices
-from .report import render_html, render_markdown, render_news_digest
+from .report import (
+    display_zone,
+    format_when,
+    render_html,
+    render_markdown,
+    render_news_digest,
+    set_display_zone,
+)
 from .store import Store
 from .symbols import SymbolResolver
-from .track import Outcome, evaluate, quote_day, render_track_record, summarize
+from .track import (
+    Outcome,
+    benchmark_for,
+    evaluate,
+    quote_day,
+    render_track_record,
+    summarize,
+    with_account_return,
+    with_benchmark,
+)
 from .triage import normalise_ticker
 
 log = logging.getLogger("dip_scanner")
@@ -61,6 +78,7 @@ _EPILOG = 'Run "dip-scanner COMMAND --help" for a command\'s options. Not invest
 
 def main(argv: list[str] | None = None) -> int:
     """Run the command line; returns the exit code (0 ok, 1 runtime error, 2 config error)."""
+    _safe_console()
     args = _parser().parse_args(argv)
     _setup_logging(args.verbose)
     # Trust the operating system's certificates, so corporate TLS inspection proxies work out of the box.
@@ -68,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _load_env(args.env_file)
         settings = load_settings()
+        set_display_zone(settings.display_tz)
         if args.data_dir is not None:
             settings = replace(settings, data_dir=_folder(args.data_dir))
         code = args.handler(args, settings)
@@ -194,11 +213,46 @@ def _positive_float(maximum: float) -> Callable[[str], float]:
 # --- setup ---------------------------------------------------------------------------------------------------------
 
 
+def _safe_console() -> None:
+    """Make sure output that can't be encoded never crashes a command.
+
+    On Windows, output redirected to a file or a pipe (Task Scheduler's `>> data\\scanner.log`, `dip-scanner report >
+    report.md`) is written in the ANSI code page (cp1252, cp1253...), which lacks Greek or Cyrillic letters, "—" or
+    emoji, and a headline with one ended the command with UnicodeEncodeError. So redirected output is written as
+    UTF-8, and on a console a character it can't show becomes "?" instead of an error.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:  # replaced by something that isn't a text stream (an IDE, a test)
+            continue
+        try:
+            if stream.isatty():
+                reconfigure(errors="replace")
+            else:
+                reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):  # closed, or can't be changed: leave it as it is
+            pass
+
+
+class _DisplayTimeFormatter(logging.Formatter):
+    """Log times in the display time zone (DISPLAY_TZ, UTC by default), like every other time the scanner shows. The
+    zone is looked up for every record, so the log follows DISPLAY_TZ from .env, which is read after logging starts."""
+
+    def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:
+        moment = datetime.fromtimestamp(record.created, display_zone())
+        if datefmt:
+            return moment.strftime(datefmt)
+        return f"{moment:%Y-%m-%d %H:%M:%S},{int(record.msecs):03d}"
+
+
 def _setup_logging(verbose: bool) -> None:
     if verbose:
-        logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.WARNING)
+        formatter = _DisplayTimeFormatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     else:
-        logging.basicConfig(format="%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S", level=logging.WARNING)
+        formatter = _DisplayTimeFormatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    logging.basicConfig(handlers=[handler], level=logging.WARNING)
     log.setLevel(logging.DEBUG if verbose else logging.INFO)
 
 
@@ -394,7 +448,7 @@ def _feeds(args: argparse.Namespace, settings: Settings) -> int:
             last = "never fetched"
         else:
             outcome = f"error: {row['last_error']}" if row["last_error"] else f"HTTP {row['last_status']}"
-            last = f"last fetch {row['last_fetch']:%Y-%m-%d %H:%M} UTC, {outcome}, {row['articles']} stored"
+            last = f"last fetch {format_when(row['last_fetch'])}, {outcome}, {row['articles']} stored"
         state = "on " if feed.enabled else "off"
         print(f"  {state} {feed.key:<34} {feed.category:<14} {feed.name}  ({last})")
     return EXIT_OK
@@ -497,6 +551,7 @@ def _report(args: argparse.Namespace, settings: Settings) -> int:
 
 def _track(args: argparse.Namespace, settings: Settings) -> int:
     now = _now()
+    account = _scanner_config(args).account.currency
     with open_store(settings) as store:
         opps = store.opportunities(since=now - timedelta(days=args.days))
     if not opps:
@@ -521,10 +576,64 @@ def _track(args: argparse.Namespace, settings: Settings) -> int:
                 problems.append(f"{ticker} ({len(group)} opportunities): {exc}")
                 continue
             outcomes.extend(evaluate(opp, bars, now=now, splits=splits) for opp in group)
+        notes: list[str] = []
+        outcomes = _with_benchmarks(outcomes, prices, now=now, notes=notes)
+        if account:
+            outcomes = _in_account(outcomes, FxRates(prices, clock=_now), account, now=now, notes=notes)
     print(render_track_record(outcomes, summarize(outcomes), missing=missing), end="")
     for problem in problems:
         print(f"Left out {problem}", file=sys.stderr)
+    for note in notes:
+        print(f"Note: {note}", file=sys.stderr)
     return EXIT_ERROR if problems and not outcomes else EXIT_OK
+
+
+def _with_benchmarks(outcomes: list[Outcome], prices: YahooPrices, *, now: datetime, notes: list[str]) -> list[Outcome]:
+    """The outcomes with their exchange's benchmark index return (one download per index); an index without prices
+    leaves "–" and a note."""
+    groups: dict[str, list[int]] = {}
+    for index, outcome in enumerate(outcomes):
+        groups.setdefault(benchmark_for(outcome.opportunity.ticker), []).append(index)
+    result = list(outcomes)
+    for symbol, indices in groups.items():
+        bars: list[PriceBar] = []
+        if any(outcomes[index].priced for index in indices):
+            start = min(quote_day(outcomes[index].opportunity) for index in indices) - timedelta(days=10)
+            try:
+                bars = prices.bars_since(symbol, start, now=now)
+            except (PriceError, PriceFetchError) as exc:
+                notes.append(
+                    f"No prices for the benchmark index {symbol}, so {len(indices)} opportunities show – for it: {exc}"
+                )
+        for index in indices:
+            result[index] = with_benchmark(outcomes[index], symbol, bars)
+    return result
+
+
+def _in_account(
+    outcomes: list[Outcome], fx: FxRates, account: str, *, now: datetime, notes: list[str]
+) -> list[Outcome]:
+    """The outcomes with their return in the [account] currency (one rate history per currency); a currency without
+    rates leaves "–" and a note."""
+    groups: dict[str, list[int]] = {}
+    for index, outcome in enumerate(outcomes):
+        groups.setdefault(outcome.opportunity.currency, []).append(index)
+    result = list(outcomes)
+    for currency, indices in groups.items():
+        rates = None
+        wanted = not same_money(currency, account) and any(outcomes[index].priced for index in indices)
+        if wanted:
+            start = min(quote_day(outcomes[index].opportunity) for index in indices)
+            try:
+                rates = fx.history(currency, account, start, now=now)
+            except (PriceError, PriceFetchError) as exc:
+                notes.append(
+                    f"No {main_currency(currency)[0]}/{account} exchange rates, so {len(indices)} opportunities show – "
+                    f"in {account}: {exc}"
+                )
+        for index in indices:
+            result[index] = with_account_return(outcomes[index], account, rates)
+    return result
 
 
 def _prices(args: argparse.Namespace, settings: Settings) -> int:
@@ -532,7 +641,7 @@ def _prices(args: argparse.Namespace, settings: Settings) -> int:
     config = _scanner_config(args)
     with make_session() as session:
         stats = YahooPrices(session).stats(symbol, now=_now())
-    print(stats.as_text())
+    print(stats.as_text(display_zone()))
     reasons = dip_reasons(stats, config.dip, now=_now())
     print(f"Dip by the [dip] thresholds: {'; '.join(reasons)}" if reasons else "No dip by the [dip] thresholds.")
     return EXIT_OK

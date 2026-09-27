@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 
@@ -11,8 +11,14 @@ from conftest import NOW, make_analysis, make_article, make_impact, make_opportu
 from dip_scanner.models import Opportunity
 from dip_scanner.report import (
     DISCLAIMER,
+    format_clock,
+    format_money,
     format_pct,
     format_price,
+    format_when,
+    fx_text,
+    html_text,
+    in_account,
     md_escape,
     md_link,
     relative_to,
@@ -22,6 +28,7 @@ from dip_scanner.report import (
     safe_url,
     score_band,
     score_color,
+    set_display_zone,
     verdict_label,
     write_reports,
 )
@@ -133,7 +140,8 @@ def test_render_markdown_reads_like_a_newsletter():
         f"| Statistical 6-month low | {format_price(opp.stats.stat_low_6m, 'USD')} ({stat_low}) |",
         "| Entry (limit buy) | $132.00 (7.4% below) |",
         "| Target (limit sell idea) | $168.00 (17.9% above) |",
-        "| Upside / downside | +17.9% / -17.2% |",
+        "| From today's price | target +17.9% / low -17.2% |",
+        "| From the entry | target +27.3% / low -10.6% |",  # what the two limit orders would make or lose
         "| Verdict | Temporary fear |",
         "| Confidence | Medium |",
     ]:
@@ -150,6 +158,8 @@ def test_render_markdown_reads_like_a_newsletter():
     ) in text
     assert "_Analysis by fake-model; prices as of 2026-09-25 14:45 UTC._" in text
     assert "Numbers fixed" not in text
+    assert "≈" not in text and "Exchange rate" not in text  # no [account] currency
+    assert "| Target (from today's price) |" in text
     assert text.rstrip().endswith(f"_{DISCLAIMER}_")
     assert "Not investment advice" in DISCLAIMER and "the tool never places orders" in DISCLAIMER
 
@@ -257,7 +267,7 @@ def test_render_html_is_self_contained_and_email_safe():
     text = " ".join(parsed.text)
     for expected in ("Dip opportunities", "AMD", "SAP SE", "$142.50", "Potential low", "One note", "Temporary fear"):
         assert expected in text
-    assert DISCLAIMER in text
+    assert " ".join("".join(parsed.text).split()).endswith(DISCLAIMER.replace("`", ""))
     assert score_color(85.0) in page and score_color(55.0) in page
     assert score_color(70.0) not in page and score_color(30.0) not in page
     assert page.index("SAP SE") > page.index("Advanced Micro Devices")  # ranked by score
@@ -288,7 +298,18 @@ def test_render_html_escapes_everything_and_drops_unsafe_links():
 def test_render_html_without_opportunities():
     page = render_html([], title="Report", generated=NOW)
     assert "No opportunities this time." in page
-    assert DISCLAIMER in unescape(page)
+    assert DISCLAIMER.split("`")[0] in unescape(page)
+
+
+def test_the_html_footer_shows_the_command_as_code_not_markdown():
+    """Regression (recheck): the HTML footer read "`dip-scanner track`" with the backticks visible."""
+    assert "`dip-scanner track`" in DISCLAIMER  # Markdown, for the text report and the email's plain part
+    page = render_html([make_opportunity()], title="Report", generated=NOW)
+    footer = page[page.rindex("Not investment advice") :]
+    assert "`" not in footer
+    assert ">dip-scanner track</code>" in footer and "<code " in footer
+    assert html_text("a `<b>` & `c`").startswith("a <code ")  # escaped first: no markup gets through
+    assert "&lt;b&gt;</code> &amp; <code " in html_text("a `<b>` & `c`")
 
 
 # --- news digest ---------------------------------------------------------------------------------------------------
@@ -416,3 +437,65 @@ def test_report_uses_the_opportunitys_currency():
     text = render_markdown([opp], title="Report", generated=NOW)
     assert "| Price | 245.60p" in text
     assert "| Entry (limit buy) | 230.00p (6.4% below) |" in text
+
+
+# --- account currency ----------------------------------------------------------------------------------------------
+
+
+def test_amounts_in_another_currency_show_their_value_in_the_account_currency():
+    opp = make_opportunity(account_currency="EUR", fx_rate=0.8783)
+    assert in_account(132.0, opp) == " ≈ €115.94"
+    assert format_money(168.0, opp) == "$168.00 ≈ €147.55"
+    assert fx_text(opp).startswith("1 USD = 0.8783 EUR at the analysis (Yahoo Finance)")
+
+    text = render_markdown([opp], title="Report", generated=NOW)
+    assert "| 1 | **AMD** | Advanced Micro Devices | 72.4 | 68% | $142.50 ≈ €125.16 | $132.00 ≈ €115.94 | " in text
+    assert "| $168.00 ≈ €147.55 (+17.9%) |" in text
+    assert "| Price | $142.50 ≈ €125.16 (-5.0% 1 day, -8.0% 5 days) |" in text
+    assert "| Entry (limit buy) | $132.00 ≈ €115.94 (7.4% below) |" in text
+    assert "| Target (limit sell idea) | $168.00 ≈ €147.55 (17.9% above) |" in text
+    assert "| Potential low | $118.00 (17.2% below) |" in text
+    assert "| Exchange rate | 1 USD = 0.8783 EUR at the analysis (Yahoo Finance); your broker's rate and " in text
+
+    page = render_html([opp], title="Report", generated=NOW)
+    assert "≈ €115.94" in page and "1 USD = 0.8783 EUR" in page
+
+
+def test_no_conversion_in_the_same_currency_or_without_a_rate():
+    euro = make_opportunity(ticker="SAP.DE", currency="EUR", account_currency="EUR", fx_rate=1.0)
+    no_rate = make_opportunity(account_currency="EUR", fx_rate=None)
+    for opp in (euro, no_rate, make_opportunity()):
+        assert in_account(100.0, opp) == "" and fx_text(opp) is None
+        assert "≈" not in render_markdown([opp], title="Report", generated=NOW)
+
+
+def test_pence_are_converted_through_pounds():
+    stats = make_stats(ticker="VOD.L", currency="GBp", price=245.6)
+    opp = make_opportunity(ticker="VOD.L", stats=stats, account_currency="EUR", fx_rate=1.1624 / 100)
+    assert format_money(245.6, opp) == "245.60p ≈ €2.85"
+    assert fx_text(opp).startswith("1 GBP = 1.162 EUR")
+    pounds = make_opportunity(ticker="VOD.L", stats=stats, account_currency="GBP", fx_rate=0.01)
+    assert in_account(245.6, pounds) == ""  # a pound account needs no conversion of pence
+
+
+# --- display time zone ---------------------------------------------------------------------------------------------
+
+
+def test_times_are_shown_in_the_display_time_zone():
+    from zoneinfo import ZoneInfo
+
+    assert format_when(NOW) == "2026-09-25 15:00 UTC"
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    assert format_when(NOW) == "2026-09-25 18:00 EEST"
+    assert format_clock(NOW) == "18:00 EEST"
+    assert format_when(datetime(2026, 12, 1, 12, 0, tzinfo=UTC)) == "2026-12-01 14:00 EET"  # winter time
+    text = render_markdown([make_opportunity()], title="Report", generated=NOW)
+    assert "_1 opportunity · generated 2026-09-25 18:00 EEST_" in text
+    assert "| Reported | 2026-09-25 18:00 EEST |" in text
+    assert "MarketWatch, Sep 25, 17:00 EEST" in text  # the headline's time
+    assert "prices as of 2026-09-25 17:45 EEST" in text
+    digest = render_news_digest([], hours=24, generated=NOW)
+    assert "Generated 2026-09-25 18:00 EEST" in digest
+    # Files are still named by UTC time, so they sort the same wherever they are read.
+    set_display_zone(None)
+    assert format_when(NOW) == "2026-09-25 15:00 UTC"

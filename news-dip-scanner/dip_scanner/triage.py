@@ -2,8 +2,9 @@
 
 The model sees a batch of articles under short ids (a1, a2, ...) instead of the 40-character article hashes: they
 cost fewer tokens and the model can't mistype them. Its reply is checked for shape (validate_triage), then every
-company entry is cleaned up: tickers are normalised to Yahoo Finance symbols, enum values are coerced, magnitudes
-clamped, and entries that can't be repaired (no usable ticker, unknown direction, ETFs, indices, crypto) are dropped.
+company entry is cleaned up: tickers are normalised to Yahoo Finance symbols (and moved to the listing named in
+[universe] preferred_listings, e.g. ASML -> ASML.AS), enum values are coerced, magnitudes clamped, and entries that
+can't be repaired (no usable ticker, unknown direction, ETFs, indices, crypto) are dropped.
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ import logging
 import math
 import re
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import replace
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
@@ -206,13 +208,16 @@ def _strength(impact: Impact) -> tuple[bool, int]:
     return impact.relation == "direct", impact.magnitude
 
 
-def _article_impacts(article_id: str, entries: list[dict]) -> list[Impact]:
-    """Clean one article's company entries: one impact per ticker (the strongest), at most five."""
+def _article_impacts(article_id: str, entries: list[dict], preferred: Mapping[str, str] | None = None) -> list[Impact]:
+    """Clean one article's company entries: one impact per ticker (the strongest), at most five. A ticker with a
+    preferred listing is moved to it first, so ASML and ASML.AS in one article become one ASML.AS impact."""
     by_ticker: dict[str, Impact] = {}
     for entry in entries:
         impact = _to_impact(article_id, entry)
         if impact is None:
             continue
+        if preferred and impact.ticker in preferred:
+            impact = replace(impact, ticker=preferred[impact.ticker])
         current = by_ticker.get(impact.ticker)
         if current is None or _strength(impact) > _strength(current):
             by_ticker[impact.ticker] = impact
@@ -321,16 +326,21 @@ def article_block(short_id: str, article: Article) -> str:
     return f'<article id="{short_id}" source="{source}" published="{published}">{body}</article>'
 
 
-def triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -> list[Impact]:
-    """The impacts the model finds in one batch of articles (invalid entries dropped, tickers normalised).
+def triage_batch(
+    model: ChatModel, articles: list[Article], *, now: datetime, preferred: Mapping[str, str] | None = None
+) -> list[Impact]:
+    """The impacts the model finds in one batch of articles (invalid entries dropped, tickers normalised and moved to
+    their preferred listing).
 
     Raises LLMError when the model's reply is unusable even after a corrective retry. Articles the reply left out
     simply give no impacts here; triage() keeps them for another try (see _triage_batch).
     """
-    return _triage_batch(model, articles, now=now)[0]
+    return _triage_batch(model, articles, now=now, preferred=preferred)[0]
 
 
-def _triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -> tuple[list[Impact], set[str]]:
+def _triage_batch(
+    model: ChatModel, articles: list[Article], *, now: datetime, preferred: Mapping[str, str] | None = None
+) -> tuple[list[Impact], set[str]]:
     """(impacts, ids of the articles the reply covered) for one batch."""
     if not articles:
         return [], set()
@@ -347,7 +357,7 @@ def _triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -
     for short_id, article in zip(ids, articles, strict=True):
         if short_id in companies:
             covered.add(article.id)
-            impacts.extend(_article_impacts(article.id, companies[short_id]))
+            impacts.extend(_article_impacts(article.id, companies[short_id], preferred))
     return impacts, covered
 
 
@@ -362,8 +372,11 @@ def triage(
     max_attempts: int,
     now: datetime,
     on_stop: Callable[[str], None] | None = None,
+    preferred: Mapping[str, str] | None = None,
 ) -> tuple[int, list[Impact]]:
     """Triage every pending article in the store; returns (articles triaged, impacts found).
+
+    preferred is [universe] preferred_listings: impacts on a key are stored under its value (ASML -> ASML.AS).
 
     Articles go to the model in batches of batch_size, oldest first. When a batch fails (LLMError), it is split in
     halves to find the article(s) that break it, so one bad article can't sink the other nineteen; the ones that
@@ -385,7 +398,7 @@ def triage(
     def attempt(batch: list[Article]) -> LLMError | None:
         nonlocal triaged, left_pending
         try:
-            found, covered = _triage_batch(model, batch, now=now)
+            found, covered = _triage_batch(model, batch, now=now, preferred=preferred)
         except (LLMUnavailableError, LLMSetupError, ConfigError):
             raise
         except LLMError as exc:

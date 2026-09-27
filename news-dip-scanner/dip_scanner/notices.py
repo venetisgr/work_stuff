@@ -16,7 +16,6 @@ NOTICE_RETRY. Notices never contain secrets: every configured key, password, tok
 
 from __future__ import annotations
 
-import html
 import logging
 import os
 import re
@@ -27,6 +26,7 @@ from urllib.parse import urlsplit
 
 from .config import Settings
 from .models import utc
+from .report import format_when, html_text
 
 if TYPE_CHECKING:
     from .notify import Notifier
@@ -97,7 +97,7 @@ def send_notice(
     now = utc(now)
     last_attempt, last_sent = store.notice_times(kind)
     if last_sent is not None and now - last_sent < NOTICE_REPEAT:
-        log.debug("Not repeating the %s notice (sent %s).", kind, f"{last_sent:%Y-%m-%d %H:%M} UTC")
+        log.debug("Not repeating the %s notice (sent %s).", kind, format_when(last_sent))
         return False
     if last_attempt is not None and now - last_attempt < NOTICE_RETRY:
         return False
@@ -105,10 +105,10 @@ def send_notice(
     subject = one_line(scrub(subject, secrets), 200)
     body = [scrub(line, secrets) for line in lines]
     markdown = "\n\n".join([f"# {subject}", *body, f"_{FOOTER}_"]) + "\n"
-    page = "".join(f"<p>{html.escape(line)}</p>" for line in body)
+    page = "".join(f"<p>{html_text(line)}</p>" for line in body)
     rich = (
-        f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{html.escape(subject)}</title></head>'
-        f"<body><h1>{html.escape(subject)}</h1>{page}<p><em>{html.escape(FOOTER)}</em></p></body></html>"
+        f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{html_text(subject)}</title></head>'
+        f"<body><h1>{html_text(subject)}</h1>{page}<p><em>{html_text(FOOTER)}</em></p></body></html>"
     )
     sent = False
     for notifier in notifiers:
@@ -135,7 +135,7 @@ def stopped_lines(command: str, reason: str, now: datetime) -> list[str]:
             "are sent."
         )
     return [
-        f"dip-scanner {command} stopped at {utc(now):%Y-%m-%d %H:%M} UTC: {reason}",
+        f"dip-scanner {command} stopped at {format_when(now)}: {reason}",
         effect,
         "Fix the setting the message names (see Troubleshooting in the README), then check with "
         "`dip-scanner run --no-notify`.",

@@ -12,7 +12,7 @@ import sqlite3
 import time
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -21,12 +21,22 @@ from .config import ConfigError, ScannerConfig, Settings
 from .detect import dip_reasons, select_candidates, severity
 from .feeds import CONTACT_USER_AGENT_MISSING, fetch_all, needs_contact_user_agent, ticker_news, user_agent_for
 from .fundamentals import SecFundamentals
+from .fx import FxRates
 from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError, Usage
 from .models import Candidate, Feed, ModelUsage, Opportunity, utc
 from .notices import FEEDS_FAILING, MODEL_UNAVAILABLE, one_line, secrets_of, send_notice
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
-from .prices import PriceError, YahooPrices
-from .report import format_price, format_when, render_html, render_markdown, verdict_label, write_reports
+from .prices import PriceError, PriceFetchError, YahooPrices
+from .report import (
+    format_clock,
+    format_money,
+    format_price,
+    format_when,
+    render_html,
+    render_markdown,
+    verdict_label,
+    write_reports,
+)
 from .store import Store
 from .symbols import Resolution, SymbolResolver
 from .triage import normalise_ticker, triage
@@ -79,7 +89,7 @@ class CycleResult:
 
     def summary(self) -> str:
         """One line for the log, e.g. "Cycle 2026-09-25 15:00 UTC: 19/20 feeds ok, 37 new articles, ...", ending with
-        the day's model use when there is any."""
+        the day's model use when there is any. The time is in the display time zone (DISPLAY_TZ)."""
         ranked = sorted(self.opportunities, key=lambda opp: opp.score, reverse=True)
         found = _count(len(ranked), "opportunity", "opportunities")
         if ranked:
@@ -95,7 +105,7 @@ class CycleResult:
         ]
         took = f"; took {(self.finished - self.started).total_seconds():.0f} s" if self.finished else ""
         usage = f"; {usage_summary(self.usage_today)}" if self.usage_today else ""
-        return f"Cycle {utc(self.started):%Y-%m-%d %H:%M} UTC: {', '.join(parts)}{took}{usage}"
+        return f"Cycle {format_when(self.started)}: {', '.join(parts)}{took}{usage}"
 
 
 class MeteredModel:
@@ -148,7 +158,8 @@ class Scanner:
     """Runs scan cycles with everything it needs passed in (so tests can pass fakes).
 
     Feeds that are disabled, or that need a contact User-Agent nobody configured (sec.gov without SEC_USER_AGENT),
-    are left out once, here, with a warning, instead of failing every cycle.
+    are left out once, here, with a warning, instead of failing every cycle. fx gives exchange rates for [account]
+    currency (by default from the same Yahoo client as the prices).
     """
 
     def __init__(
@@ -167,6 +178,7 @@ class Scanner:
         notify: bool = True,
         clock: Callable[[], datetime] = _now,
         symbols: SymbolResolver | None = None,
+        fx: FxRates | None = None,
     ) -> None:
         self.settings = settings
         self.config = config
@@ -180,6 +192,7 @@ class Scanner:
         self.notify = notify
         self._clock = clock
         self.symbols = symbols  # finds the new symbol of a renamed company (None: tickers without prices are skipped)
+        self.fx = fx if fx is not None else FxRates(prices, clock=clock)
         self.user_agents = {"sec.gov": settings.sec_user_agent}
         self.feeds = [feed for feed in feeds if feed.enabled and self._can_fetch(feed)]
         self._last_prune: datetime | None = None
@@ -270,6 +283,7 @@ class Scanner:
                 max_attempts=scan.max_triage_attempts,
                 now=now,
                 on_stop=lambda reason: _unavailable(result, reason),
+                preferred=self.config.universe.preferred_listings,
             )
         finally:
             result.model_calls += triage_model.answered
@@ -309,7 +323,7 @@ class Scanner:
                 failures = self.store.record_analysis_failure(candidate.ticker, when=now, error=str(exc))
                 result.notes.append(
                     f"Analysis of {candidate.ticker} failed ({_count(failures, 'time')} in a row), "
-                    f"retrying after {_retry_at(now, failures):%Y-%m-%d %H:%M} UTC: {exc}"
+                    f"retrying after {format_when(_retry_at(now, failures))}: {exc}"
                 )
                 log.warning("%s", result.notes[-1], exc_info=not isinstance(exc, LLMError))
                 continue
@@ -388,7 +402,7 @@ class Scanner:
                         subject=f"dip-scanner: the language model has been unavailable for {streak} cycles",
                         lines=[
                             f"The last {streak} cycles in a row couldn't use the language model (the latest at "
-                            f"{now:%Y-%m-%d %H:%M} UTC): {one_line(result.model_unavailable)}",
+                            f"{format_when(now)}): {one_line(result.model_unavailable)}",
                             "Meanwhile new articles wait for triage and candidates for their analysis; articles "
                             "older than [scan] max_article_age_hours are skipped for good. Check the provider's "
                             "status page, the network, and your rate limits and quota.",
@@ -411,7 +425,7 @@ class Scanner:
                         subject=f"dip-scanner: every feed has failed for {streak} cycles",
                         lines=[
                             f"All {_count(result.feeds_failed, 'feed')} failed in each of the last {streak} cycles "
-                            f"(the latest at {now:%Y-%m-%d %H:%M} UTC), so no news is coming in. Check the network "
+                            f"(the latest at {format_when(now)}), so no news is coming in. Check the network "
                             "connection with `dip-scanner feeds --check`.",
                             "Latest errors: " + "; ".join(errors[:3]) + (" ..." if len(errors) > 3 else ""),
                         ],
@@ -438,7 +452,7 @@ class Scanner:
         """Why a ticker waits (its last analysis failed recently, see FAILURE_BACKOFF), or None when it may go."""
         failed = self.store.analysis_failures(ticker)
         if failed is not None and now < (retry := _retry_at(failed[1], failed[0])):
-            return f"{ticker} ({_count(failed[0], 'failure')}, next try {retry:%H:%M} UTC)"
+            return f"{ticker} ({_count(failed[0], 'failure')}, next try {format_clock(retry)})"
         return None
 
     def _analyze(
@@ -449,7 +463,8 @@ class Scanner:
         context_news: bool | None = None,
         result: CycleResult | None = None,
     ) -> Opportunity:
-        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model (its calls recorded)."""
+        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model (its calls recorded). The
+        opportunity carries the [account] currency's exchange rate when one is set."""
         if context_news is None:
             context_news = self.config.scan.context_news
         extra = []
@@ -460,10 +475,29 @@ class Scanner:
         fundamentals = self.fundamentals.get(candidate.ticker) if self.fundamentals is not None else None
         model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
         try:
-            return analyze_candidate(model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
+            opportunity = analyze_candidate(model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
         finally:
             if result is not None:
                 result.model_calls += model.answered
+        return self._with_fx(opportunity, now, result)
+
+    def _with_fx(self, opp: Opportunity, now: datetime, result: CycleResult | None) -> Opportunity:
+        """The opportunity with [account] currency and today's exchange rate into it (Yahoo). Without a rate the
+        amounts stay in the trading currency only, with a note; the analysis is never lost over it."""
+        account = self.config.account.currency
+        if not account:
+            return opp
+        try:
+            rate = self.fx.rate(opp.currency, account, now=now)
+        except Exception as exc:  # PriceError, PriceFetchError, or a bug: the paid analysis is kept either way
+            rate = None
+            message = (
+                f"No {opp.currency}/{account} exchange rate for {opp.ticker}, amounts in {opp.currency} only: {exc}"
+            )
+            log.warning("%s", message, exc_info=not isinstance(exc, PriceError | PriceFetchError))
+            if result is not None:
+                result.notes.append(message)
+        return replace(opp, account_currency=account, fx_rate=rate)
 
     def _send_alerts(self, now: datetime, result: CycleResult) -> None:
         """Send this cycle's alerts and thesis changes, plus any from the last day that couldn't be sent.
@@ -699,8 +733,8 @@ def thesis_change_line(previous: Opportunity, opp: Opportunity) -> str:
     return (
         f"{opp.ticker}: now {verdict_label(now.verdict)}, {now.probability_up_6m}% chance up in 6m, score "
         f"{opp.score:.1f} (analysed {format_when(opp.created)}). Was {verdict_label(was.verdict)}, "
-        f"{was.probability_up_6m}%, entry {format_price(was.entry_price, previous.currency)}, target "
-        f"{format_price(was.target_price, previous.currency)} (alerted {format_when(previous.created)}). "
+        f"{was.probability_up_6m}%, entry {format_money(was.entry_price, previous)}, target "
+        f"{format_money(was.target_price, previous)} (alerted {format_when(previous.created)}). "
         "If you placed orders on the earlier idea, review them."
     )
 

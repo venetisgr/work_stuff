@@ -28,6 +28,16 @@ evaluate() replays an opportunity's limit orders against the daily bars that fol
   else to last_price; None when the entry never filled.
 - up_after_6m: None until more than 183 days have passed; then whether the last close on or before the 6-month date
   is above the report's price (None as well when the bars stop more than a week before that date).
+- priced: whether anything has traded since the report: a bar after the quote day, or the quote day's own bar when
+  its session was still running at the report (session_elapsed) or its close differs from the report's price. Until
+  then the returns are shown as "–" and the outcome counts in no rate or average (right after a report there is
+  nothing to measure, and 0 of 8 higher, +0.0% would look like a result).
+
+with_benchmark() adds the return of the exchange's benchmark index over the same days (from its close on the quote
+day to its close on the day of last_price; BENCHMARKS lists the index per exchange), so a rising market doesn't pass
+for skill: excess_return_pct is return_pct minus it. with_account_return() adds the return in the [account]
+currency: (1 + return) * rate at the end / rate at the report - 1, with the rate stored with the report when there is
+one, else the day's closing rate.
 """
 
 from __future__ import annotations
@@ -40,8 +50,9 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from .fx import rate_on, same_money
 from .models import VERDICTS, Opportunity, PriceBar, Split, utc
-from .report import format_pct, format_price, md_escape, superseded_by, verdict_label
+from .report import display_date, format_pct, format_price, md_escape, superseded_by, verdict_label
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +70,25 @@ MAX_DATA_GAP_DAYS = 7  # up_after_6m needs a close at most this many days before
 MAX_PRICE_MISMATCH = 1.4
 # (label, lowest score, score below which the bucket ends); the same bands as the report's score colours.
 SCORE_BUCKETS = (("<50", None, 50.0), ("50-65", 50.0, 65.0), ("65-80", 65.0, 80.0), ("80+", 80.0, None))
+# The quote day's close differs from the report's price by more than this (relative): it traded after the report.
+_SAME_PRICE = 1e-4
+
+# The benchmark index of each exchange, by Yahoo suffix (every symbol answered on 2026-09-27 with a year of daily
+# closes). Other European exchanges get the Euro Stoxx 50 (Warsaw's WIG20.WA had no history), everything else the
+# S&P 500.
+BENCHMARKS = {
+    "": "^GSPC",
+    ".DE": "^GDAXI", ".F": "^GDAXI", ".DU": "^GDAXI", ".HM": "^GDAXI", ".MU": "^GDAXI", ".SG": "^GDAXI",
+    ".BE": "^GDAXI", ".PA": "^FCHI", ".MI": "FTSEMIB.MI", ".AS": "^AEX", ".MC": "^IBEX", ".AT": "GD.AT",
+    ".BR": "^BFX", ".LS": "PSI20.LS", ".ST": "^OMX", ".CO": "^OMXC25", ".HE": "^OMXH25", ".OL": "OSEBX.OL",
+    ".VI": "^ATX", ".IR": "^ISEQ", ".L": "^FTSE", ".SW": "^SSMI",
+    ".T": "^N225", ".HK": "^HSI", ".TO": "^GSPTSE", ".AX": "^AXJO", ".KS": "^KS11", ".TW": "^TWII",
+    ".SS": "000001.SS", ".BO": "^BSESN", ".NS": "^NSEI", ".SI": "^STI", ".SA": "^BVSP", ".MX": "^MXX",
+    ".TA": "^TA125.TA",
+}  # fmt: skip
+EUROPE_BENCHMARK = "^STOXX50E"
+_OTHER_EUROPEAN_SUFFIXES = frozenset({".WA", ".PR", ".BD", ".IC", ".TL", ".RG", ".VS", ".NX", ".LU"})
+DEFAULT_BENCHMARK = "^GSPC"
 
 
 @dataclass(frozen=True)
@@ -79,6 +109,19 @@ class Outcome:
     trade_return_pct: float | None = None  # limit buy at entry -> target (if hit) or last price; None if not filled
     split_factor: float = 1.0  # the report's prices were divided by this (splits after the quote day)
     price_mismatch: bool = False  # the report's price doesn't match Yahoo's history: left out of the summary
+    priced: bool = True  # something traded since the report; until then the returns mean nothing (shown as "–")
+    last_day: date | None = None  # the day of last_price (None without bars)
+    benchmark: str | None = None  # the index compared with (see with_benchmark)
+    benchmark_return_pct: float | None = None  # its return over the same days; None when unknown
+    account_currency: str | None = None  # [account] currency of account_return_pct
+    account_return_pct: float | None = None  # return_pct in the account currency; None when a rate is missing
+
+    @property
+    def excess_return_pct(self) -> float | None:
+        """The return minus the benchmark index's over the same days (None when either is unknown)."""
+        if not self.priced or self.benchmark_return_pct is None:
+            return None
+        return self.return_pct - self.benchmark_return_pct
 
 
 def _local_date(moment: datetime, zone: str | None) -> date:
@@ -154,7 +197,12 @@ def evaluate(opp: Opportunity, bars: list[PriceBar], *, now: datetime, splits: S
         exit_price = target if target_hit is not None else last_price
         trade_return = _change(exit_price, entry)
 
-    quoted = {bar.day: bar for bar in bars}.get(quote_day(opp)) or (window[0] if window else None)
+    quoted_day = quote_day(opp)
+    priced = any(bar.day > quoted_day for bar in window) or any(
+        bar.day == quoted_day and (opp.stats.session_elapsed is not None or abs(bar.close / price - 1) > _SAME_PRICE)
+        for bar in window
+    )
+    quoted = {bar.day: bar for bar in bars}.get(quoted_day) or (window[0] if window else None)
     mismatch = quoted is not None and price > 0 and max(quoted.close / price, price / quoted.close) > MAX_PRICE_MISMATCH
     if mismatch:
         log.warning(
@@ -181,6 +229,8 @@ def evaluate(opp: Opportunity, bars: list[PriceBar], *, now: datetime, splits: S
         trade_return_pct=trade_return,
         split_factor=factor,
         price_mismatch=mismatch,
+        priced=priced,
+        last_day=window[-1].day if window else None,
     )
 
 
@@ -201,6 +251,45 @@ def _change(value: float, base: float) -> float:
     return (value / base - 1) * 100 if base else 0.0
 
 
+# --- benchmark and account currency -------------------------------------------------------------------------------
+
+
+def benchmark_for(ticker: str) -> str:
+    """The Yahoo symbol of the benchmark index for a ticker's exchange: ^GSPC for AMD, ^GDAXI for SAP.DE, GD.AT for
+    ALWN.AT; ^STOXX50E for other European exchanges and ^GSPC for the rest."""
+    _, dot, suffix = ticker.strip().upper().rpartition(".")
+    suffix = f".{suffix}" if dot else ""
+    if suffix in BENCHMARKS:
+        return BENCHMARKS[suffix]
+    return EUROPE_BENCHMARK if suffix in _OTHER_EUROPEAN_SUFFIXES else DEFAULT_BENCHMARK
+
+
+def with_benchmark(outcome: Outcome, symbol: str, bars: Sequence[PriceBar]) -> Outcome:
+    """The outcome with the index's return over the same days: from its last close on or before the report's quote
+    day to its last close on or before last_day. None (the symbol kept) when nothing has traded since the report or
+    the index has no close for one of the two days."""
+    closes = sorted(((bar.day, bar.close) for bar in bars if bar.close > 0), key=lambda item: item[0])
+    start = rate_on(closes, quote_day(outcome.opportunity))
+    end = rate_on(closes, outcome.last_day) if outcome.last_day is not None else None
+    value = _change(end, start) if outcome.priced and start and end else None
+    return replace(outcome, benchmark=symbol, benchmark_return_pct=value)
+
+
+def with_account_return(outcome: Outcome, account: str, rates: Sequence[tuple[date, float]] | None) -> Outcome:
+    """The outcome with its return in the account currency (see the module docstring). A stock in the account's
+    currency needs no rates. None when nothing has traded since the report or a rate is missing."""
+    opp = outcome.opportunity
+    value = None
+    if outcome.priced and same_money(opp.currency, account):
+        value = outcome.return_pct
+    elif outcome.priced and rates and outcome.last_day is not None:
+        start = opp.fx_rate if opp.account_currency == account and opp.fx_rate else rate_on(rates, quote_day(opp))
+        end = rate_on(rates, outcome.last_day)
+        if start and end:
+            value = ((1 + outcome.return_pct / 100) * end / start - 1) * 100
+    return replace(outcome, account_currency=account, account_return_pct=value)
+
+
 # --- summary ---------------------------------------------------------------------------------------------------------
 
 
@@ -215,11 +304,14 @@ def score_bucket(score: float) -> str:
 def summarize(outcomes: Sequence[Outcome]) -> dict:
     """Counts, hit rates and average returns, overall, by verdict and by score bucket.
 
-    Every group has: count; filled / fill_rate (of all); target_hit / target_hit_rate (of the filled ones);
-    below_low / below_low_rate (of all); matured (6 months passed with data) / up_after_6m / up_rate_6m (of the
-    matured) / predicted_up_6m (their average probability_up_6m, to compare with up_rate_6m); positive /
-    positive_rate (return above 0, of all); avg_return_pct, median_return_pct; avg_trade_return_pct (filled ones);
-    avg_score. Rates are percentages; a rate or average over nothing is None.
+    Every group has: count; priced (something traded since the report: the rest count in no rate or average);
+    filled / fill_rate (of the priced); target_hit / target_hit_rate (of the filled ones); below_low /
+    below_low_rate (of the priced); matured (6 months passed with data) / up_after_6m / up_rate_6m (of the matured) /
+    predicted_up_6m (their average probability_up_6m, to compare with up_rate_6m); positive / positive_rate (return
+    above 0, of the priced); avg_return_pct, median_return_pct; avg_trade_return_pct (filled ones); benchmarked /
+    avg_benchmark_return_pct / avg_excess_return_pct (the priced ones with an index return); avg_account_return_pct
+    (the priced ones with a return in the account currency); avg_score. Rates are percentages; a rate or average over
+    nothing is None.
 
     The whole dict has those overall figures plus "statuses" (a count per status), "by_verdict" (verdicts that
     occur, in VERDICTS order, then any others) and "by_score" (every bucket in SCORE_BUCKETS, empty ones included).
@@ -229,6 +321,7 @@ def summarize(outcomes: Sequence[Outcome]) -> dict:
     outcomes = [o for o in outcomes if not o.price_mismatch]
     summary = _group(outcomes)
     summary["price_mismatch"] = mismatched
+    summary["account_currency"] = next((o.account_currency for o in outcomes if o.account_currency), None)
     summary["statuses"] = {status: sum(o.status == status for o in outcomes) for status in STATUSES}
     verdicts = [v for v in VERDICTS if any(o.opportunity.analysis.verdict == v for o in outcomes)]
     verdicts += sorted({o.opportunity.analysis.verdict for o in outcomes} - set(verdicts))
@@ -243,31 +336,38 @@ def summarize(outcomes: Sequence[Outcome]) -> dict:
 
 
 def _group(outcomes: list[Outcome]) -> dict:
-    filled = [o for o in outcomes if o.entry_filled is not None]
+    priced = [o for o in outcomes if o.priced]
+    filled = [o for o in priced if o.entry_filled is not None]
     hits = [o for o in filled if o.target_hit is not None]
-    breached = [o for o in outcomes if o.low_breached is not None]
-    matured = [o for o in outcomes if o.up_after_6m is not None]
+    breached = [o for o in priced if o.low_breached is not None]
+    matured = [o for o in priced if o.up_after_6m is not None]
     up = [o for o in matured if o.up_after_6m]
-    positive = [o for o in outcomes if o.return_pct > 0]
-    returns = [o.return_pct for o in outcomes]
+    positive = [o for o in priced if o.return_pct > 0]
+    returns = [o.return_pct for o in priced]
     trades = [o.trade_return_pct for o in filled if o.trade_return_pct is not None]
+    benchmarked = [o for o in priced if o.benchmark_return_pct is not None]
     return {
         "count": len(outcomes),
+        "priced": len(priced),
         "filled": len(filled),
-        "fill_rate": _rate(len(filled), len(outcomes)),
+        "fill_rate": _rate(len(filled), len(priced)),
         "target_hit": len(hits),
         "target_hit_rate": _rate(len(hits), len(filled)),
         "below_low": len(breached),
-        "below_low_rate": _rate(len(breached), len(outcomes)),
+        "below_low_rate": _rate(len(breached), len(priced)),
         "matured": len(matured),
         "up_after_6m": len(up),
         "up_rate_6m": _rate(len(up), len(matured)),
         "predicted_up_6m": _mean([o.opportunity.analysis.probability_up_6m for o in matured]),
         "positive": len(positive),
-        "positive_rate": _rate(len(positive), len(outcomes)),
+        "positive_rate": _rate(len(positive), len(priced)),
         "avg_return_pct": _mean(returns),
         "median_return_pct": statistics.median(returns) if returns else None,
         "avg_trade_return_pct": _mean(trades),
+        "benchmarked": len(benchmarked),
+        "avg_benchmark_return_pct": _mean([o.benchmark_return_pct for o in benchmarked]),
+        "avg_excess_return_pct": _mean([o.excess_return_pct for o in benchmarked]),
+        "avg_account_return_pct": _mean([o.account_return_pct for o in priced if o.account_return_pct is not None]),
         "avg_score": _mean([o.opportunity.score for o in outcomes]),
     }
 
@@ -285,7 +385,8 @@ def _mean(values: Sequence[float]) -> float | None:
 
 def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: Sequence[tuple[str, int]] = ()) -> str:
     """The track record as Markdown: the headline numbers, tables by verdict and by score, then every opportunity
-    (newest first) with its orders, status and returns.
+    (newest first) with its orders, status and returns, next to its benchmark index's return and, with [account]
+    currency, its return in that currency. Opportunities without trading since their report show "–".
 
     missing names the tickers left out because there were no prices for them, with how many opportunities each
     (delisted or renamed stocks: often the worst outcomes, so the figures would otherwise look better than they were).
@@ -307,7 +408,7 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
             lines += ["", left_out]
         return "\n".join(lines) + "\n"
 
-    days = sorted(utc(o.opportunity.created).date() for o in outcomes)  # UTC, like the Reported column
+    days = sorted(display_date(o.opportunity.created) for o in outcomes)  # the dates of the Reported column
     span = f"on {days[0]:%Y-%m-%d}" if days[0] == days[-1] else f"{days[0]:%Y-%m-%d} to {days[-1]:%Y-%m-%d}"
     lines.append(
         f"_{_plural(len(outcomes), 'opportunity', 'opportunities')} reported {span} · "
@@ -315,6 +416,13 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
     )
     if left_out:
         lines += ["", left_out]
+    waiting = sum(1 for o in outcomes if not o.priced and not o.price_mismatch)
+    if waiting:
+        lines += [
+            "",
+            f"_{_plural(waiting, 'opportunity has', 'opportunities have')} had no trading since the report yet: "
+            "shown with – and left out of the figures until the first session after it._",
+        ]
     if summary.get("price_mismatch"):
         lines += [
             "",
@@ -328,20 +436,32 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
         up_line += f"; the model said {predicted:.0f}% on average"
     median = summary.get("median_return_pct")
     average = _pct_or_na(summary.get("avg_return_pct"))
+    priced = summary.get("priced", summary.get("count", 0))
+    account = summary.get("account_currency")
     lines += [
         "",
         "## Summary",
         "",
         "| Measure | Result |",
         "|---|---|",
-        f"| Entry filled (limit buy reached) | {_of(summary.get('filled', 0), summary.get('count', 0))} |",
+        f"| Entry filled (limit buy reached) | {_of(summary.get('filled', 0), priced)} |",
         f"| Target hit after the fill | {_of(summary.get('target_hit', 0), summary.get('filled', 0))} |",
-        f"| Fell below the potential low | {_of(summary.get('below_low', 0), summary.get('count', 0))} |",
+        f"| Fell below the potential low | {_of(summary.get('below_low', 0), priced)} |",
         f"| Higher after 6 months | {up_line} |",
-        f"| Higher now than when reported | {_of(summary.get('positive', 0), summary.get('count', 0))} |",
+        f"| Higher now than when reported | {_of(summary.get('positive', 0), priced)} |",
         f"| Average return since the report | {average}"
         + (f" (median {format_pct(median)})" if median is not None else "")
         + " |",
+    ]
+    if account:
+        lines.append(
+            f"| Average return in {md_escape(account)} (exchange-rate moves included) | "
+            f"{_pct_or_na(summary.get('avg_account_return_pct'))} |"
+        )
+    lines += [
+        f"| Average return of the benchmark index over the same days | "
+        f"{_pct_or_na(summary.get('avg_benchmark_return_pct'))} |",
+        f"| Average excess return (return minus the index's) | {_pct_or_na(summary.get('avg_excess_return_pct'))} |",
         f"| Average return of filled limit orders | {_pct_or_na(summary.get('avg_trade_return_pct'))} |",
     ]
     statuses = summary.get("statuses") or {}
@@ -350,8 +470,9 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
         lines += ["", "Status: " + " · ".join(tally)]
 
     group_header = [
-        "| {first} | Count | Filled | Target hit | Below low | Higher after 6m | Avg return | Avg limit-order return |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|",
+        "| {first} | Count | Filled | Target hit | Below low | Higher after 6m | Avg return | Avg vs index "
+        "| Avg limit-order return |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     by_verdict = summary.get("by_verdict") or {}
     if by_verdict:
@@ -362,23 +483,35 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
         lines += ["", "## By score", "", group_header[0].format(first="Score"), group_header[1]]
         lines += [_group_row(label, group) for label, group in by_score.items()]
 
+    in_account = f"| In {md_escape(account)} " if account else ""
     lines += [
         "",
         "## Opportunities",
         "",
         "| Reported | Ticker | Score | Verdict | Price | Entry | Target | Low | Status | Filled | Target hit "
-        "| Return | Max gain | Max loss | Up after 6m |",
-        "|---|---|---:|---|---:|---:|---:|---:|---|---|---|---:|---:|---:|---|",
+        f"| Return {in_account}| Index | vs index | Max gain | Max loss | Up after 6m |",
+        "|---|---|---:|---|---:|---:|---:|---:|---|---|---|---:|"
+        + ("---:|" if account else "")
+        + "---:|---:|---:|---:|---|",
     ]
     ordered = sorted(outcomes, key=lambda o: utc(o.opportunity.created), reverse=True)
     newer = superseded_by([outcome.opportunity for outcome in ordered])
-    lines += [_outcome_row(outcome, newer.get(index)) for index, outcome in enumerate(ordered)]
+    lines += [_outcome_row(outcome, newer.get(index), account=account) for index, outcome in enumerate(ordered)]
+    currency_note = (
+        f" The {md_escape(account)} return adds the exchange-rate move from the report (the rate stored with it, else "
+        "that day's close) to the last close's day; broker conversion fees are not in it."
+        if account
+        else ""
+    )
     lines += [
         "",
         "_Returns are from the price in the report to the last close within 6 months; limit-order returns from the "
-        "entry to the target (when hit) or that close. A target only counts on a day after the entry filled. Prices "
-        "are shown as reported; after a split they are compared with the split-adjusted history. "
-        "Past results say little about future ones, and this is not investment advice._",
+        "entry to the target (when hit) or that close. A target only counts on a day after the entry filled. Index is "
+        "the exchange's benchmark (^GSPC for US listings, GD.AT for Athens, ^GDAXI for Xetra...) from its close on the "
+        "day of the report's price to its close on the day of the last price, and vs index the return minus that: a "
+        f"rising market lifts every dip, and this shows what the picks added.{currency_note} Prices are shown as "
+        "reported; after a split they are compared with the split-adjusted history. Past results say little about "
+        "future ones, and this is not investment advice._",
     ]
     return "\n".join(lines) + "\n"
 
@@ -387,30 +520,42 @@ def _group_row(label: str, group: dict) -> str:
     cells = [
         md_escape(label),
         str(group.get("count", 0)),
-        _of(group.get("filled", 0), group.get("count", 0)),
+        _of(group.get("filled", 0), group.get("priced", group.get("count", 0))),
         _of(group.get("target_hit", 0), group.get("filled", 0)),
-        _of(group.get("below_low", 0), group.get("count", 0)),
+        _of(group.get("below_low", 0), group.get("priced", group.get("count", 0))),
         _of(group.get("up_after_6m", 0), group.get("matured", 0)),
         _pct_or_na(group.get("avg_return_pct")),
+        _pct_or_na(group.get("avg_excess_return_pct")),
         _pct_or_na(group.get("avg_trade_return_pct")),
     ]
     return "| " + " | ".join(cells) + " |"
 
 
-def _outcome_row(outcome: Outcome, newer: Opportunity | None = None) -> str:
+def _outcome_row(outcome: Outcome, newer: Opportunity | None = None, *, account: str | None = None) -> str:
     opp = outcome.opportunity
     analysis, currency = opp.analysis, opp.currency
     up = {None: "–", True: "yes", False: "no"}[outcome.up_after_6m]
     status = STATUS_LABELS.get(outcome.status, outcome.status)
     if newer is not None:  # a later analysis of the same stock: the idea may no longer hold
-        status += f" (superseded {utc(newer.created):%Y-%m-%d}: {verdict_label(newer.analysis.verdict)})"
+        status += f" (superseded {display_date(newer.created):%Y-%m-%d}: {verdict_label(newer.analysis.verdict)})"
     if outcome.split_factor != 1:
         factor = outcome.split_factor
         status += f" (after a {factor:g}:1 split)" if factor > 1 else f" (after a 1:{1 / factor:g} reverse split)"
     if outcome.price_mismatch:
         status += " (price mismatch, left out)"
+    priced = outcome.priced
+
+    def pct(value: float | None) -> str:
+        return format_pct(value) if priced and value is not None else "–"
+
+    index = "–"
+    if priced and outcome.benchmark_return_pct is not None:
+        index = f"{format_pct(outcome.benchmark_return_pct)} ({md_escape(outcome.benchmark or '?')})"
+    returns = [pct(outcome.return_pct)]
+    if account:
+        returns.append(pct(outcome.account_return_pct if outcome.account_currency == account else None))
     cells = [
-        f"{utc(opp.created):%Y-%m-%d}",
+        f"{display_date(opp.created):%Y-%m-%d}",
         f"**{md_escape(opp.ticker)}**",
         f"{opp.score:.1f}",
         verdict_label(analysis.verdict),
@@ -421,9 +566,11 @@ def _outcome_row(outcome: Outcome, newer: Opportunity | None = None) -> str:
         status,
         _day(outcome.entry_filled),
         _day(outcome.target_hit),
-        format_pct(outcome.return_pct),
-        format_pct(outcome.max_gain_pct),
-        format_pct(outcome.max_loss_pct),
+        *returns,
+        index,
+        pct(outcome.excess_return_pct),
+        pct(outcome.max_gain_pct),
+        pct(outcome.max_loss_pct),
         up,
     ]
     return "| " + " | ".join(cells) + " |"

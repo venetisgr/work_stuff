@@ -197,6 +197,31 @@ def test_upside_and_downside_are_relative_to_the_price():
     assert opp.downside_pct() < 0 < opp.upside_pct()
 
 
+def test_entry_upside_and_downside_are_what_the_limit_orders_would_make_or_lose():
+    opp = make_opportunity()  # entry 132, target 168, low 118
+    assert opp.entry_upside_pct() == pytest.approx((168 / 132 - 1) * 100)  # +27.3%
+    assert opp.entry_downside_pct() == pytest.approx((118 / 132 - 1) * 100)  # -10.6%
+
+
+def test_the_exchange_rate_round_trips_and_older_records_have_none():
+    opp = make_opportunity(account_currency="EUR", fx_rate=0.8783)
+    assert Opportunity.from_dict(json.loads(json.dumps(opp.to_dict()))) == opp
+    data = make_opportunity().to_dict()
+    del data["account_currency"], data["fx_rate"]  # stored before [account] existed
+    old = Opportunity.from_dict(data)
+    assert (old.account_currency, old.fx_rate) == (None, None)
+    for wrong in (0, -1.0, "0.9", float("nan"), float("inf"), True):
+        assert Opportunity.from_dict({**opp.to_dict(), "fx_rate": wrong}).fx_rate is None
+
+
+def test_price_stats_text_in_another_time_zone():
+    from zoneinfo import ZoneInfo
+
+    text = make_stats().as_text(ZoneInfo("Europe/Athens"))
+    assert "as of 2026-09-25 17:45 EEST" in text.splitlines()[0]
+    assert "as of 2026-09-25 14:45 UTC" in make_stats().as_text()  # what the model sees
+
+
 def test_opportunity_round_trips_through_json():
     opp = make_opportunity(
         id=7,

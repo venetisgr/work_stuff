@@ -1,6 +1,8 @@
 import re
 from dataclasses import fields
+from datetime import UTC
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
 from dotenv import dotenv_values
@@ -8,6 +10,7 @@ from dotenv import dotenv_values
 from dip_scanner.config import (
     DEFAULT_MODELS,
     PROJECT_ROOT,
+    AccountConfig,
     AlertConfig,
     ConfigError,
     DipConfig,
@@ -18,6 +21,7 @@ from dip_scanner.config import (
     Settings,
     UniverseConfig,
     default_file,
+    display_zone,
     load_feeds,
     load_scanner_config,
     load_settings,
@@ -36,6 +40,7 @@ def test_an_empty_environment_gives_the_defaults(tmp_path, monkeypatch):
     assert settings.notify.email_to == [] and settings.notify.webhook_format == "generic"
     assert settings.sec_user_agent is None
     assert settings.data_dir == tmp_path / "data"
+    assert settings.display_tz is UTC
     assert Settings().llm.provider == "openai"
 
 
@@ -74,6 +79,7 @@ def test_every_setting_is_read():
         "TELEGRAM_BOT_TOKEN": "123:abc",
         "TELEGRAM_CHAT_ID": "-10042",
         "SEC_USER_AGENT": "Jane Doe jane@example.com",
+        "DISPLAY_TZ": "Europe/Athens",
     }
     settings = load_settings(env)
     assert settings.llm == LLMSettings(
@@ -105,6 +111,28 @@ def test_every_setting_is_read():
         telegram_chat_id="-10042",
     )
     assert settings.sec_user_agent == "Jane Doe jane@example.com"
+    assert settings.display_tz == ZoneInfo("Europe/Athens")
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("UTC", UTC),
+        ("utc", UTC),
+        ("Europe/Athens", ZoneInfo("Europe/Athens")),
+        ("europe/athens", ZoneInfo("Europe/Athens")),  # the case doesn't matter
+        ("America/New_York", ZoneInfo("America/New_York")),
+    ],
+)
+def test_display_tz_takes_iana_names(name, expected):
+    assert display_zone(name) == expected
+    assert display_zone(None) is UTC
+
+
+@pytest.mark.parametrize("name", ["Athens", "Europe", "EEST", "+03:00", "../../etc/passwd"])
+def test_an_unknown_display_tz_is_a_config_error(name):
+    with pytest.raises(ConfigError, match=r"DISPLAY_TZ must be an IANA time zone name such as Europe/Athens"):
+        load_settings({"DISPLAY_TZ": name})
 
 
 @pytest.mark.parametrize(
@@ -197,7 +225,8 @@ def test_the_defaults_match_the_spec():
         retention_days=30,
     )
     assert config.dip == DipConfig(3.0, 6.0, 10.0, 2, ("negative", "mixed"), True)
-    assert config.universe == UniverseConfig((), False, (), 1.0, None)
+    assert config.universe == UniverseConfig((), False, (), 1.0, None, {})
+    assert config.account == AccountConfig(currency=None)
     assert config.alerts == AlertConfig(
         min_score=65,
         min_probability=60,
@@ -241,6 +270,7 @@ only_watchlist = true
 exclude = ["tsla"]
 min_price = 5
 allowed_suffixes = ["", "de", ".at", ".DE"]
+preferred_listings = { asml = "asml.as", "NASDAQ:SAP" = "SAP.DE", "ETE.AT" = "ETE.AT" }
 
 [alerts]
 min_score = 70.5
@@ -248,6 +278,9 @@ min_probability = 65
 verdicts = ["temporary_fear"]
 system_notices = false
 notice_after_cycles = 12
+
+[account]
+currency = " eur "
 """,
     )
     config = load_scanner_config(path)
@@ -267,8 +300,21 @@ notice_after_cycles = 12
     )
     assert isinstance(config.scan.interval_minutes, float)
     assert config.dip == DipConfig(4.0, 7.5, 12.0, 3, ("negative",), False)
-    assert config.universe == UniverseConfig(("AMD", "SAP.DE"), True, ("TSLA",), 5.0, ("", ".DE", ".AT"))
+    assert config.universe == UniverseConfig(
+        ("AMD", "SAP.DE"), True, ("TSLA",), 5.0, ("", ".DE", ".AT"), {"ASML": "ASML.AS", "SAP": "SAP.DE"}
+    )
     assert config.alerts == AlertConfig(70.5, 65, ("temporary_fear",), system_notices=False, notice_after_cycles=12)
+    assert config.account == AccountConfig(currency="EUR")
+
+
+def test_watchlist_and_exclude_follow_the_preferred_listings(tmp_path):
+    text = (
+        '[universe]\nwatchlist = ["ASML", "AMD", "ASML.AS"]\nexclude = ["sap"]\n'
+        'preferred_listings = { "ASML" = "ASML.AS", "SAP" = "SAP.DE" }\n'
+    )
+    universe = load_scanner_config(_write(tmp_path, text)).universe
+    assert universe.watchlist == ("ASML.AS", "AMD")  # once
+    assert universe.exclude == ("SAP.DE",)
 
 
 def test_watchlist_and_exclude_are_written_like_triage_tickers(tmp_path):
@@ -344,6 +390,16 @@ def test_a_section_must_be_a_table(tmp_path):
         ("[alerts]\nmin_probability = -1\n", "alerts.min_probability must be between 0 and 100"),
         ('[dip]\ndirections = ["down"]\n', "dip.directions in .* has unknown value 'down'"),
         ('[alerts]\nverdicts = ["buy", "sell"]\n', "alerts.verdicts in .* has unknown values 'buy', 'sell'"),
+        ('[account]\ncurrency = "euro"\n', 'account.currency in .* must be a three-letter currency code like "EUR"'),
+        ("[account]\ncurrency = 978\n", "account.currency in .* must be a string"),
+        ('[account]\ncurrency = "GBX"\n', "account.currency in .* a hundredth of a currency; use GBP"),
+        ('[account]\ncurrancy = "EUR"\n', r"Unknown setting 'currancy' in \[account\]"),
+        ('[universe]\npreferred_listings = ["ASML"]\n', "universe.preferred_listings in .* must be a table"),
+        ("[universe]\npreferred_listings = { ASML = 1 }\n", "universe.preferred_listings in .* must be a table"),
+        (
+            '[universe]\npreferred_listings = { ASML = "SPY" }\n',
+            "universe.preferred_listings in .*: 'SPY' isn't a company's Yahoo Finance symbol",
+        ),
         ("[scan\n", "is not valid TOML"),
     ],
 )
@@ -488,11 +544,17 @@ def test_the_shipped_scanner_config_spells_out_the_defaults():
     assert load_scanner_config(PROJECT_ROOT / "scanner.toml") == ScannerConfig()
 
 
-def test_the_shipped_scanner_config_and_the_readme_name_every_setting():
+def test_the_shipped_scanner_config_and_the_readme_name_every_setting(tmp_path):
     text = (PROJECT_ROOT / "scanner.toml").read_text(encoding="utf-8")
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     written = set(re.findall(r"^#? ?([a-z_0-9]+) = ", text, re.MULTILINE))
-    sections = {"scan": ScanConfig, "dip": DipConfig, "universe": UniverseConfig, "alerts": AlertConfig}
+    sections = {
+        "scan": ScanConfig,
+        "dip": DipConfig,
+        "universe": UniverseConfig,
+        "alerts": AlertConfig,
+        "account": AccountConfig,
+    }
     for section, cls in sections.items():
         assert f"[{section}]" in text
         for name in (f.name for f in fields(cls)):
@@ -500,6 +562,14 @@ def test_the_shipped_scanner_config_and_the_readme_name_every_setting():
     # The settings that bound the model bill and keep an unattended scanner honest are in the README too.
     for name in ("max_analyses_per_day", "reanalyse_same_session_hours", "system_notices", "notice_after_cycles"):
         assert f"`[{'scan' if 'analys' in name else 'alerts'}] {name}`" in readme, name
+    # So are the settings for a euro investor, and the display time zone.
+    for setting in ("`[account] currency`", "`[universe] preferred_listings`", "`DISPLAY_TZ`"):
+        assert setting in readme, setting
+    # The commented examples in scanner.toml are valid settings.
+    examples = "\n".join(line.removeprefix("# ") for line in text.splitlines() if re.match(r"# [a-z_]+ = ", line))
+    for number, line in enumerate(examples.splitlines()):
+        section = next(name for name, cls in sections.items() if line.split(" = ")[0] in {f.name for f in fields(cls)})
+        load_scanner_config(_write(tmp_path, f"[{section}]\n{line}\n", f"example{number}.toml"))
 
 
 def test_the_env_example_loads_and_lists_every_setting():

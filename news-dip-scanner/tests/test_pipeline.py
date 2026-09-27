@@ -15,13 +15,14 @@ from conftest import (
     FakeChatModel,
     FakeResponse,
     FakeSession,
+    chart_json,
     make_analysis,
     make_article,
     make_impact,
     make_opportunity,
 )
 
-from dip_scanner.config import AlertConfig, DipConfig, ScanConfig, ScannerConfig, Settings
+from dip_scanner.config import AccountConfig, AlertConfig, DipConfig, ScanConfig, ScannerConfig, Settings
 from dip_scanner.fundamentals import SecFundamentals
 from dip_scanner.llm import LLMError, LLMSetupError, LLMUnavailableError
 from dip_scanner.models import Feed
@@ -185,6 +186,48 @@ def build(tmp_path):
     yield factory
     for store in stores:
         store.close()
+
+
+EURUSD_URL = "https://query1.finance.yahoo.com/v8/finance/chart/EURUSD%3DX"
+
+
+def test_a_euro_account_sees_the_amounts_in_euros(build):
+    """[account] currency = "EUR": the opportunity keeps the day's rate, and reports and alerts show euros too."""
+    session = FakeSession({**routes(), EURUSD_URL: chart_json("EURUSD=X", [1.13, 1.14], currency="USD")})
+    notifier = FakeNotifier()
+    config = ScannerConfig(account=AccountConfig(currency="EUR"))
+    scanner = build(session=session, notifiers=[notifier], config=config)
+
+    result = scanner.run_cycle(CYCLE)
+
+    [opp] = result.opportunities
+    assert (opp.account_currency, opp.fx_rate) == ("EUR", pytest.approx(1 / 1.14))
+    assert scanner.store.opportunities()[0].fx_rate == pytest.approx(1 / 1.14)  # stored with it
+    latest = result.report_paths[3].read_text(encoding="utf-8")
+    assert f"| Price | $143.55 ≈ €{143.55 / 1.14:,.2f} (-10.0% 1 day" in latest
+    assert "| Exchange rate | 1 USD = 0.8772 EUR at the analysis (Yahoo Finance)" in latest
+    [(_, markdown, html)] = notifier.sent
+    assert "≈ €" in markdown and "≈ €" in html
+
+
+def test_a_missing_exchange_rate_never_costs_the_analysis(build):
+    scanner = build(config=ScannerConfig(account=AccountConfig(currency="EUR")))  # no EURUSD=X route: 404
+    result = scanner.run_cycle(CYCLE)
+    [opp] = result.opportunities
+    assert (opp.account_currency, opp.fx_rate) == ("EUR", None)
+    assert any(note.startswith("No USD/EUR exchange rate for AMD, amounts in USD only") for note in result.notes)
+    assert "≈" not in result.report_paths[3].read_text(encoding="utf-8")
+
+
+def test_the_cycle_summary_uses_the_display_time_zone():
+    from zoneinfo import ZoneInfo
+
+    from dip_scanner.report import set_display_zone
+
+    result = CycleResult(started=CYCLE, finished=CYCLE + timedelta(seconds=12))
+    assert result.summary().startswith("Cycle 2026-09-25 20:30 UTC: ")
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    assert result.summary().startswith("Cycle 2026-09-25 23:30 EEST: ")
 
 
 def test_a_cycle_finds_the_current_symbol_of_a_triage_symbol_without_prices(build, monkeypatch):

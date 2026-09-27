@@ -16,13 +16,23 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import pytest
 import requests
 from requests.structures import CaseInsensitiveDict
 
 from dip_scanner.llm import Usage
 from dip_scanner.models import Analysis, Article, Candidate, Impact, Opportunity, PriceBar, PriceStats
+from dip_scanner.report import set_display_zone
 
 NOW = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def utc_display_zone():
+    """Every test shows times in UTC: the display zone (DISPLAY_TZ) is process-wide, and a test may change it."""
+    set_display_zone(None)
+    yield
+    set_display_zone(None)
 
 
 # --- chat model ----------------------------------------------------------------------------------------------------
@@ -400,3 +410,48 @@ def make_opportunity(**overrides: Any) -> Opportunity:
     }
     values.update(overrides)
     return Opportunity(**values)
+
+
+def chart_json(
+    symbol: str,
+    closes: Sequence[float],
+    *,
+    currency: str = "USD",
+    start: date = date(2026, 9, 1),
+    price: float | None = None,
+    instrument: str = "CURRENCY",
+    zone: str = "Europe/London",
+) -> dict:
+    """A Yahoo chart API reply for symbol with one daily bar per weekday from start (stamped 08:00 UTC), the last
+    close as the live price unless price is given. Enough for currency pairs and indices in tests."""
+    days = [bar.day for bar in make_bars(closes, start)]
+    stamps = [int(datetime(day.year, day.month, day.day, 8, 0, tzinfo=UTC).timestamp()) for day in days]
+    return {
+        "chart": {
+            "result": [
+                {
+                    "meta": {
+                        "currency": currency,
+                        "symbol": symbol,
+                        "instrumentType": instrument,
+                        "exchangeTimezoneName": zone,
+                        "regularMarketPrice": closes[-1] if price is None else price,
+                        "regularMarketTime": stamps[-1] + 3600,
+                    },
+                    "timestamp": stamps,
+                    "indicators": {
+                        "quote": [
+                            {
+                                "open": list(closes),
+                                "high": list(closes),
+                                "low": list(closes),
+                                "close": list(closes),
+                                "volume": [0] * len(closes),
+                            }
+                        ]
+                    },
+                }
+            ],
+            "error": None,
+        }
+    }

@@ -481,12 +481,25 @@ def test_short_alert_one_line_per_opportunity_best_first():
     assert lines[1].endswith("Mixed, high confidence")
     assert lines[2] == (
         "- AMD (Advanced Micro Devices) · score 72.4 · 68% chance up in 6m · price $142.50 · entry $132.00 · "
-        "target $168.00 (+17.9%) · low $118.00 · Temporary fear, medium confidence"
+        "target $168.00 (+17.9% from price, +27.3% from entry) · low $118.00 · Temporary fear, medium confidence"
     )
     # The numbers are the model's uncalibrated estimate, and the low is no floor: the alert says so itself.
     assert lines[3] == ALERT_FOOTER and "uncalibrated" in ALERT_FOOTER and "not a floor" in ALERT_FOOTER
     assert "Not investment advice" in ALERT_FOOTER
     assert len(lines) == 4
+
+
+def test_short_alert_shows_amounts_in_the_account_currency():
+    """A euro investor sees what the limit orders mean in euros; a euro stock needs no conversion."""
+    amd = make_opportunity(account_currency="EUR", fx_rate=0.8783)
+    sap = make_opportunity(ticker="SAP.DE", currency="EUR", score=60.0, account_currency="EUR", fx_rate=1.0)
+    lines = short_alert([amd, sap]).splitlines()
+    assert (
+        "· price $142.50 ≈ €125.16 · entry $132.00 ≈ €115.94 · target $168.00 ≈ €147.55 (+17.9% from price"
+        in (lines[1])
+    )
+    assert "low $118.00 ·" in lines[1]  # the low stays in dollars: the orders are what you place
+    assert "≈" not in lines[2] and "price €142.50 · entry €132.00" in lines[2]
 
 
 def test_short_alert_labels_alerts_that_could_not_be_sent_earlier():

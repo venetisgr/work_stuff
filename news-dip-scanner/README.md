@@ -118,10 +118,18 @@ The settings you are most likely to change in `scanner.toml`:
 | `[dip] min_magnitude`, `directions`, `include_indirect` | 2, negative + mixed, true | Which news can make a company a candidate. |
 | `[universe] watchlist` | none | Tickers that skip the magnitude and relation filters (any negative or mixed news of magnitude 1 or more, direct or indirect). They still need a dip. |
 | `[universe] allowed_suffixes` | all | Exchanges by Yahoo suffix: `""` US, `.DE` Xetra, `.PA` Paris, `.AT` Athens... |
+| `[universe] preferred_listings` | none | The listing you buy for a company listed in several places, e.g. `{ "ASML" = "ASML.AS" }`: its news goes there (see [Investing from a euro account](#investing-from-a-euro-account)). |
 | `[alerts] min_score`, `min_probability`, `verdicts` | 65, 60, temporary fear + mixed | What gets sent as an alert. Everything is in the reports. In practice the score is what binds, and 65 is rarely reached by a "mixed" verdict (see [Scoring](#scoring)). |
 | `[alerts] repeat_hours`, `min_score_change` | 24, 10 | A ticker alerted within `repeat_hours` isn't alerted again unless the score rose by `min_score_change`, the verdict changed or the price fell by another `min_drop_1d_pct`. |
 | `[alerts] system_notices` | true | Tell you through the same channels when the scanner stopped or can't work (see [Running it every 5 minutes](#running-it-every-5-minutes)). |
 | `[alerts] notice_after_cycles` | 6 | Cycles in a row with the model unavailable, or every feed failing, before such a notice. |
+| `[account] currency` | none | Your broker account's currency, e.g. `"EUR"`: reports and alerts show price, entry and target in it too, and `track` shows returns in it. |
+
+Times in reports, alerts, summaries, notes and the log are UTC unless `DISPLAY_TZ` in `.env` names another IANA time
+zone (`Europe/Athens`, `Europe/Berlin`, `America/New_York`), shown with its abbreviation: `2026-09-25 18:00 EEST`. A
+name the system doesn't know is a configuration error; on Windows the names come from the `tzdata` package, which is
+installed with the scanner there. The database, the report file names and the model's daily use (counted from 00:00
+UTC) stay in UTC.
 
 Tickers are Yahoo Finance symbols: `AMD`, `BRK-B`, `SAP.DE`, `ASML.AS`, `ALWN.AT`, `7203.T`, `0700.HK` (in the
 watchlist and exclude lists `BRK.B` or `NASDAQ:TSLA` work too). Only company shares become candidates: ETFs, funds
@@ -189,6 +197,43 @@ Known limits:
 - **Alerts.** With the default `[alerts]` only confident "temporary fear" calls alert, on any exchange (see
   [Scoring](#scoring)).
 
+## Investing from a euro account
+
+The prices, entries and targets are in the currency a stock trades in, and so are the returns in `track`. From a
+euro account, a US stock is also a bet on the dollar:
+
+- **Currency risk is a big share of the target.** EUR/USD moved 7.3% a year (annualised daily volatility, 2016-2026,
+  Yahoo's `EURUSD=X`), about 5% over six months; since 2016 the median six-month move was 2.9% and one in four was over
+  6%. Next to a typical 10-20% target from the analysis, that decides many outcomes: +15% in dollars while the dollar
+  loses 6% against the euro is about +8% in euros.
+- **Conversion fees.** Most brokers convert at a spread or a fee of a few tenths of a percent, on the buy and again on
+  the sale; check your broker's fee schedule.
+- **Minimum commissions.** On a small account these weigh more than the fee in percent: with a €7 minimum, a €500
+  order pays 1.4% to buy and 1.4% to sell, before any currency cost. Fewer, larger orders cost less.
+
+`[account] currency = "EUR"` in `scanner.toml` makes this visible. Reports and alerts then show price, entry and
+target in euros too (`$132.00 ≈ €115.94`), at Yahoo Finance's exchange rate when the analysis was made (the report
+names the rate; your broker's rate and fee differ), and `track` adds the return in euros, exchange-rate moves
+included, next to the return in the trading currency (see [Track record](#track-record)). The rate is fetched from
+Yahoo's chart API like the prices (`EURUSD=X`, `EURGBP=X`...; pence, cents and agorot are converted through pounds,
+rand and shekels). Without a rate the amounts stay in the trading currency and the notes say so. Opportunities
+analysed before the setting keep showing their trading currency only.
+
+Many large European companies trade in New York too (ASML, SAP, TotalEnergies, Stellantis), and the triage names the
+listing the article is about, often the US one. `[universe] preferred_listings` moves a company's news to the listing
+you would buy, so it is analysed there, with prices, entry and target in euros and no conversion:
+
+```toml
+[universe]
+preferred_listings = { "ASML" = "ASML.AS", "SAP" = "SAP.DE", "TTE" = "TTE.PA", "STLA" = "STLAM.MI" }
+```
+
+All eight symbols answered on 2026-09-27. The map applies to every new triage answer and to news stored before it was
+set, watchlist and exclude entries are read through it (`"ASML"` on the watchlist means `ASML.AS`), and news filed
+under both symbols counts once, for the preferred one. Pick the company's home exchange (Amsterdam for ASML, Xetra
+for SAP): secondary listings trade less, at wider spreads. Keep `[universe] allowed_suffixes` in line, or the
+preferred listing is filtered out.
+
 ## Commands
 
 After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_scanner`.
@@ -201,7 +246,7 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 | `dip-scanner news [--hours 24] [--ticker T]` | The news digest ("newsletter"): companies with negative news first, then the other headlines. | no |
 | `dip-scanner analyze TICKER [--no-save]` | Analyses one ticker now, whatever its price did and ignoring the cooldown. | yes |
 | `dip-scanner report [--days 7] [--min-score N] [--html PATH]` | The stored opportunities of the last days. | no |
-| `dip-scanner track [--days 365]` | How past opportunities played out (see [Track record](#track-record)). | no |
+| `dip-scanner track [--days 365]` | How past opportunities played out, next to their exchange's index (see [Track record](#track-record)). | no |
 | `dip-scanner prices TICKER` | Price statistics and whether they count as a dip. | no |
 
 Options for every command: `-v` (debug logging), `--env-file PATH`, `--config PATH`, `--feeds PATH` and
@@ -219,9 +264,11 @@ Everything goes to `data/` (or `DATA_DIR`):
 - `cache/sec/`: the SEC ticker list (a day) and each company's figures (12 hours).
 
 Each opportunity in the report shows the price and recent moves, the chance of being higher in 6 months, the
-potential low and the statistical low, the entry (limit buy) and target (limit sell idea) with upside and downside,
-the verdict and confidence, what the market fears, the fundamental impact, the thesis, risks, catalysts, what to check
-before buying, and the headlines that flagged it.
+potential low and the statistical low, the entry (limit buy) and target (limit sell idea), the upside to the target
+and downside to the low twice (from today's price, and from the entry, which is what the two limit orders would make
+or lose), the verdict and confidence, what the market fears, the fundamental impact, the thesis, risks, catalysts,
+what to check before buying, and the headlines that flagged it. With `[account] currency` set, price, entry and target
+also show their value in your currency, with the exchange rate used.
 
 Alerts go to every configured channel. Email and generic webhooks get the full report; Slack, Discord and Telegram
 get one line per opportunity. The rules:
@@ -317,10 +364,40 @@ provider's current prices.
   a new session has traded (evenings, weekends, later the same day) that happens at most every
   `reanalyse_same_session_hours` (12) unless the price fell further, and `max_analyses_per_day` (40) caps the day,
   so a busy news day can't run up the bill. Expect a handful to a few dozen a day.
-- **Total**: roughly 0.25-0.6 million input tokens a day. With a small model for triage this usually costs
-  well under a few dollars a day. Reasoning models also bill their thinking as output tokens: set
-  `LLM_TRIAGE_REASONING_EFFORT=low` (triage only maps headlines to companies, all day long), and
-  `LLM_ANALYSIS_REASONING_EFFORT` or `LLM_REASONING_EFFORT` if you want the analysis cheaper too.
+- **Total**: roughly 0.25-0.6 million input tokens a day. Reasoning models also bill their thinking as output
+  tokens, which is where most of the money goes.
+
+**What that costs a month.** With OpenAI's list prices for the default models, checked on 2026-09-27 (gpt-5-mini
+$0.25 per million input tokens and $2 per million output tokens, gpt-5 $1.25 and $10; prices change, check the
+provider's page), and the request counts above, 30 days of `watch` at the 5-minute interval:
+
+| Day | Triage (gpt-5-mini) | Analysis (gpt-5) | A day | A month | In euros |
+|---|---|---|---:|---:|---:|
+| Quiet | 150 requests, 300 output tokens each | 5 analyses, 2,000 output tokens each | $0.27 | about $8 | €7 |
+| Typical | 220 requests, 500 output tokens each | 15 analyses, 3,500 output tokens each | $0.89 | about $27 | €24 |
+| Busy every day | 290 requests, 1,000 output tokens each | 40 analyses (the daily cap), 5,000 each | $2.86 | about $86 | €75 |
+
+Input is 1,500 tokens per triage request and 3,500 per analysis; the output counts include reasoning at
+`LLM_TRIAGE_REASONING_EFFORT=low` and the analysis model's default effort, and are assumptions: no live model was run
+for this README. The euro figures use 1 EUR = 1.1386 USD. Anthropic's defaults (claude-haiku-4-5 at $1 and $5,
+claude-sonnet-5 at $2 and $10) come to about $18-95 a month for the same days, mostly because Haiku's input costs
+four times as much.
+
+Next to the Reddit author's starting capital of €2,500, a year of typical days costs about €280, 11% of the account,
+and a year of busy ones about €900, 36%, before a single trade and before broker fees (see
+[Investing from a euro account](#investing-from-a-euro-account)). The scanner has to find a lot of good trades to pay
+for itself on an account that size. To keep the bill down:
+
+- Set `LLM_TRIAGE_REASONING_EFFORT=low`: triage only maps headlines to companies, all day long. If a triage reply
+  takes about 1,800 output tokens at the model's default effort instead of 500, the typical month costs about $17
+  more. `LLM_ANALYSIS_REASONING_EFFORT=low` (or `medium`) makes the analysis cheaper too, at some cost in quality.
+- Use a longer `[scan] interval_minutes` (15 minutes: about 96 triage requests a day) and a lower
+  `[scan] max_analyses_per_day`.
+- Set a monthly spend limit or budget in the provider's console, and keep automatic recharge of prepaid credit off or
+  low. When the money runs out, the scanner stops and sends a "dip-scanner stopped" notice (see
+  [Running it every 5 minutes](#running-it-every-5-minutes)), instead of running up a bill.
+- A ChatGPT Plus (or Pro) subscription doesn't include API use: the API is billed separately, per token, from
+  prepaid credit on platform.openai.com.
 
 Every summary line of `run` and `watch` ends with the day's use so far (calls and tokens in and out, since 00:00
 UTC), and `run` also prints it per step and model: multiply by your provider's prices to see what the day cost. The
@@ -387,12 +464,30 @@ Then `systemctl --user enable --now dip-scanner` and `journalctl --user -u dip-s
 service only runs while you are logged in, unless you run `loginctl enable-linger "$USER"` once: do that on a server
 you log out of, or it stops when you disconnect and doesn't start after a reboot.
 
-**Windows Task Scheduler**: create a task that runs every 5 minutes, with the program
-`C:\path\to\news-dip-scanner\.venv\Scripts\dip-scanner.exe`, arguments `run`, and "Start in" set to
-`C:\path\to\news-dip-scanner` (so `.env`, `scanner.toml` and `data\` are found). Under Settings, choose "Do not start
-a new instance" if the task is already running. Or run `dip-scanner watch` in a terminal that stays open. With cron
-and Task Scheduler the output goes where nobody looks, so set up at least one notification channel: the system
-notices above are how you learn that the runs stopped working.
+**Windows Task Scheduler**, one cycle every 5 minutes with its output in `data\scanner.log` (run `dip-scanner run
+--no-notify` once first, so that `data\` exists: the redirect needs it). In a Command Prompt:
+
+```bat
+schtasks /Create /TN dip-scanner /SC MINUTE /MO 5 /TR "cmd /c cd /d C:\path\to\news-dip-scanner && set PYTHONUTF8=1&& .venv\Scripts\dip-scanner.exe run >> data\scanner.log 2>&1"
+```
+
+- `cd /d` makes `.env`, `scanner.toml` and `data\` findable. `PYTHONUTF8=1` writes the log in UTF-8 (Greek
+  headlines, "€"); the scanner does that for redirected output anyway, and on a console it shows "?" for what the
+  code page lacks instead of failing. There is no space before the second `&&` on purpose: cmd would keep it in the
+  value, and Python refuses to start with `PYTHONUTF8` set to `"1 "`.
+- As created, the task only runs while you are logged on, and a console window flashes every 5 minutes. Open it in
+  Task Scheduler (`taskschd.msc`), Properties: on General choose "Run whether user is logged on or not" (it asks for
+  your password), which also runs it without a window. On Conditions tick "Wake the computer to run this task", and
+  on a laptop untick "Start the task only if the computer is on AC power": a PC that sleeps runs nothing, and Windows
+  only wakes it when the power plan allows wake timers (Power Options, advanced settings, Sleep, "Allow wake
+  timers"). On Settings keep "If the task is already running: Do not start a new instance", so a slow cycle doesn't
+  overlap the next.
+- The `/TR` text is limited to about 260 characters. With a long path, put the part in quotes after `cmd /c` into a
+  `run-scanner.cmd` file in the project folder and use `/TR "C:\path\to\news-dip-scanner\run-scanner.cmd"`.
+
+Or run `dip-scanner watch` in a terminal that stays open. With cron and Task Scheduler the output goes where nobody
+looks, so set up at least one notification channel: the system notices above are how you learn that the runs stopped
+working.
 
 ## Track record
 
@@ -416,8 +511,24 @@ verdicts and probabilities mean anything before trusting them:
 - **Below low**: the first day whose low went under the potential low.
 - **Status**, first match wins: target hit, below the low, expired (over 183 days), open (filled, waiting for the
   target), waiting for entry.
+- **No trading yet**: until a session has traded after the report (a report written at the weekend or after the
+  close), its returns show "–" and it counts in no rate or average, so a fresh report doesn't read as "0 of 8 higher,
+  +0.0%". The header says how many are waiting.
+- **Benchmark**: every opportunity is compared with its exchange's index over the same days, from the index's close
+  on the day of the report's price to its close on the day of the last price: `^GSPC` (S&P 500) for US listings,
+  `^GDAXI` for Xetra, `^FCHI` Paris, `^AEX` Amsterdam, `FTSEMIB.MI` Milan, `^IBEX` Madrid, `GD.AT` Athens, `^FTSE`
+  London, and the local index for Brussels, Lisbon, Stockholm, Copenhagen, Helsinki, Oslo, Vienna, Dublin, Zurich,
+  Tokyo, Hong Kong and a few more (all checked on 2026-09-27); other European exchanges get the Euro Stoxx 50
+  (`^STOXX50E`), anything else the S&P 500. "vs index" is the return minus the index's. In a rising market almost
+  every dip bounces, and "higher after 6 months" looks good; the average excess return, overall and per verdict and
+  score band, is what says whether the picks beat simply holding the market. An index without prices shows "–" and a
+  note.
+- **Account currency**: with `[account] currency` set, a column shows each return in that currency, exchange-rate
+  moves included: the rate stored with the report (else that day's close) against the close on the day of the last
+  price. Broker fees are not in it.
 - It summarises fill rates, target hits, how many were higher after 6 months next to the model's average predicted
-  probability, and returns, overall and by verdict and score band (<50, 50-65, 65-80, 80+).
+  probability, and returns (next to the index's, and in the account currency), overall and by verdict and score band
+  (<50, 50-65, 65-80, 80+).
 - Tickers Yahoo no longer has prices for (delisted, renamed, taken over) are named in a "Left out" line: failed
   companies are often among them, so the figures may look better than what happened.
 - An opportunity with a later analysis of the same stock is marked "superseded", with the later verdict.
@@ -472,7 +583,10 @@ money:
   a lost customer), and a limit buy fills exactly when the price keeps falling. The potential low is an estimate, not a
   floor.
 - **News can be wrong, stale or planted**, and a language model can misread it with confidence.
-- Taxes, fees, currency moves and position sizing are yours to manage. Never put in money you can't afford to lose.
+- **Currency moves and fees can eat the target** of a 6-month idea bought in another currency (see
+  [Investing from a euro account](#investing-from-a-euro-account)).
+- **Costs are real before any trade**: the model bill is a noticeable share of a small account (see [Costs](#costs)).
+- Taxes and position sizing are yours to manage. Never put in money you can't afford to lose.
 
 ## Troubleshooting
 
@@ -488,6 +602,8 @@ money:
 | `Daily limit of 40 analyses reached ...` in the notes | `[scan] max_analyses_per_day` was used up in the last 24 hours; the named candidates are analysed once there is room. Raise it, or set 0 for no limit, if the bill allows. |
 | `Already analysed on the latest session's prices, so new news waits ...` | More news (often in the evening or at the weekend) about a ticker analysed on the same session's prices; it is analysed after the next session, 12 hours after the last analysis (`[scan] reanalyse_same_session_hours`) or when the price falls by another `min_drop_1d_pct`. |
 | A "dip-scanner stopped" notice | The reason is in it (the same message `run` prints). Fix that setting; `dip-scanner run --no-notify` checks it. |
+| `DISPLAY_TZ must be an IANA time zone name` | Use a name like `Europe/Athens` (not `Athens`, `EEST` or `+03:00`). On Windows, `pip install tzdata` if the scanner was installed without it. |
+| `No USD/EUR exchange rate for ..., amounts in USD only` | Yahoo Finance couldn't give the rate for `[account] currency` just then; the analysis is kept, without the ≈ amounts. |
 | `Analysis of X failed ...` | The model refused, was filtered, or its reply was unusable even after a corrective retry. That ticker waits 30 minutes, then 1 h, 2 h... up to a day before it is tried again. |
 | Throttling (429) | Raise `interval_minutes`, lower `triage_batch_size` or `max_candidates_per_cycle`, or raise your quota. |
 | SSL certificate errors on a corporate network | The tool trusts the operating system's certificates. If your proxy's root certificate isn't installed there, point `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` at a bundle that includes it. |
@@ -519,6 +635,7 @@ without sleeping.
 | `analyze.py` | The fear-vs-fundamentals analysis, number checks and the score |
 | `report.py` / `notify.py` | Markdown/HTML/JSON reports, the news digest, and alerts |
 | `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing), rate-limited and scrubbed |
-| `track.py` | The track record |
+| `track.py` | The track record, its benchmark indices and returns in the account currency |
+| `fx.py` | Exchange rates from Yahoo Finance for `[account] currency`, and minor currency units (pence, cents, agorot) |
 | `llm.py` | OpenAI, Azure AI Foundry and Anthropic chat models, JSON replies |
 | `config.py` / `models.py` | Settings and config files; the shared data types |

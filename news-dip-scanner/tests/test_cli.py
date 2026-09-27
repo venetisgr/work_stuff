@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import functools
-from datetime import timedelta
+import io
+import logging
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import FakeChatModel, FakeSession, make_article, make_impact, make_opportunity
+from conftest import FakeChatModel, FakeSession, chart_json, make_article, make_impact, make_opportunity
 from test_pipeline import ANALYSIS, CYCLE, MARKETWATCH_URL, SEC_URL, routes, triage_reply
 
 from dip_scanner import cli
 from dip_scanner.config import DATABASE_NAME
 from dip_scanner.fundamentals import SecFundamentals
 from dip_scanner.pipeline import Scanner
+from dip_scanner.report import set_display_zone
 from dip_scanner.store import Store
 
 ENV_VARS = (
@@ -43,6 +47,7 @@ ENV_VARS = (
     "TELEGRAM_CHAT_ID",
     "SEC_USER_AGENT",
     "DATA_DIR",
+    "DISPLAY_TZ",
     "SCANNER_CONFIG",
     "FEEDS_FILE",
 )
@@ -96,6 +101,9 @@ def models(monkeypatch) -> tuple[FakeChatModel, FakeChatModel]:
     triage_model, analysis_model = FakeChatModel(triage_reply), FakeChatModel(ANALYSIS, name="fake-analysis")
     monkeypatch.setattr(cli, "build_models", lambda settings: (triage_model, analysis_model))
     return triage_model, analysis_model
+
+
+CHART = "https://query1.finance.yahoo.com/v8/finance/chart/"
 
 
 def store_at(folder: Path) -> Store:
@@ -219,6 +227,76 @@ def test_ctrl_c_exits_with_130(workdir, monkeypatch, capsys):
     monkeypatch.setattr(cli, "_news", interrupted)
     assert cli.main(["news"]) == 130
     assert "Interrupted." in capsys.readouterr().err
+
+
+# --- output on Windows, display time zone ----------------------------------------------------------------------------
+
+
+class Console(io.TextIOWrapper):
+    """A console (isatty) in a Windows code page."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def greek_news(workdir: Path) -> str:
+    title = "Η ΔΕΗ ανακοίνωσε αποτελέσματα — μετοχή −4%"  # Greek, an em dash and a minus: none are in cp1252
+    article = make_article(title=title, published=CYCLE - timedelta(hours=2), fetched=CYCLE - timedelta(hours=2))
+    with store_at(workdir) as store:
+        store.add_articles([article], max_age_hours=24, now=CYCLE)
+        store.record_triage([article.id], [make_impact(article_id=article.id, ticker="PPC.AT", company="ΔΕΗ")])
+    return title
+
+
+def test_redirected_output_is_utf8_and_never_crashes(workdir, monkeypatch):
+    """Regression (Windows): `dip-scanner news >> data\\scanner.log` wrote in cp1252 and died with
+    UnicodeEncodeError on the first Greek headline."""
+    title = greek_news(workdir)
+    redirected = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")  # a file or a pipe on Western Windows
+    monkeypatch.setattr("sys.stdout", redirected)
+    assert cli.main(["news"]) == 0
+    redirected.flush()
+    assert title in redirected.buffer.getvalue().decode("utf-8")
+    assert redirected.encoding == "utf-8"
+
+
+def test_a_console_that_lacks_a_character_shows_a_question_mark(workdir, monkeypatch):
+    greek_news(workdir)
+    console = Console(io.BytesIO(), encoding="cp1252")
+    errors = Console(io.BytesIO(), encoding="cp1252")
+    monkeypatch.setattr("sys.stdout", console)
+    monkeypatch.setattr("sys.stderr", errors)
+    assert cli.main(["news"]) == 0
+    console.flush()
+    assert (console.encoding, console.errors, errors.errors) == ("cp1252", "replace", "replace")
+    shown = console.buffer.getvalue().decode("cp1252")
+    assert "? ??? ?????????? ???????????? — ?????? ?4%" in shown  # cp1252 has the dash, not Greek or the minus
+
+
+def test_display_tz_sets_the_time_zone_of_the_output(workdir, capsys, monkeypatch):
+    from dip_scanner.feeds import FeedState
+
+    with store_at(workdir) as store:
+        store.save_feed_state("marketwatch", FeedState(), status=200, error=None, fetched=CYCLE)
+    (workdir / ".env").write_text("DISPLAY_TZ=Europe/Athens\n", encoding="utf-8")
+    assert cli.main(["feeds"]) == 0
+    assert "last fetch 2026-09-25 23:30 EEST, HTTP 200" in capsys.readouterr().out
+
+    monkeypatch.setenv("DISPLAY_TZ", "Athens")
+    assert cli.main(["feeds"]) == 2
+    assert "Configuration problem: DISPLAY_TZ must be an IANA time zone name" in capsys.readouterr().err
+
+
+def test_log_times_use_the_display_time_zone():
+    record = logging.LogRecord("dip_scanner", logging.INFO, __file__, 1, "Cycle done", None, None)
+    record.created = datetime(2026, 9, 25, 20, 30, 5, tzinfo=UTC).timestamp()
+    record.msecs = 250
+    brief = cli._DisplayTimeFormatter("%(asctime)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    verbose = cli._DisplayTimeFormatter("%(asctime)s %(message)s")
+    assert brief.format(record) == "2026-09-25 20:30:05 Cycle done"  # UTC by default, not the machine's time
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    assert brief.format(record) == "2026-09-25 23:30:05 Cycle done"
+    assert verbose.format(record) == "2026-09-25 23:30:05,250 Cycle done"
 
 
 # --- prices --------------------------------------------------------------------------------------------------------
@@ -451,6 +529,39 @@ def test_track_evaluates_every_stored_opportunity(workdir, web, capsys):
     chart_calls = [call for call in web.calls if "/v8/finance/chart/AMD" in call["url"]]
     assert [call["params"]["range"] for call in chart_calls] == ["1mo"]  # one download covering the signal day
     assert chart_calls[0]["params"]["events"] == "split"  # with the splits, to compare old prices correctly
+
+
+def test_track_compares_with_the_index_and_shows_the_account_currency(workdir, web, capsys):
+    web.routes[CHART + "%5EGSPC"] = chart_json(
+        "^GSPC",
+        [7000 + 10 * n for n in range(20)],
+        currency="USD",
+        start=date(2026, 9, 1),
+        instrument="INDEX",
+        zone="America/New_York",
+    )
+    web.routes[CHART + "EURUSD%3DX"] = chart_json("EURUSD=X", [1.15] * 20, currency="USD", start=date(2026, 9, 1))
+    (workdir / "scanner.toml").write_text('[account]\ncurrency = "EUR"\n', encoding="utf-8")
+    with store_at(workdir) as store:
+        store.add_opportunity(make_opportunity(created=CYCLE - timedelta(days=20)))
+
+    assert cli.main(["track"]) == 0
+    captured = capsys.readouterr()
+    assert "| Return | In EUR | Index | vs index |" in captured.out
+    row = next(line for line in captured.out.splitlines() if "**AMD**" in line)
+    assert "(^GSPC) |" in row and row.count("–") <= 4
+    assert "| Average return in EUR (exchange-rate moves included) | +" in captured.out
+    assert "Note:" not in captured.err
+    assert [url.rsplit("/", 1)[1] for url in web.urls if "%5E" in url or "%3D" in url] == ["%5EGSPC", "EURUSD%3DX"]
+
+
+def test_track_without_index_prices_says_so_and_carries_on(workdir, web, capsys):
+    with store_at(workdir) as store:
+        store.add_opportunity(make_opportunity(created=CYCLE - timedelta(days=20)))
+    assert cli.main(["track"]) == 0
+    captured = capsys.readouterr()
+    assert "Note: No prices for the benchmark index ^GSPC, so 1 opportunities show – for it" in captured.err
+    assert "| Average return of the benchmark index over the same days | – |" in captured.out
 
 
 def test_track_with_nothing_stored(workdir, capsys):
