@@ -70,6 +70,10 @@ class Recorder:
         ),
         ("https://my-resource.openai.azure.com/openai/v1", "https://my-resource.openai.azure.com/openai/v1/"),
         ("https://gateway.contoso.com/aoai", "https://gateway.contoso.com/aoai/openai/v1/"),
+        (
+            "https://my-resource.openai.azure.com/openai/deployments/gpt-4o/chat/completions?api-version=2025-01-01-preview",
+            "https://my-resource.openai.azure.com/openai/v1/",
+        ),
     ],
 )
 def test_foundry_base_url_accepts_names_and_portal_endpoints(endpoint, expected):
@@ -91,6 +95,18 @@ def test_complete_calls_the_v1_chat_completions_api_with_the_deployment():
             {"role": "user", "content": "Summarize this."},
         ],
     }
+
+
+def test_a_pasted_target_uri_also_supplies_the_deployment():
+    uri = "https://my-resource.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2025-01-01"
+    recorder = Recorder(completion())
+
+    recorder.model(endpoint=uri, deployment=None).complete("s", "p")
+    assert str(recorder.requests[0].url) == "https://my-resource.openai.azure.com/openai/v1/chat/completions"
+    assert recorder.body["model"] == "gpt-4o-mini"
+
+    recorder.model(endpoint=uri, deployment="gpt-4.1").complete("s", "p")  # an explicit deployment wins
+    assert recorder.body["model"] == "gpt-4.1"
 
 
 def test_optional_reasoning_effort_and_output_cap_are_sent_when_set():

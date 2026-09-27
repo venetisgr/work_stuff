@@ -1,7 +1,7 @@
 from datetime import date, timedelta
 
 import pytest
-from conftest import FakeModel
+from conftest import FakeModel, make_pptx, write_file
 from test_pipeline import sample_location
 
 from sharepoint_digest import cli, pipeline
@@ -82,3 +82,36 @@ def test_full_run_writes_the_digest(fake_services, tmp_path, capsys):
     assert digest.exists()
     assert f"Digest: {digest}" in output
     assert "2 of 3 file(s) summarized." in output
+
+
+def test_local_dir_needs_neither_sharepoint_nor_folders_toml(tmp_path, monkeypatch, capsys):
+    model = FakeModel()
+    monkeypatch.setattr(pipeline, "FoundryChatModel", lambda settings: model)
+    synced = tmp_path / "Board packs"
+    write_file(synced, "Q3 plan.pptx", make_pptx(), "2026-09-20T10:00:00+00:00")
+
+    code = cli.main(
+        ["--local-dir", str(synced), "--start", "2026-09-01", "--end", "2026-09-30"]
+        + ["--output-dir", str(tmp_path / "out"), "--folders-file", str(tmp_path / "missing.toml")]
+    )
+
+    assert code == 0
+    assert (tmp_path / "out" / "Board-packs_2026-09-01_to_2026-09-30_digest.md").exists()
+    assert "1 of 1 file(s) summarized." in capsys.readouterr().out
+
+
+def test_local_dir_can_stand_in_for_a_configured_folder(tmp_path, capsys):
+    write_file(tmp_path, "Q3 plan.pptx", b"deck", "2026-09-20T10:00:00+00:00")
+    args = ["--folder", "temp-folder-1", "--local-dir", str(tmp_path), "--start", "2026-09-01", "--end", "2026-09-30"]
+
+    assert cli.main([*args, "--dry-run"]) == 0
+    output = capsys.readouterr().out
+    assert "Temp Folder 1: 1 file(s) modified between 1 Sep 2026 and 30 Sep 2026 would be summarized." in output
+    assert "Q3 plan.pptx" in output
+
+
+def test_list_folders_shows_local_paths(tmp_path, capsys):
+    folders = tmp_path / "folders.toml"
+    folders.write_text("[folders.board]\nlabel = 'Board'\nlocal_path = 'C:\\Users\\me\\Board'\n")
+    assert cli.main(["--list-folders", "--folders-file", str(folders)]) == 0
+    assert "1. Board  (--folder board, local: C:\\Users\\me\\Board)" in capsys.readouterr().out

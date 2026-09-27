@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -32,12 +33,12 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(PROJECT_ROOT / ".env")  # doesn't override anything already set
 
     try:
-        folders = load_folders(args.folders_file or default_folders_file())
         if args.list_folders:
-            for number, folder in enumerate(folders, start=1):
-                print(f"{number}. {folder.label}  (--folder {folder.key}, path: /{folder.path})")
+            for number, folder in enumerate(load_folders(args.folders_file or default_folders_file()), start=1):
+                where = f"local: {folder.local_path}" if folder.local_path else f"path: /{folder.path}"
+                print(f"{number}. {folder.label}  (--folder {folder.key}, {where})")
             return 0
-        folder = find_folder(folders, args.folder) if args.folder else _ask_for_folder(folders)
+        folder = _choose_folder(args)
         date_range = _date_range(args)
         run = run_digest(
             load_settings(),
@@ -90,6 +91,12 @@ def _parser() -> argparse.ArgumentParser:
         default="modified",
         help="which file date the range applies to (default: modified)",
     )
+    parser.add_argument(
+        "--local-dir",
+        type=Path,
+        metavar="PATH",
+        help="read the files from this folder on your computer (e.g. a OneDrive-synced copy) instead of SharePoint",
+    )
     parser.add_argument("--no-subfolders", action="store_true", help="don't look inside subfolders")
     parser.add_argument("--workers", type=_positive_int, default=4, help="files summarized in parallel (default: 4)")
     parser.add_argument(
@@ -122,6 +129,15 @@ def _date_range(args: argparse.Namespace) -> DateRange:
     if args.start:
         return DateRange(args.start, end)
     return DateRange(end - timedelta(days=(args.days or DEFAULT_DAYS) - 1), end)
+
+
+def _choose_folder(args: argparse.Namespace) -> Folder:
+    if args.local_dir and not args.folder:  # an ad-hoc local folder; folders.toml isn't needed
+        name = args.local_dir.expanduser().resolve().name or "local"
+        return Folder(key=name, label=name, path="", local_path=str(args.local_dir))
+    folders = load_folders(args.folders_file or default_folders_file())
+    folder = find_folder(folders, args.folder) if args.folder else _ask_for_folder(folders)
+    return replace(folder, local_path=str(args.local_dir)) if args.local_dir else folder
 
 
 def _ask_for_folder(folders: list[Folder]) -> Folder:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -112,6 +112,24 @@ class FolderListing:
     skipped: list[SkippedFile]  # Office files in the date range that can't be read
 
 
+def select_files(
+    files: Iterable[DriveFile], start: datetime, end: datetime, *, date_field: str = "modified"
+) -> FolderListing:
+    """Keep the files we can summarize whose modified (or created) time falls in [start, end)."""
+    selected: list[DriveFile] = []
+    skipped: list[SkippedFile] = []
+    for file in files:
+        if file.name.startswith("~$") or not start <= file.timestamp(date_field) < end:  # ~$ = Office lock files
+            continue
+        if file.kind:
+            selected.append(file)
+        elif file.extension in UNSUPPORTED_OFFICE_TYPES:
+            reason = f"{file.extension} files aren't supported; save it as .pptx or .docx to include it."
+            skipped.append(SkippedFile(file, reason))
+    selected.sort(key=lambda f: f.timestamp(date_field))
+    return FolderListing(selected, skipped)
+
+
 def graph_credential(settings: SharePointSettings) -> TokenCredential:
     """Build the Entra ID credential used to call Microsoft Graph, per GRAPH_AUTH_MODE."""
     from azure.identity import ClientSecretCredential, DefaultAzureCredential, DeviceCodeCredential
@@ -216,21 +234,8 @@ class SharePointFolder:
         self, start: datetime, end: datetime, *, date_field: str = "modified", recursive: bool = True
     ) -> FolderListing:
         """Files whose modified (or created) time falls in [start, end)."""
-        files: list[DriveFile] = []
-        skipped: list[SkippedFile] = []
-        for item, path in self._walk(recursive):
-            if item["name"].startswith("~$"):  # Office lock files
-                continue
-            file = DriveFile.from_graph(item, path)
-            if not start <= file.timestamp(date_field) < end:
-                continue
-            if file.kind:
-                files.append(file)
-            elif file.extension in UNSUPPORTED_OFFICE_TYPES:
-                reason = f"{file.extension} files aren't supported; save it as .pptx or .docx to include it."
-                skipped.append(SkippedFile(file, reason))
-        files.sort(key=lambda f: f.timestamp(date_field))
-        return FolderListing(files, skipped)
+        files = (DriveFile.from_graph(item, path) for item, path in self._walk(recursive))
+        return select_files(files, start, end, date_field=date_field)
 
     def download(self, file: DriveFile) -> bytes:
         return self.graph.get_bytes(f"/drives/{self.drive_id}/items/{file.id}/content")

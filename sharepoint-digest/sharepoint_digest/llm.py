@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 import openai
 
@@ -20,6 +21,7 @@ FOUNDRY_SCOPE = "https://ai.azure.com/.default"
 _AZURE_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com", ".cognitiveservices.azure.com")
 # Errors that repeat on every request, so there's no point carrying on with the other files.
 _SETUP_ERROR_CODES = {"unsupported_parameter", "unsupported_value", "OperationNotSupported"}
+_DEPLOYMENT_IN_URL = re.compile(r"/openai/deployments/([^/?#]+)")
 
 
 class LLMError(Exception):
@@ -53,6 +55,12 @@ def foundry_base_url(endpoint: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}{path}/openai/v1/"  # e.g. an API Management gateway
 
 
+def deployment_from_endpoint(endpoint: str) -> str | None:
+    """The deployment name in a pasted Target URI, e.g. .../openai/deployments/<name>/chat/completions?..."""
+    match = _DEPLOYMENT_IN_URL.search(endpoint)
+    return unquote(match.group(1)) if match else None
+
+
 def _entra_token_provider() -> Callable[[], str]:
     from azure.identity import DefaultAzureCredential, get_bearer_token_provider
 
@@ -65,9 +73,10 @@ class FoundryChatModel:
     def __init__(self, settings: FoundrySettings, *, http_client: httpx2.Client | None = None):
         if not settings.endpoint:
             raise ConfigError("Set FOUNDRY_ENDPOINT in .env to your Foundry resource's endpoint or name.")
-        if not settings.deployment:
+        deployment = settings.deployment or deployment_from_endpoint(settings.endpoint)
+        if not deployment:
             raise ConfigError("Set FOUNDRY_DEPLOYMENT in .env to the name of your GPT model deployment.")
-        self.deployment = settings.deployment
+        self.deployment = deployment
         self._reasoning_effort = settings.reasoning_effort
         self._max_output_tokens = settings.max_output_tokens
         self._client = openai.OpenAI(

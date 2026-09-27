@@ -24,6 +24,14 @@ def test_folders_can_override_site_and_library(tmp_path):
     )
 
 
+def test_a_local_path_makes_the_sharepoint_path_optional(tmp_path):
+    path = tmp_path / "folders.toml"
+    # Single quotes keep Windows backslashes as they are.
+    path.write_text("[folders.board]\nlocal_path = 'C:\\Users\\me\\OneDrive - Contoso\\Board'\n")
+    [folder] = load_folders(path)
+    assert (folder.label, folder.path, folder.local_path) == ("board", "", r"C:\Users\me\OneDrive - Contoso\Board")
+
+
 @pytest.mark.parametrize(
     ("content", "message"),
     [

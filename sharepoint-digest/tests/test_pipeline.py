@@ -13,6 +13,7 @@ from conftest import (
     make_pptx,
     make_settings,
     site_routes,
+    write_file,
 )
 
 from sharepoint_digest.config import ConfigError, Folder
@@ -83,6 +84,19 @@ def test_run_summarizes_each_file_then_writes_the_digest(tmp_path):
     assert [d["name"] for d in data["documents"]] == ["Alpha status.docx", "Q3 plan.pptx"]
     assert data["documents"][0]["summary"].startswith("**Overview:**")
     assert {d["name"] for d in data["not_included"]} == {"Old notes.doc", "Locked.docx"}
+
+
+def test_a_folder_with_a_local_path_is_read_from_disk(tmp_path):
+    write_file(tmp_path, "Q3 plan.pptx", make_pptx(), "2026-09-20T10:00:00+00:00")
+    write_file(tmp_path, "Minutes/Alpha status.docx", make_docx(), "2026-09-05T10:00:00+00:00")
+    folder = Folder("synced", "Synced copy", "", local_path=str(tmp_path))
+    model = FakeModel()
+
+    run = run_digest(make_settings(), folder, SEPTEMBER, model=model)
+
+    assert [s.file.path for s in run.summaries] == ["Minutes/Alpha status.docx", "Q3 plan.pptx"]
+    assert run.digest.startswith("## Highlights")
+    assert any("## Slide 1: Q3 plan" in prompt for prompt in model.prompts)
 
 
 def test_nothing_in_range_means_no_model_calls():

@@ -19,13 +19,14 @@ class ConfigError(Exception):
 
 @dataclass(frozen=True)
 class Folder:
-    """A SharePoint folder the digest can run against (one entry in folders.toml)."""
+    """A folder the digest can run against (one entry in folders.toml)."""
 
     key: str
     label: str
-    path: str
+    path: str  # inside the SharePoint library
     site_url: str | None = None
     library: str | None = None
+    local_path: str | None = None  # read the folder on this computer instead, e.g. a OneDrive-synced copy
 
 
 @dataclass(frozen=True)
@@ -122,15 +123,23 @@ def load_folders(path: Path) -> list[Folder]:
 
     folders = []
     for key, entry in entries.items():
-        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
-            raise ConfigError(f'Folder "{key}" in {path} needs a path (use path = "" for the library root).')
+        if not isinstance(entry, dict):
+            raise ConfigError(f'Folder "{key}" in {path} should be a table of settings.')
+        local_path = _optional_str(entry.get("local_path"))
+        folder_path = entry.get("path", "" if local_path else None)
+        if not isinstance(folder_path, str):
+            raise ConfigError(
+                f'Folder "{key}" in {path} needs a path inside the SharePoint library '
+                '(use path = "" for the library root) or a local_path.'
+            )
         folders.append(
             Folder(
                 key=key,
                 label=str(entry.get("label") or key),
-                path=entry["path"].strip().strip("/"),
+                path=folder_path.strip().strip("/"),
                 site_url=_optional_str(entry.get("site_url")),
                 library=_optional_str(entry.get("library")),
+                local_path=local_path,
             )
         )
     return folders

@@ -5,7 +5,8 @@ summarizes each one with your GPT model in Azure AI Foundry, and combines the su
 
 ## How it works
 
-1. **Find**: lists the folder (and its subfolders) through Microsoft Graph and keeps the `.pptx` and `.docx` files
+1. **Find**: lists the folder (and its subfolders) through Microsoft Graph, or reads a copy synced to your computer,
+   and keeps the `.pptx` and `.docx` files
    whose last-modified date falls in the range.
 2. **Read**: downloads each file and extracts its text. From decks it takes slide titles, bullets, tables, chart data
    and speaker notes; from Word documents, headings, paragraphs, lists and tables, in order.
@@ -31,6 +32,9 @@ cp .env.example .env           # Windows: copy .env.example .env
 
 ### 2. SharePoint access (Microsoft Graph)
 
+Can't get an app registration? Skip this step and [read a synced copy](#reading-a-synced-copy-instead-of-sharepoint)
+instead; your own access to the folders is enough for that.
+
 Register an app in the Azure portal (**Microsoft Entra ID → App registrations → New registration**) and note its
 tenant ID and client (application) ID. Then set it up for one of these sign-in modes (`GRAPH_AUTH_MODE` in `.env`):
 
@@ -55,7 +59,9 @@ GPT-5 mini. The tool uses the Chat Completions API, so models that only offer th
 models) won't work.
 
 - `FOUNDRY_ENDPOINT`: the endpoint from the resource's overview page, e.g. `https://my-resource.openai.azure.com/`
-  (the resource name alone also works).
+  (the resource name alone also works). You can also paste the chat completions URL you already use, the
+  deployment's Target URI (`.../openai/deployments/<name>/chat/completions?api-version=...`); the tool then takes the
+  deployment name from it.
 - `FOUNDRY_DEPLOYMENT`: the **deployment** name from **Models + endpoints**, which can differ from the model name.
 - `FOUNDRY_API_KEY`: a key from the resource's **Keys and Endpoint** page. Leave it empty to use Entra ID instead;
   the identity then needs the **Cognitive Services OpenAI User** role on the resource. With Entra ID, the tool signs
@@ -75,6 +81,28 @@ path = "Projects/Alpha"            # folder path inside the library ("" for the 
 # site_url = "https://contoso.sharepoint.com/sites/Other"   # optional, if it's on another site
 # library = "Board Documents"                                # optional, if it's in another library
 ```
+
+### Reading a synced copy instead of SharePoint
+
+This route needs no app registration and no SharePoint permissions beyond your own; only the Foundry settings.
+
+1. In SharePoint, open the folder and select **Sync** (or **Add shortcut to My files**). OneDrive keeps a copy on
+   your computer up to date, and the files keep their SharePoint modified dates, so date ranges still work.
+2. Find the folder in File Explorer and copy its path.
+3. Add it to the folder's entry in `folders.toml`, in single quotes so the backslashes stay as they are:
+
+   ```toml
+   [folders.temp-folder-1]
+   label = "Temp Folder 1"
+   local_path = 'C:\Users\you\Contoso\Team Site - Documents\Temp Folder 1'
+   ```
+
+   Or skip `folders.toml` and point at any folder directly:
+   `python -m sharepoint_digest --local-dir "C:\path\to\folder" --days 14`.
+
+A folder you downloaded by hand works the same way, but downloaded files may be stamped with the download date
+instead of the SharePoint date, so download only the files in your range. `--date-field created` isn't available
+for local copies.
 
 ## Usage
 
@@ -100,6 +128,7 @@ After `pip install -e .`, `sharepoint-digest` works as a shorthand for `python -
 | `--start` / `--end` | First and last day of the range (`YYYY-MM-DD`, both included). `--end` defaults to today. |
 | `--days N` | The last N days up to `--end`, instead of `--start`. The default range is the last 7 days. |
 | `--date-field created` | Filter on the file's creation date instead of its last-modified date. |
+| `--local-dir PATH` | Read the files from a folder on your computer instead of SharePoint. |
 | `--no-subfolders` | Only look at files directly in the folder. |
 | `--workers N` | Files summarized in parallel (default 4). Lower it if Foundry throttles you. |
 | `--output-dir DIR` | Where to write the results (default `./output`). |
@@ -153,6 +182,7 @@ The tests use fake SharePoint and model backends, so they run offline without cr
 | `cli.py` | Command-line options, folder menu, output messages |
 | `pipeline.py` | The run: list files, summarize them in parallel, build the digest |
 | `sharepoint.py` | Microsoft Graph: find the site, library and folder; list and download files |
+| `local.py` | The same for a folder on your computer, such as a OneDrive-synced copy |
 | `extract.py` | Text from `.pptx` and `.docx` files |
 | `llm.py` | The GPT deployment in Azure AI Foundry (OpenAI v1 API) |
 | `summarize.py` / `prompts.py` | Per-document summaries and the digest |

@@ -1,10 +1,13 @@
 # Folders the digest can cover. See them with: python -m sharepoint_digest --list-folders
 #
 # Each [folders.<key>] table is one folder; <key> is what you pass to --folder.
-#   label    - name shown in the folder menu and at the top of the digest
-#   path     - folder path inside the document library, e.g. "Projects/Alpha" ("" = library root)
-#   site_url - optional: use a different site than SHAREPOINT_SITE_URL for this folder
-#   library  - optional: use a different library than SHAREPOINT_LIBRARY for this folder
+#   label      - name shown in the folder menu and at the top of the digest
+#   path       - folder path inside the document library, e.g. "Projects/Alpha" ("" = library root)
+#   site_url   - optional: use a different site than SHAREPOINT_SITE_URL for this folder
+#   library    - optional: use a different library than SHAREPOINT_LIBRARY for this folder
+#   local_path - optional: read the folder from your computer instead, e.g. a copy synced with
+#                OneDrive. Use single quotes on Windows so the backslashes stay as they are:
+#                local_path = 'C:\Users\you\Contoso\Team Site - Documents\Temp Folder 1'
 #
 # These four are placeholders until the real folder names are known.
 

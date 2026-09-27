@@ -1,4 +1,4 @@
-"""The end-to-end run: find the files in SharePoint, summarize each one, then write the digest."""
+"""The end-to-end run: find the files (in SharePoint or a local copy), summarize each one, write the digest."""
 
 from __future__ import annotations
 
@@ -6,11 +6,13 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
+from typing import Protocol
 
 from .config import ConfigError, Folder, Settings
 from .extract import extract_text
 from .llm import ChatModel, FoundryChatModel, LLMError, LLMSetupError
-from .sharepoint import DriveFile, GraphClient, SharePointFolder, SkippedFile, graph_credential
+from .local import LocalFolder
+from .sharepoint import DriveFile, FolderListing, GraphClient, SharePointFolder, SkippedFile, graph_credential
 from .summarize import DocumentSummary, build_digest, summarize_document
 
 log = logging.getLogger(__name__)
@@ -62,7 +64,19 @@ class DigestRun:
         return f"{verb} {self.date_range.describe()}"
 
 
-def open_folder(settings: Settings, folder: Folder) -> SharePointFolder:
+class FileSource(Protocol):
+    """Where the files come from: a SharePoint folder, or a copy of one on this computer."""
+
+    def list_files(
+        self, start: datetime, end: datetime, *, date_field: str = ..., recursive: bool = ...
+    ) -> FolderListing: ...
+
+    def download(self, file: DriveFile) -> bytes: ...
+
+
+def open_folder(settings: Settings, folder: Folder) -> FileSource:
+    if folder.local_path:
+        return LocalFolder(folder.local_path)
     site_url = folder.site_url or settings.sharepoint.site_url
     if not site_url:
         raise ConfigError("Set SHAREPOINT_SITE_URL in .env (or site_url for this folder in folders.toml).")
@@ -79,7 +93,7 @@ def run_digest(
     recursive: bool = True,
     workers: int = 4,
     dry_run: bool = False,
-    location: SharePointFolder | None = None,
+    location: FileSource | None = None,
     model: ChatModel | None = None,
 ) -> DigestRun:
     """List the folder's PowerPoint and Word files in the date range, summarize them and write a digest.
@@ -122,7 +136,7 @@ def run_digest(
 
 def _summarize_files(
     model: ChatModel,
-    location: SharePointFolder,
+    location: FileSource,
     files: list[DriveFile],
     *,
     folder_label: str,

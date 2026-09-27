@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 
 from azure.core.credentials import AccessToken
 from docx import Document
@@ -66,6 +69,16 @@ def make_docx() -> bytes:
     table.cell(1, 2).text = "2026-10-01"
     doc.add_paragraph("Next review in two weeks.")
     return _save(doc)
+
+
+def write_file(root: Path, relative: str, content: bytes, modified: str) -> Path:
+    """Create root/relative with the given content and modified time (ISO 8601)."""
+    path = root / relative
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content)
+    stamp = datetime.fromisoformat(modified).timestamp()
+    os.utime(path, (stamp, stamp))
+    return path
 
 
 def _save(document) -> bytes:
