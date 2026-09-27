@@ -1,0 +1,25 @@
+# Folders the digest can cover. See them with: python -m sharepoint_digest --list-folders
+#
+# Each [folders.<key>] table is one folder; <key> is what you pass to --folder.
+#   label    - name shown in the folder menu and at the top of the digest
+#   path     - folder path inside the document library, e.g. "Projects/Alpha" ("" = library root)
+#   site_url - optional: use a different site than SHAREPOINT_SITE_URL for this folder
+#   library  - optional: use a different library than SHAREPOINT_LIBRARY for this folder
+#
+# These four are placeholders until the real folder names are known.
+
+[folders.temp-folder-1]
+label = "Temp Folder 1"
+path = "Temp Folder 1"
+
+[folders.temp-folder-2]
+label = "Temp Folder 2"
+path = "Temp Folder 2"
+
+[folders.temp-folder-3]
+label = "Temp Folder 3"
+path = "Temp Folder 3"
+
+[folders.temp-folder-4]
+label = "Temp Folder 4"
+path = "Temp Folder 4"
