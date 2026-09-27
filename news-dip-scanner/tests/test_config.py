@@ -408,6 +408,14 @@ name = "  "
         ('[feeds.pr]\nurl = "https://x"\nlanguages = "en"\n', 'languages for feed "pr" .* must be a list'),
         ('[feeds.pr]\nurl = "https://x"\nlanguages = [""]\n', 'languages for feed "pr" .* must be a list'),
         ('[feeds."ticker:AMD"]\nurl = "https://x"\n', "can't be empty or contain"),
+        ('[feeds.r]\nurl = "https://x"\nexclude_titles = "^About"\n', 'exclude_titles for feed "r" .* must be a list'),
+        ('[feeds.r]\nurl = "https://x"\nexclude_titles = [""]\n', 'exclude_titles for feed "r" .* must be a list'),
+        ('[feeds.r]\nurl = "https://x"\nexclude_titles = [3]\n', 'exclude_titles for feed "r" .* must be a list'),
+        (
+            "[feeds.r]\nurl = \"https://x\"\nexclude_titles = ['^About', '^About (.+ - Reuters$']\n",
+            r"exclude_titles for feed \"r\" .*: '\^About \(\.\+ - Reuters\$' is not a valid regular expression "
+            r"\(missing \), unterminated subpattern",
+        ),
         ("[feeds\n", "is not valid TOML"),
     ],
 )
@@ -428,6 +436,22 @@ def test_feed_title_dedup_and_languages_can_be_set(tmp_path):
     assert anything.languages == ()
 
 
+def test_feed_exclude_titles_are_compiled(tmp_path):
+    text = (
+        '[feeds.reuters]\nurl = "https://r.example.com"\n'
+        "exclude_titles = ['^About .+ \\(\\w+\\.\\w+\\) - Reuters$', '(?i)stock price', '(?i)stock price']\n\n"
+        '[feeds.plain]\nurl = "https://p.example.com"\n'
+    )
+    reuters, plain = load_feeds(_write(tmp_path, text, "feeds.toml"))
+    assert [pattern.pattern for pattern in reuters.exclude_titles] == [
+        r"^About .+ \(\w+\.\w+\) - Reuters$",
+        "(?i)stock price",  # duplicates once
+    ]
+    assert reuters.exclude_titles[0].search("About SUBARU CORPORATION (FUH0y.D) - Reuters")
+    assert reuters.exclude_titles[1].search("(GISC.N) | Stock Price & Latest News - Reuters")
+    assert plain.exclude_titles == ()
+
+
 def test_a_missing_feed_list_is_reported(tmp_path):
     with pytest.raises(ConfigError, match="Feed list not found"):
         load_feeds(tmp_path / "nope.toml")
@@ -440,6 +464,24 @@ def test_the_shipped_feed_list_loads():
     assert len({feed.key for feed in feeds}) == len(feeds)
     # Only the SEC feed repeats formulaic titles for different items.
     assert [feed.key for feed in feeds if not feed.dedup_titles] == ["sec-8k-filings"]
+    # Reuters via Google News: profile and quote pages go, news stays (titles seen live on 2026-09-27).
+    [reuters] = [feed for feed in feeds if feed.key == "reuters-business"]
+    pages = [
+        "About Sumitomo Forestry Co., Ltd. (SMFSY.PK) - Reuters",
+        "About Pictet Icav - Pictet AI Enhanced World ex US Equity UCITS ETF - USD Acc (PQXU.DE) - Reuters",
+        "(GISC.N) | Stock Price & Latest News - Reuters",
+        "JGPD.DE - Reuters",
+    ]
+    news = [
+        "Armani open to more than one investor for sale of 15% stake, CEO says - Reuters",
+        "Barrick Mining reaches deal with unions at Mali gold mine, easing strike threat - Reuters",
+        "China weighs allowing ByteDance, Alibaba to buy new Nvidia chips, The Information reports - Reuters",
+    ]
+    assert all(any(p.search(title) for p in reuters.exclude_titles) for title in pages)
+    assert not any(p.search(title) for p in reuters.exclude_titles for title in news)
+    # The Greek feeds keep Greek and English items (some Greek sites call their feed English).
+    greek = [feed for feed in feeds if feed.category == "greece"]
+    assert len(greek) >= 5 and all(feed.languages == ("el", "en") and not feed.enabled for feed in greek)
 
 
 def test_the_shipped_scanner_config_spells_out_the_defaults():

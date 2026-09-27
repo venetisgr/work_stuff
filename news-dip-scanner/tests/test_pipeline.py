@@ -30,6 +30,7 @@ from dip_scanner.pipeline import CycleResult, Scanner, alert_subject, seconds_un
 from dip_scanner.prices import PriceError, YahooPrices
 from dip_scanner.report import render_markdown
 from dip_scanner.store import Store
+from dip_scanner.symbols import SEARCH_URLS, SymbolResolver
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # The fixture chart's last session closed at 20:00 UTC on 2026-09-25 (AMD -10% on the day); its articles are from
@@ -155,6 +156,7 @@ def build(tmp_path):
         sec_user_agent: str | None = SEC_AGENT,
         feeds: list[Feed] | None = None,
         notify: bool = True,
+        symbols: bool = False,
     ) -> Scanner:
         session = session if session is not None else FakeSession(routes())
         settings = Settings(data_dir=tmp_path / "data", sec_user_agent=sec_user_agent)
@@ -177,11 +179,43 @@ def build(tmp_path):
             notifiers=[FakeNotifier()] if notifiers is None else notifiers,
             session=session,
             notify=notify,
+            symbols=SymbolResolver(session, store) if symbols else None,
         )
 
     yield factory
     for store in stores:
         store.close()
+
+
+def test_a_cycle_finds_the_current_symbol_of_a_triage_symbol_without_prices(build, monkeypatch):
+    """The triage gave XMD (no prices) for Advanced Micro Devices: Yahoo's search finds AMD, whose dip is analysed
+    with the news of both symbols."""
+    monkeypatch.setitem(
+        TRIAGE_RULES, "AMD shares slide", [company("XMD", "Advanced Micro Devices", "direct", "negative", 4)]
+    )
+    search = {
+        "quotes": [
+            {"symbol": "AMD", "exchange": "NMS", "quoteType": "EQUITY", "longname": "Advanced Micro Devices, Inc."},
+        ]
+    }
+    session = FakeSession({**routes(), SEARCH_URLS[0]: search})
+    scanner = build(session=session, symbols=True)
+
+    result = scanner.run_cycle(CYCLE)
+
+    [opp] = result.opportunities
+    assert opp.ticker == "AMD" and len(opp.article_ids) == 2
+    assert "AMD shares slide after weak data-center guidance" in [headline["title"] for headline in opp.headlines]
+    assert (
+        "Symbol renamed/resolved via Yahoo search (the triage's symbol has no prices): XMD -> AMD "
+        "(Advanced Micro Devices, Inc.)" in result.notes
+    )
+    assert scanner.store.ticker_valid("XMD", now=CYCLE) is False
+    assert scanner.store.resolved_symbol("XMD", now=CYCLE)[0] == "AMD"
+    searches = [call["params"]["q"] for call in session.calls if call["url"] == SEARCH_URLS[0]]
+    # BA and NVDA have no prices in this fake either; the search's only answer (AMD) doesn't carry their names.
+    assert sorted(searches) == ["Advanced Micro Devices", "Boeing", "Nvidia"]
+    assert scanner.store.resolved_symbol("BA", now=CYCLE) is None
 
 
 # --- a full cycle --------------------------------------------------------------------------------------------------
@@ -600,6 +634,19 @@ def test_analyze_ticker_without_prices_raises_price_error(build):
     scanner = build()
     with pytest.raises(PriceError):
         scanner.analyze_ticker("NOSUCH", now=CYCLE)
+
+
+def test_analyze_ticker_names_the_symbol_that_replaces_one_without_prices(build):
+    scanner = build(symbols=True)
+    scanner.store.save_symbol_lookup("OPAP.AT", "Allwyn", "ALWN.AT", "Allwyn AG", checked=CYCLE - timedelta(days=1))
+
+    with pytest.raises(
+        PriceError, match=r"finds ALWN\.AT \(Allwyn AG\) for Allwyn: try `dip-scanner analyze ALWN\.AT`"
+    ):
+        scanner.analyze_ticker("OPAP.AT", now=CYCLE)
+    with pytest.raises(PriceError) as error:  # nothing known, no stored news to search for: the plain error
+        scanner.analyze_ticker("NOSUCH", now=CYCLE)
+    assert "try" not in str(error.value)
 
 
 # --- housekeeping --------------------------------------------------------------------------------------------------

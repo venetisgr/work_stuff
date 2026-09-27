@@ -291,6 +291,8 @@ def test_run_does_one_cycle_and_prints_the_summary(workdir, web, models, capsys)
     report = workdir / "data" / "reports" / "2026-09-25" / "203000-opportunities.md"
     assert f"Report: {report}" in out and report.exists()
     assert any("companyfacts" in url for url in web.urls)  # SEC fundamentals were used
+    # BA and NVDA have no prices in the fixtures: the scanner looked for a new symbol by company name.
+    assert any(url.endswith("/v1/finance/search") for url in web.urls)
     with store_at(workdir) as store:
         [opp] = store.opportunities()
         # --no-notify: shown here, and not pushed by a later notifying run either.

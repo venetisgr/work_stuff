@@ -7,12 +7,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
-from conftest import NOW, make_article, make_impact, make_opportunity, make_stats
+from conftest import NOW, FakeSession, make_article, make_impact, make_opportunity, make_stats
 
 from dip_scanner.config import DipConfig, ScanConfig, ScannerConfig, UniverseConfig
 from dip_scanner.detect import dip_reasons, select_candidates, severity
 from dip_scanner.models import Article, Impact, PriceStats
 from dip_scanner.prices import PriceError
+from dip_scanner.store import Store
+from dip_scanner.symbols import SEARCH_URLS, SymbolResolver
 
 NO_DIP = {"change_1d_pct": -1.0, "change_5d_pct": -2.0, "drawdown_20d_pct": -4.0}
 
@@ -598,3 +600,160 @@ def test_the_same_news_on_the_same_prices_is_not_analysed_again_after_the_cooldo
         now=FRIDAY_CLOSE + timedelta(hours=2),
     )
     assert candidate.ticker == "AMD"
+
+
+# --- renamed symbols -----------------------------------------------------------------------------------------------
+
+ALLWYN_SEARCH = {
+    "quotes": [
+        {
+            "symbol": "ALWN.AT",
+            "exchange": "ATH",
+            "quoteType": "EQUITY",
+            "shortname": "Allwyn AG",
+            "longname": "Allwyn AG",
+        },
+        {
+            "symbol": "GOFPY",
+            "exchange": "PNK",
+            "quoteType": "EQUITY",
+            "shortname": "Allwyn AG",
+            "longname": "Allwyn AG",
+        },
+    ]
+}
+RENAMED = "Symbol renamed/resolved via Yahoo search (the triage's symbol has no prices): OPAP.AT -> ALWN.AT (Allwyn AG)"
+
+
+def resolver(route=None) -> tuple[SymbolResolver, FakeSession]:
+    session = FakeSession({SEARCH_URLS[0]: ALLWYN_SEARCH if route is None else route, SEARCH_URLS[1]: 503})
+    return SymbolResolver(session, Store(":memory:")), session
+
+
+def allwyn(**overrides) -> PriceStats:
+    return make_stats(ticker="ALWN.AT", name="Allwyn AG", currency="EUR", price=11.84, **overrides)
+
+
+def test_a_symbol_without_prices_is_resolved_by_company_name_and_its_news_moves_over():
+    """Regression (live): the triage wrote OPAP.AT, the symbol before OPAP became Allwyn AG (ALWN.AT); Yahoo has no
+    prices for it, so the ticker was marked invalid for a week and the story was lost."""
+    impacts = [news("OPAP.AT", company="Allwyn", hours_ago=2)]
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    store = FakeStore()
+    symbols, session = resolver()
+
+    candidates, notes = select_candidates(impacts, prices, store, config(), now=NOW, symbols=symbols)
+
+    [candidate] = candidates
+    assert candidate.ticker == "ALWN.AT" and candidate.company == "Allwyn AG"
+    assert [(impact.ticker, article) for impact, article in candidate.impacts] == [("ALWN.AT", impacts[0][1])]
+    assert notes == [RENAMED]
+    assert prices.tickers == ["OPAP.AT", "ALWN.AT"]
+    assert store.marked == [("OPAP.AT", False, NOW), ("ALWN.AT", True, NOW)]
+    assert [call["params"]["q"] for call in session.calls] == ["Allwyn"]
+
+    # The next cycle takes the replacement from the store: no price request for OPAP.AT, no search.
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    [candidate], notes = select_candidates(impacts, prices, store, config(), now=NOW, symbols=symbols)
+    assert candidate.ticker == "ALWN.AT" and notes == [RENAMED]
+    assert prices.tickers == ["ALWN.AT"] and len(session.calls) == 1
+
+
+def test_news_under_the_old_and_the_new_symbol_ends_up_in_one_candidate():
+    new = news("ALWN.AT", company="Allwyn", hours_ago=1, magnitude=1)  # alone, too small to qualify
+    old = news("OPAP.AT", company="Allwyn", hours_ago=3, title="Allwyn cuts its outlook")
+    same = (replace(old[0], ticker="ALWN.AT"), old[1])  # the same article filed under both symbols
+    symbols, _ = resolver()
+
+    candidates, notes = select_candidates(
+        [new, same, old], FakePrices({"ALWN.AT": allwyn()}), FakeStore(), config(), now=NOW, symbols=symbols
+    )
+
+    [candidate] = candidates
+    assert candidate.ticker == "ALWN.AT"
+    assert [article.title for _, article in candidate.impacts] == ["Allwyn cuts its outlook"]  # once
+    # ALWN.AT was looked at first (one magnitude-1 article: no qualifying news) and again with OPAP.AT's news:
+    # only the second outcome is noted.
+    assert notes == [RENAMED]
+
+    # When the old symbol comes first, its news waits for the new one's turn.
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    newer = news("ALWN.AT", company="Allwyn", hours_ago=1)
+    [candidate], notes = select_candidates([old, newer], prices, FakeStore(), config(), now=NOW, symbols=resolver()[0])
+    assert candidate.impacts == [newer, (replace(old[0], ticker="ALWN.AT"), old[1])] and notes == [RENAMED]
+    assert prices.tickers == ["OPAP.AT", "ALWN.AT"]  # looked at once
+
+
+def test_the_replacement_goes_through_every_filter_and_isnt_replaced_in_turn():
+    impacts = [news("OPAP.AT", company="Allwyn")]
+    symbols, session = resolver()
+
+    candidates, notes = select_candidates(
+        impacts, FakePrices({"ALWN.AT": allwyn(**NO_DIP)}), FakeStore(), config(), now=NOW, symbols=symbols
+    )
+    assert candidates == [] and notes[0] == RENAMED and notes[1].startswith("No dip (price not down enough): ALWN.AT")
+
+    cfg = config(universe={"exclude": ("ALWN.AT",)})
+    candidates, notes = select_candidates(impacts, FakePrices(), FakeStore(), cfg, now=NOW, symbols=resolver()[0])
+    assert candidates == [] and notes == [RENAMED, "Excluded in [universe] exclude: ALWN.AT"]
+
+    # No prices for the replacement either: noted, and no second search for it.
+    store = FakeStore()
+    symbols, session = resolver()
+    candidates, notes = select_candidates(impacts, FakePrices(), store, config(), now=NOW, symbols=symbols)
+    assert candidates == []
+    assert notes == [
+        RENAMED,
+        "No prices (unknown symbol or no data; marked invalid): ALWN.AT (No chart data for ALWN.AT)",
+    ]
+    assert [call["params"]["q"] for call in session.calls] == ["Allwyn"]
+    assert store.marked == [("OPAP.AT", False, NOW), ("ALWN.AT", False, NOW)]
+
+
+def test_a_symbol_without_prices_and_without_a_match_is_marked_invalid_with_a_note():
+    """ "OPAP" is the old name: Yahoo's search doesn't know it any more."""
+    store = FakeStore()
+    symbols, session = resolver({"quotes": []})
+
+    candidates, notes = select_candidates(
+        [news("OPAP.AT", company="OPAP")], FakePrices(), store, config(), now=NOW, symbols=symbols
+    )
+
+    assert candidates == [] and store.marked == [("OPAP.AT", False, NOW)]
+    assert notes == [
+        "No prices (unknown symbol or no data, and Yahoo search finds no listing of that company on the same "
+        "exchange; marked invalid): OPAP.AT (No chart data for OPAP.AT)"
+    ]
+    # Marked invalid: prices aren't asked again, but a company name not searched for yet is.
+    prices = FakePrices({"ALWN.AT": allwyn()})
+    session.routes[SEARCH_URLS[0]] = ALLWYN_SEARCH
+    impacts = [news("OPAP.AT", company="OPAP", hours_ago=3), news("OPAP.AT", company="Allwyn", hours_ago=1)]
+    [candidate], notes = select_candidates(impacts, prices, store, config(), now=NOW, symbols=symbols)
+    assert candidate.ticker == "ALWN.AT" and len(candidate.impacts) == 2 and notes == [RENAMED]
+    assert prices.tickers == ["ALWN.AT"]
+    assert [call["params"]["q"] for call in session.calls] == ["OPAP", "Allwyn"]  # "OPAP" answered from the store
+
+
+def test_a_failed_search_is_retried_next_cycle():
+    store = FakeStore()
+    symbols, session = resolver(requests.ConnectionError("no network"))
+    impacts = [news("OPAP.AT", company="Allwyn")]
+
+    candidates, notes = select_candidates(impacts, FakePrices(), store, config(), now=NOW, symbols=symbols)
+
+    assert candidates == []
+    assert notes == [
+        "No prices (unknown symbol or no data; marked invalid; the Yahoo search for a new symbol failed, retried "
+        "next cycle): OPAP.AT (No chart data for OPAP.AT)"
+    ]
+    session.routes[SEARCH_URLS[0]] = ALLWYN_SEARCH
+    [candidate], notes = select_candidates(
+        impacts, FakePrices({"ALWN.AT": allwyn()}), store, config(), now=NOW, symbols=symbols
+    )
+    assert candidate.ticker == "ALWN.AT" and notes == [RENAMED]
+
+
+def test_without_a_resolver_nothing_is_searched():
+    candidates, notes = select([news("OPAP.AT", company="Allwyn")], FakePrices({"ALWN.AT": allwyn()}))
+    assert candidates == []
+    assert notes == ["No prices (unknown symbol or no data; marked invalid): OPAP.AT (No chart data for OPAP.AT)"]

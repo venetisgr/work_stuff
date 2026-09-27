@@ -25,9 +25,10 @@ from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError, Usage
 from .models import Candidate, Feed, ModelUsage, Opportunity, utc
 from .notices import FEEDS_FAILING, MODEL_UNAVAILABLE, one_line, secrets_of, send_notice
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
-from .prices import YahooPrices
+from .prices import PriceError, YahooPrices
 from .report import format_price, format_when, render_html, render_markdown, verdict_label, write_reports
 from .store import Store
+from .symbols import Resolution, SymbolResolver
 from .triage import normalise_ticker, triage
 
 log = logging.getLogger(__name__)
@@ -165,6 +166,7 @@ class Scanner:
         session,
         notify: bool = True,
         clock: Callable[[], datetime] = _now,
+        symbols: SymbolResolver | None = None,
     ) -> None:
         self.settings = settings
         self.config = config
@@ -177,6 +179,7 @@ class Scanner:
         self.session = session
         self.notify = notify
         self._clock = clock
+        self.symbols = symbols  # finds the new symbol of a renamed company (None: tickers without prices are skipped)
         self.user_agents = {"sec.gov": settings.sec_user_agent}
         self.feeds = [feed for feed in feeds if feed.enabled and self._can_fetch(feed)]
         self._last_prune: datetime | None = None
@@ -274,7 +277,13 @@ class Scanner:
 
         recent = self.store.recent_impacts(now - timedelta(hours=scan.lookback_hours))
         candidates, notes = select_candidates(
-            recent, self.prices, self.store, self.config, now=now, waiting=lambda ticker: self._waiting(ticker, now)
+            recent,
+            self.prices,
+            self.store,
+            self.config,
+            now=now,
+            waiting=lambda ticker: self._waiting(ticker, now),
+            symbols=self.symbols,
         )
         result.notes.extend(notes)
         candidates = self._daily_limit(candidates, now, result)
@@ -625,14 +634,24 @@ class Scanner:
 
         Uses the ticker's stored impacts from the [scan] lookback window plus fresh per-ticker headlines (always
         fetched here, whatever [scan] context_news says). Raises PriceError / PriceFetchError when there are no
-        prices, LLMError when the model's reply is unusable.
+        prices, LLMError when the model's reply is unusable. A PriceError names the symbol that replaces this one
+        when the scanner found one (see symbols.py), e.g. "try `dip-scanner analyze ALWN.AT`" for OPAP.AT.
         """
         now = utc(now) if now is not None else utc(self._clock())
         symbol = normalise_ticker(ticker) or ticker.strip().upper()
-        stats = self.prices.stats(symbol, now=now)
         since = now - timedelta(hours=self.config.scan.lookback_hours)
         impacts = [(impact, article) for impact, article in self.store.recent_impacts(since) if impact.ticker == symbol]
         names = Counter(impact.company for impact, _ in impacts if impact.company)
+        try:
+            stats = self.prices.stats(symbol, now=now)
+        except PriceError as exc:
+            found = self._replacement(symbol, [name for name, _ in names.most_common()], now)
+            if found is None:
+                raise
+            raise PriceError(
+                f"{exc} Yahoo's search finds {found.symbol} ({found.name}) for {found.query}: try "
+                f"`dip-scanner analyze {found.symbol}`."
+            ) from exc
         company = (stats.name or "").strip() or (names.most_common(1)[0][0] if names else symbol)
         candidate = Candidate(
             ticker=symbol,
@@ -643,6 +662,17 @@ class Scanner:
             severity=severity(stats, impacts),
         )
         return self._analyze(candidate, now, context_news=True)
+
+    def _replacement(self, symbol: str, companies: list[str], now: datetime) -> Resolution | None:
+        """The symbol found for one without prices: remembered from a scan cycle, or searched for by the company
+        names the triage gave it. None when there is no resolver, nothing matches or the search fails."""
+        if self.symbols is None:
+            return None
+        try:
+            return self.symbols.known(symbol, now=now) or self.symbols.resolve(symbol, companies, now=now)
+        except Exception as exc:  # only a hint: the price error is what counts
+            log.debug("Couldn't look up a new symbol for %s: %s", symbol, exc)
+            return None
 
 
 _NOT_ADVICE = "Not investment advice; check before placing or cancelling any order."

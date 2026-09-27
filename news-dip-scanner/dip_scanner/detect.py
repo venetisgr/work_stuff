@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import logging
 import math
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -18,10 +19,12 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from .config import DipConfig, ScannerConfig
 from .models import Article, Candidate, Impact, Opportunity, PriceStats, utc
 from .prices import PriceError
+from .symbols import Resolution, SymbolSearchError
 
 if TYPE_CHECKING:
     from .prices import YahooPrices
     from .store import Store
+    from .symbols import SymbolResolver
 
 log = logging.getLogger(__name__)
 
@@ -126,16 +129,32 @@ def _impact_weight(impact: Impact) -> float:
 
 
 class _Notes:
-    """Skip notes grouped by reason: one line per reason naming every ticker it applied to, in first-seen order."""
+    """Skip notes grouped by reason: one line per reason naming every ticker it applied to, in first-seen order.
+
+    Each item belongs to the ticker being looked at when it was added (owner). When a ticker is looked at again (news
+    from its old symbol was handed to it), forget() takes back what was noted about it the first time.
+    """
 
     def __init__(self) -> None:
-        self._groups: dict[str, list[str]] = {}
+        self._groups: dict[str, list[tuple[str | None, str]]] = {}
+        self.owner: str | None = None
 
     def add(self, reason: str, item: str) -> None:
-        self._groups.setdefault(reason, []).append(item)
+        self._groups.setdefault(reason, []).append((self.owner, item))
+
+    def forget(self, owner: str) -> None:
+        for reason in list(self._groups):
+            kept = [entry for entry in self._groups[reason] if entry[0] != owner]
+            if kept:
+                self._groups[reason] = kept
+            else:
+                del self._groups[reason]
 
     def lines(self) -> list[str]:
-        return [f"{reason}: {', '.join(items)}" for reason, items in self._groups.items()]
+        return [f"{reason}: {', '.join(item for _, item in items)}" for reason, items in self._groups.items()]
+
+
+_RENAMED = "Symbol renamed/resolved via Yahoo search (the triage's symbol has no prices)"
 
 
 def select_candidates(
@@ -146,6 +165,7 @@ def select_candidates(
     *,
     now: datetime,
     waiting: Callable[[str], str | None] | None = None,
+    symbols: SymbolResolver | None = None,
 ) -> tuple[list[Candidate], list[str]]:
     """Candidates sorted by severity (highest first, capped per cycle) and notes about every ticker left out.
 
@@ -161,6 +181,11 @@ def select_candidates(
        pipeline's backoff); such tickers are skipped here, before the cap, so they don't take a place.
     6. Tickers the store marks invalid (no prices recently) are skipped without asking for prices. When the price
        source raises PriceError the ticker is marked invalid; other errors (network) are noted but don't mark it.
+       With symbols (a SymbolResolver), a ticker without prices is first looked up by the company names the triage
+       gave for it (Yahoo's search, same exchange, see symbols.py): the model may know an old symbol (OPAP.AT for
+       Allwyn, now ALWN.AT). When a listing is found, the ticker's news moves to that symbol, which then goes
+       through these steps like any other (a note says "OPAP.AT -> ALWN.AT"); a replacement found in the last 7
+       days applies before step 2. A symbol found this way isn't replaced in turn.
     7. Instruments that aren't company shares (Yahoo's instrumentType ETF, MUTUALFUND, INDEX...) are skipped and
        marked invalid; so are prices below [universe] min_price (in the currency's main unit: pence, cents and
        agorot quotes are divided by 100) and prices that don't pass dip_reasons.
@@ -175,10 +200,8 @@ def select_candidates(
     this news came out after the last session.
     """
     now = utc(now)
-    scan, dip, universe = cfg.scan, cfg.dip, cfg.universe
+    scan = cfg.scan
     notes = _Notes()
-    watchlist = set(universe.watchlist)
-    excluded = set(universe.exclude)
     since = now - timedelta(hours=scan.lookback_hours)
 
     by_ticker: dict[str, list[tuple[Impact, Article]]] = {}
@@ -199,100 +222,162 @@ def select_candidates(
                 f"No news in the last {_hours(scan.lookback_hours)} ([scan] lookback_hours)",
                 f"{ticker} ({count} older)",
             )
+    with_news = len(by_ticker)
 
-    candidates: list[Candidate] = []
-    for ticker, group in by_ticker.items():
-        if ticker in excluded:
-            notes.add("Excluded in [universe] exclude", ticker)
-            continue
-        if universe.only_watchlist and ticker not in watchlist:
-            notes.add("Not on the watchlist ([universe] only_watchlist)", ticker)
-            continue
-        if universe.allowed_suffixes is not None and _suffix(ticker) not in universe.allowed_suffixes:
-            allowed = ", ".join(repr(suffix) for suffix in universe.allowed_suffixes) or "none"
-            notes.add(f"Exchange not in [universe] allowed_suffixes ({allowed})", ticker)
-            continue
-
-        qualifying, rejected = _qualifying(group, dip, on_watchlist=ticker in watchlist)
-        if not qualifying:
-            notes.add("No qualifying news ([dip] filters)", f"{ticker} ({'; '.join(rejected)})")
-            continue
-        qualifying.sort(key=lambda pair: (utc(pair[1].published), utc(pair[1].fetched)), reverse=True)
-
-        stats: PriceStats | None = None
-        wanted = scan.cooldown_hours > 0 or scan.reanalyse_same_session_hours > 0
-        last = store.last_opportunity(ticker) if wanted else None
-        if (cooldown := _cooldown(ticker, qualifying, last, scan.cooldown_hours, now)) is not None:
-            reacted = False
-            if last is not None and last.news_after_session:  # analysed before its news could move the price
-                stats = _stats(ticker, prices, store, notes, now)
-                if stats is None:
-                    continue
-                moved = abs(stats.change_1d_pct) >= dip.min_drop_1d_pct - _EPSILON  # the market's answer to it
-                reacted = session_day(stats) > session_day(last.stats) and moved
-            if not reacted:
-                notes.add(f"Analysed within the {_hours(scan.cooldown_hours)} cooldown, no new news since", cooldown)
+    replacements: set[str] = set()  # symbols found for a ticker without prices; never replaced in turn
+    if symbols is not None:
+        for ticker in list(by_ticker):
+            if store.ticker_valid(ticker, now=now) is True:
                 continue
+            found = _known(symbols, ticker, now)
+            if found is not None:
+                notes.add(_RENAMED, f"{ticker} -> {found.symbol} ({found.name})")
+                _hand_over(by_ticker, ticker, found.symbol)
+                replacements.add(found.symbol)
 
-        if waiting is not None and (why := waiting(ticker)) is not None:
-            notes.add("Analysis failed recently, waiting before trying again", why)
-            continue
-
-        if stats is None:
-            stats = _stats(ticker, prices, store, notes, now)
-        if stats is None:
-            continue
-        if stats.instrument_type is not None and stats.instrument_type not in _EQUITY_TYPES:
-            store.set_ticker_valid(ticker, False, checked=now)
-            notes.add("Not a company's shares (a fund, index or other instrument; marked invalid)", ticker)
-            continue
-        if major_units(stats.price, stats.currency) < universe.min_price:
-            notes.add(
-                f"Price below [universe] min_price {universe.min_price:g}",
-                f"{ticker} ({_money(stats.price)} {stats.currency})",
-            )
-            continue
-        reasons = dip_reasons(stats, dip, now=now)
-        if not reasons:
-            notes.add("No dip (price not down enough)", f"{ticker} ({_moves(stats)})")
-            continue
-        if (wait := _same_session(ticker, stats, last, qualifying, cfg, now)) is not None:
-            notes.add(*wait)
-            continue
-        unpriced = news_after_session(stats, qualifying)
-        if unpriced:
-            reasons.append(f"all of this news came out after the last session ({session_day(stats):%a %d %b})")
-        candidates.append(
-            Candidate(
-                ticker=ticker,
-                company=_company(stats, qualifying),
-                stats=stats,
-                impacts=qualifying,
-                dip_reasons=reasons,
-                severity=severity(stats, qualifying),
-                news_after_session=unpriced,
-            )
+    candidates: dict[str, Candidate] = {}
+    queue = deque(by_ticker)
+    while queue:
+        ticker = queue.popleft()
+        notes.forget(ticker)  # looked at again with more news: only the latest outcome counts
+        candidates.pop(ticker, None)
+        notes.owner = ticker
+        outcome = _evaluate(
+            ticker,
+            by_ticker[ticker],
+            prices,
+            store,
+            cfg,
+            notes,
+            now,
+            waiting=waiting,
+            symbols=None if ticker in replacements else symbols,
         )
+        notes.owner = None
+        if isinstance(outcome, Candidate):
+            candidates[ticker] = outcome
+        elif isinstance(outcome, Resolution):
+            notes.add(_RENAMED, f"{ticker} -> {outcome.symbol} ({outcome.name})")
+            _hand_over(by_ticker, ticker, outcome.symbol)
+            replacements.add(outcome.symbol)
+            if outcome.symbol not in queue:
+                queue.append(outcome.symbol)
 
-    candidates.sort(key=lambda candidate: (-candidate.severity, candidate.ticker))
+    ranked = sorted(candidates.values(), key=lambda candidate: (-candidate.severity, candidate.ticker))
     limit = max(0, scan.max_candidates_per_cycle)
-    for candidate in candidates[limit:]:
+    for candidate in ranked[limit:]:
         notes.add(
             f"Over the limit of {limit} candidates per cycle ([scan] max_candidates_per_cycle), "
             "left for the next cycle",
             f"{candidate.ticker} (severity {candidate.severity:.1f})",
         )
-    selected = candidates[:limit]
+    selected = ranked[:limit]
     lines = notes.lines()
     for line in lines:
         log.debug("%s", line)
     log.info(
         "%d candidate(s) from %d ticker(s) with news in the last %s.",
         len(selected),
-        len(by_ticker),
+        with_news,
         _hours(scan.lookback_hours),
     )
     return selected, lines
+
+
+def _evaluate(
+    ticker: str,
+    group: list[tuple[Impact, Article]],
+    prices: YahooPrices,
+    store: Store,
+    cfg: ScannerConfig,
+    notes: _Notes,
+    now: datetime,
+    *,
+    waiting: Callable[[str], str | None] | None,
+    symbols: SymbolResolver | None,
+) -> Candidate | Resolution | None:
+    """One ticker through steps 2-8 of select_candidates: a Candidate, a Resolution when the ticker has no prices
+    and Yahoo's search found the company under another symbol, or None (with a note saying why)."""
+    scan, dip, universe = cfg.scan, cfg.dip, cfg.universe
+    if ticker in universe.exclude:
+        notes.add("Excluded in [universe] exclude", ticker)
+        return None
+    if universe.only_watchlist and ticker not in universe.watchlist:
+        notes.add("Not on the watchlist ([universe] only_watchlist)", ticker)
+        return None
+    if universe.allowed_suffixes is not None and _suffix(ticker) not in universe.allowed_suffixes:
+        allowed = ", ".join(repr(suffix) for suffix in universe.allowed_suffixes) or "none"
+        notes.add(f"Exchange not in [universe] allowed_suffixes ({allowed})", ticker)
+        return None
+
+    qualifying, rejected = _qualifying(group, dip, on_watchlist=ticker in universe.watchlist)
+    if not qualifying:
+        notes.add("No qualifying news ([dip] filters)", f"{ticker} ({'; '.join(rejected)})")
+        return None
+    qualifying.sort(key=lambda pair: (utc(pair[1].published), utc(pair[1].fetched)), reverse=True)
+
+    stats: PriceStats | Resolution | None = None
+    wanted = scan.cooldown_hours > 0 or scan.reanalyse_same_session_hours > 0
+    last = store.last_opportunity(ticker) if wanted else None
+    if (cooldown := _cooldown(ticker, qualifying, last, scan.cooldown_hours, now)) is not None:
+        reacted = False
+        if last is not None and last.news_after_session:  # analysed before its news could move the price
+            stats = _stats(ticker, group, prices, store, notes, now, symbols)
+            if not isinstance(stats, PriceStats):
+                return stats
+            moved = abs(stats.change_1d_pct) >= dip.min_drop_1d_pct - _EPSILON  # the market's answer to it
+            reacted = session_day(stats) > session_day(last.stats) and moved
+        if not reacted:
+            notes.add(f"Analysed within the {_hours(scan.cooldown_hours)} cooldown, no new news since", cooldown)
+            return None
+
+    if waiting is not None and (why := waiting(ticker)) is not None:
+        notes.add("Analysis failed recently, waiting before trying again", why)
+        return None
+
+    if stats is None:
+        stats = _stats(ticker, group, prices, store, notes, now, symbols)
+    if not isinstance(stats, PriceStats):
+        return stats
+    if stats.instrument_type is not None and stats.instrument_type not in _EQUITY_TYPES:
+        store.set_ticker_valid(ticker, False, checked=now)
+        notes.add("Not a company's shares (a fund, index or other instrument; marked invalid)", ticker)
+        return None
+    if major_units(stats.price, stats.currency) < universe.min_price:
+        notes.add(
+            f"Price below [universe] min_price {universe.min_price:g}",
+            f"{ticker} ({_money(stats.price)} {stats.currency})",
+        )
+        return None
+    reasons = dip_reasons(stats, dip, now=now)
+    if not reasons:
+        notes.add("No dip (price not down enough)", f"{ticker} ({_moves(stats)})")
+        return None
+    if (wait := _same_session(ticker, stats, last, qualifying, cfg, now)) is not None:
+        notes.add(*wait)
+        return None
+    unpriced = news_after_session(stats, qualifying)
+    if unpriced:
+        reasons.append(f"all of this news came out after the last session ({session_day(stats):%a %d %b})")
+    return Candidate(
+        ticker=ticker,
+        company=_company(stats, qualifying),
+        stats=stats,
+        impacts=qualifying,
+        dip_reasons=reasons,
+        severity=severity(stats, qualifying),
+        news_after_session=unpriced,
+    )
+
+
+def _hand_over(by_ticker: dict[str, list[tuple[Impact, Article]]], old: str, new: str) -> None:
+    """Move old's news to new, the symbol that replaces it (each article once, the impacts relabelled)."""
+    group = by_ticker.setdefault(new, [])
+    have = {article.id for _, article in group}
+    for impact, article in by_ticker.pop(old):
+        if article.id not in have:
+            have.add(article.id)
+            group.append((replace(impact, ticker=new), article))
 
 
 def _qualifying(
@@ -399,17 +484,41 @@ def _same_session(
     return None
 
 
-def _stats(ticker: str, prices: YahooPrices, store: Store, notes: _Notes, now: datetime) -> PriceStats | None:
-    """The ticker's price statistics, or None (with a note) when there are none."""
+def _stats(
+    ticker: str,
+    group: list[tuple[Impact, Article]],
+    prices: YahooPrices,
+    store: Store,
+    notes: _Notes,
+    now: datetime,
+    symbols: SymbolResolver | None,
+) -> PriceStats | Resolution | None:
+    """The ticker's price statistics, or None (with a note) when there are none; with symbols, a Resolution instead
+    when the ticker has no prices and Yahoo's search finds the company under another symbol."""
     valid = store.ticker_valid(ticker, now=now)
     if valid is False:
-        notes.add("No prices (marked invalid, rechecked after 7 days)", ticker)
+        found, failed = _resolve(symbols, ticker, group, now)
+        if found is not None:
+            return found
+        detail = " (the Yahoo search for a new symbol failed, retried next cycle)" if failed else ""
+        notes.add("No prices (marked invalid, rechecked after 7 days)", f"{ticker}{detail}")
         return None
     try:
         stats = prices.stats(ticker, now=now)
     except PriceError as exc:
         store.set_ticker_valid(ticker, False, checked=now)
-        notes.add("No prices (unknown symbol or no data; marked invalid)", f"{ticker} ({_short(exc)})")
+        found, failed = _resolve(symbols, ticker, group, now)
+        if found is not None:
+            return found
+        if symbols is None:
+            reason = "No prices (unknown symbol or no data; marked invalid)"
+        elif failed:
+            reason = "No prices (unknown symbol or no data; marked invalid; the Yahoo search for a new symbol "
+            reason += "failed, retried next cycle)"
+        else:
+            reason = "No prices (unknown symbol or no data, and Yahoo search finds no listing of that company on "
+            reason += "the same exchange; marked invalid)"
+        notes.add(reason, f"{ticker} ({_short(exc)})")
         return None
     except Exception as exc:  # network trouble etc.: not the ticker's fault, try again next cycle
         log.warning("Couldn't get prices for %s: %s", ticker, exc, exc_info=log.isEnabledFor(logging.DEBUG))
@@ -418,6 +527,33 @@ def _stats(ticker: str, prices: YahooPrices, store: Store, notes: _Notes, now: d
     if valid is None:
         store.set_ticker_valid(ticker, True, checked=now)
     return stats
+
+
+def _known(symbols: SymbolResolver, ticker: str, now: datetime) -> Resolution | None:
+    """A replacement found for ticker in the last 7 days (from the store; None on any trouble)."""
+    try:
+        found = symbols.known(ticker, now=now)
+    except Exception:  # bookkeeping must not break the cycle
+        log.warning("Couldn't read the symbol lookups for %s", ticker, exc_info=True)
+        return None
+    return found if found is not None and found.symbol != ticker else None
+
+
+def _resolve(
+    symbols: SymbolResolver | None, ticker: str, group: list[tuple[Impact, Article]], now: datetime
+) -> tuple[Resolution | None, bool]:
+    """(the listing Yahoo's search finds for the company names the triage gave, whether the search failed)."""
+    if symbols is None:
+        return None, False
+    names = Counter(impact.company.strip() for impact, _ in group if impact.company.strip())
+    try:
+        found = symbols.resolve(ticker, [name for name, _ in names.most_common()], now=now)
+    except SymbolSearchError:
+        return None, True
+    except Exception:  # a bug or a database problem: this ticker is skipped, the cycle goes on
+        log.warning("Couldn't look up a new symbol for %s", ticker, exc_info=True)
+        return None, True
+    return (found if found is not None and found.symbol != ticker else None), False
 
 
 def _company(stats: PriceStats, impacts: list[tuple[Impact, Article]]) -> str:

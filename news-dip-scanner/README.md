@@ -31,18 +31,20 @@ the scores mean anything. Step 5 stays with you. Nothing here verifies the claim
  feeds.toml (20 RSS/Atom feeds)
         │  every 5 min, conditional GETs (ETag / Last-Modified)
         ▼
- poll ──► new articles (deduplicated by link and by headline; translations dropped) ──► SQLite (data/scanner.sqlite3)
-        │  only articles from the last 24 h go to the model
+ poll ──► new articles (deduplicated by link and by headline; translations and non-news pages dropped) ──► SQLite
+        │  (data/scanner.sqlite3); only articles from the last 24 h go to the model
         ▼
  triage (small model, 20 articles per request)
         │  article ─► [{ticker, relation direct|indirect, direction, magnitude 1-5, event type, rationale}]
         ▼
  candidates: tickers with negative/mixed news in the last 48 h
         │  filters: [universe], [dip] news rules, 24 h cooldown, Yahoo Finance prices
+        │  a symbol without prices is looked up by company name (renamed: OPAP.AT -> ALWN.AT)
         │  dip = down ≥3% on the day, or ≥6% over 5 days, or ≥10% below the 20-day high
         ▼
  analysis (stronger model, one request per candidate, at most 8 per cycle and 40 a day)
         │  input: price statistics + SEC quarterly figures (US) + flagged news + per-ticker headlines
+        │         (Yahoo, Google News in English and, for Athens and 5 EU exchanges, the local language)
         │  output: verdict (temporary fear / mixed / fundamental / unclear), P(higher in 6 months),
         │          potential low, entry (limit buy), target (limit sell), fear, thesis, risks, checks
         ▼
@@ -100,7 +102,7 @@ Older backlog is stored but never sent to the model. Later cycles only see what'
 | File | What's in it |
 |---|---|
 | `.env` | Secrets and service settings (see `.env.example`). Real environment variables win over it. |
-| [`feeds.toml`](feeds.toml) | The news sources: 20 enabled, plus 10 switched off (two Greek sources and eight checked alternates). Each entry notes what it covers and when it was last verified. |
+| [`feeds.toml`](feeds.toml) | The news sources: 20 enabled, plus 14 switched off (six Greek sources and eight checked alternates). Each entry notes what it covers and when it was last verified; `exclude_titles` drops headlines that aren't news (see the file's header). |
 | [`scanner.toml`](scanner.toml) | Thresholds, watchlist and alert rules. Every key is optional and the file shows the defaults; a misspelled key is an error, never silently ignored, and so is a `--config` or `SCANNER_CONFIG` file that doesn't exist. |
 
 The settings you are most likely to change in `scanner.toml`:
@@ -121,9 +123,71 @@ The settings you are most likely to change in `scanner.toml`:
 | `[alerts] system_notices` | true | Tell you through the same channels when the scanner stopped or can't work (see [Running it every 5 minutes](#running-it-every-5-minutes)). |
 | `[alerts] notice_after_cycles` | 6 | Cycles in a row with the model unavailable, or every feed failing, before such a notice. |
 
-Tickers are Yahoo Finance symbols: `AMD`, `BRK-B`, `SAP.DE`, `ASML.AS`, `OPAP.AT`, `7203.T`, `0700.HK` (in the
+Tickers are Yahoo Finance symbols: `AMD`, `BRK-B`, `SAP.DE`, `ASML.AS`, `ALWN.AT`, `7203.T`, `0700.HK` (in the
 watchlist and exclude lists `BRK.B` or `NASDAQ:TSLA` work too). Only company shares become candidates: ETFs, funds
 and indices are left out.
+
+The triage model knows the symbols of its training data, and some have changed since: OPAP became Allwyn (`OPAP.AT`
+is now `ALWN.AT`), Mytilineos became Metlen (`MYTIL.AT` is now `MTLN.AT`). When Yahoo has no prices for a symbol, the
+scanner searches Yahoo Finance for the company name the triage gave and takes a listing on the same exchange whose
+name matches (company shares only; for a symbol without a suffix, a main US exchange, not OTC). Its news moves to that
+symbol, the notes say `OPAP.AT -> ALWN.AT (Allwyn AG)`, and the answer is kept for 7 days. This needs the current
+name: Yahoo no longer finds "OPAP", so a story the model filed as "OPAP" stays unresolved (the prompt asks for the
+name the article uses). Greek or Cyrillic letters that look like Latin ones (`ΕΤΕ.ΑΤ`) are read as Latin.
+
+## Scanning Athens stocks
+
+The enabled feeds are English and mostly about US and large European companies. To cover the Athens Exchange too:
+
+1. **Feeds.** In `feeds.toml`, set `enabled = true` for the Greek sources you want. `mononews` (Athens companies,
+   banks, analyst calls) and `ot-gr` (a business daily) carry the most company news; `naftemporiki` is more
+   economy and personal finance; `newmoney`, `powergame` and `sofokleousin` add similar stories with more politics,
+   world news and sport. All six answered on 2026-09-27 (see the comments there); run `dip-scanner feeds --check`
+   from your own connection. Capital.gr refuses feed requests from cloud servers and was left out. Each enabled
+   feed adds triage requests for its non-company stories (see [Costs](#costs)).
+2. **Exchanges.** Every exchange is allowed by default. To look at US and Athens listings only, set
+   `[universe] allowed_suffixes = ["", ".AT"]` in `scanner.toml`.
+3. **Watchlist.** Any negative or mixed news about a watchlist ticker counts, however small or indirect. Current
+   Yahoo codes, each checked with `dip-scanner prices` on 2026-09-27:
+
+   ```toml
+   [universe]
+   watchlist = [
+       "ETE.AT",       # National Bank of Greece
+       "EUROB.AT",     # Eurobank
+       "TPEIR.AT",     # Piraeus Bank
+       "ALPHA.AT",     # Alpha Bank
+       "HTO.AT",       # OTE (Hellenic Telecommunications Organization)
+       "PPC.AT",       # PPC (Public Power Corporation)
+       "ALWN.AT",      # Allwyn, formerly OPAP (OPAP.AT has no prices any more)
+       "MTLN.AT",      # Metlen Energy & Metals, formerly Mytilineos (MYTIL.AT has no prices any more)
+       "BELA.AT",      # Jumbo
+       "MOH.AT",       # Motor Oil
+       "ELPE.AT",      # HELLENiQ ENERGY
+       "GEKTERNA.AT",  # GEK TERNA
+       "AKTR.AT",      # Aktor
+       "AEGN.AT",      # Aegean Airlines
+       "TITC.AT",      # Titan
+   ]
+   ```
+
+Known limits:
+
+- **No fundamentals.** They come from SEC filings, which Athens companies don't make. The analysis rests on the news
+  and the price data; the model is told that this is expected and not to lower its confidence for it, but read the
+  company's latest results before acting on a verdict.
+- **Thinner news.** Few English sources follow Athens companies, and the Greek feeds mix them with much else. The
+  per-ticker context headlines of an analysis come from Google News in Greek as well as English ("Jumbo μετοχή" for
+  BELA.AT; the same for Xetra, Paris, Milan, Madrid and Amsterdam listings in their languages), but only headlines
+  that name the company in Latin letters or its symbol are kept. Companies the Greek press calls by a Greek name
+  (ΔΕΗ for PPC, ΕΤΕ or Εθνική for National Bank of Greece) get fewer: on 2026-09-27 Jumbo and Allwyn got 15 context
+  headlines each (a few of Jumbo's about Australia's Jumbo Interactive), National Bank of Greece 8, PPC and OTE 1.
+- **Greek text.** The triage prompt says that articles can be in any language and asks for English answers,
+  symbols in Latin letters and the company's current name. The prompts haven't been tested against a live model
+  (see [Limitations](#limitations)); run `dip-scanner news` after a few cycles to see what it made of the Greek
+  stories.
+- **Alerts.** With the default `[alerts]` only confident "temporary fear" calls alert, on any exchange (see
+  [Scoring](#scoring)).
 
 ## Commands
 
@@ -240,10 +304,11 @@ All numbers below were measured on a live run (real feeds, 2026-09-27) and are e
 provider's current prices.
 
 - **Triage**: one request per cycle that has new articles, with up to 20 articles each. Every request carries a
-  fixed prompt of about 4,700 characters (about 1,200 tokens) plus about 300 characters per article, and gets a
+  fixed prompt of about 5,200 characters (about 1,300 tokens) plus about 300 characters per article, and gets a
   short JSON reply. At the 5-minute interval most requests carry only 1-3 articles (a full batch of 20 only happens
   after a backlog, about 2,500-3,000 tokens), so expect roughly 150-290 triage requests a day: the live Sunday run
-  measured 162 requests for about 440 fresh articles, about 1,400 tokens each on average. That is about 0.2-0.5
+  measured 162 requests for about 440 fresh articles, about 1,400 tokens each on average (with the prompt at 4,700
+  characters then; about 100 tokens more per request now). That is about 0.2-0.5
   million input tokens a day for triage, most of it the fixed prompt repeated every cycle; a longer
   `interval_minutes` cuts it about proportionally (15 minutes: about 96 requests a day).
 - **Analysis**: one request per candidate, about 3,500 input tokens (price block, fundamentals, up to 12,000
@@ -375,10 +440,15 @@ your open orders against them is still yours to do.
   and 12-16-week quarters of retail calendars count. Figures whose newest period is over 18 months old carry a note,
   and so does a newest quarter that ended over 200 days ago ("a later one may be missing").
 - **Triage makes mistakes**: wrong tickers, missed indirect effects, stories about a company's stock price mistaken
-  for news about the company. A reused ticker can point at a different company. Check the ticker before acting.
+  for news about the company. A reused ticker can point at a different company, and a symbol without prices is only
+  replaced when Yahoo's search finds a listing with the company's name on the same exchange (see the tickers note
+  under [Configuration](#configuration)). Check the ticker before acting.
 - **Some feeds are noisy** (Google News queries, general business news): triage filters them out, at some token
-  cost. Google News links are redirects. The per-ticker context headlines for an analysis keep only items that name
-  the company or its symbol and are at most 30 days old.
+  cost. A feed's `exclude_titles` drops known non-news pages before triage (the Reuters feed lists company, fund and
+  quote pages among the stories: 42 of 100 items on 2026-09-27). Google News links are redirects. The per-ticker
+  context headlines for an analysis keep only items that name the company (without "S.A.", "N.V.", "Inc." and the
+  like) or its symbol and are at most 30 days old; a common word as a name lets some strays in (Australia's Jumbo
+  Interactive among the headlines about Jumbo S.A.).
 - **News after the close.** A dip is often matched with news that came out after the last session (evenings,
   weekends): the drop can't be a reaction to it, unless the article only reports an earlier event or the drop itself.
   Such candidates say "all of this news came out after the last session (Fri 25 Sep)", the model is told to compare
@@ -413,7 +483,8 @@ money:
 | `The language model can't be used: ... billing or usage-limit reasons` | The provider refused the account (credit, spend limit). Articles stay pending meanwhile; fix it and start again. |
 | `sec-8k-filings` fails or is skipped | Set `SEC_USER_AGENT` to your name and email. |
 | A feed fails in `feeds --check` | Some sites block cloud IP addresses; feeds.toml notes the ones known to. Switch it off or use an alternate. |
-| `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know; it is rechecked after 7 days. |
+| `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know, and Yahoo's search found no listing with the company's name on the same exchange (or couldn't be reached: then it is asked again next cycle). The symbol is rechecked after 7 days. If you know the current symbol, add it to the watchlist. |
+| `Symbol renamed/resolved via Yahoo search ...: OPAP.AT -> ALWN.AT` | The triage's symbol has no prices and the company was found under another one, which was checked instead. If the match is wrong, add the found symbol to `[universe] exclude`. |
 | `Daily limit of 40 analyses reached ...` in the notes | `[scan] max_analyses_per_day` was used up in the last 24 hours; the named candidates are analysed once there is room. Raise it, or set 0 for no limit, if the bill allows. |
 | `Already analysed on the latest session's prices, so new news waits ...` | More news (often in the evening or at the weekend) about a ticker analysed on the same session's prices; it is analysed after the next session, 12 hours after the last analysis (`[scan] reanalyse_same_session_hours`) or when the price falls by another `min_drop_1d_pct`. |
 | A "dip-scanner stopped" notice | The reason is in it (the same message `run` prints). Fix that setting; `dip-scanner run --no-notify` checks it. |
@@ -439,11 +510,12 @@ without sleeping.
 | `cli.py` | Commands, options, exit codes |
 | `pipeline.py` | One cycle, the watch loop, manual analysis |
 | `feeds.py` | Fetching and parsing RSS/Atom, link and headline normalisation, per-ticker news |
-| `store.py` | SQLite: feed state, articles, impacts, ticker validity, opportunities, model calls, notice times |
+| `store.py` | SQLite: feed state, articles, impacts, ticker validity, symbol lookups, opportunities, model calls, notice times |
 | `triage.py` / `prompts.py` | News to affected companies (batched), and all prompt text |
 | `prices.py` | Yahoo Finance chart API and the price statistics |
 | `fundamentals.py` | SEC XBRL company facts (US filers) |
 | `detect.py` | Dip rules, severity and candidate selection |
+| `symbols.py` | The current symbol of a renamed company, from Yahoo's search by name |
 | `analyze.py` | The fear-vs-fundamentals analysis, number checks and the score |
 | `report.py` / `notify.py` | Markdown/HTML/JSON reports, the news digest, and alerts |
 | `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing), rate-limited and scrubbed |

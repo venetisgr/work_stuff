@@ -1,4 +1,4 @@
-"""SQLite persistence for feed state, articles, impacts, ticker validity and opportunities.
+"""SQLite persistence for feed state, articles, impacts, ticker validity, symbol lookups and opportunities.
 
 One connection per Store, shared between threads (check_same_thread=False) and serialised with a lock. WAL mode
 lets a second process (e.g. `dip-scanner news` while `watch` runs) read while the scanner writes. Timestamps are
@@ -29,10 +29,12 @@ TITLE_DEDUP_WINDOW = timedelta(hours=72)
 MIN_DEDUP_TITLE_WORDS = 5
 # A ticker without prices is re-checked after this long (it may have been listed or renamed since).
 INVALID_TICKER_TTL = timedelta(days=7)
+# A search for the new symbol of a ticker without prices (symbols.py) is repeated after this long.
+SYMBOL_LOOKUP_TTL = timedelta(days=7)
 ARTICLE_STATUSES = ("pending", "done", "failed", "skipped")
 _MAX_PARAMS = 500  # stay well under SQLite's bound-parameter limit in IN (...) lists
 
-SCHEMA_VERSION = 3  # 2: opportunities.alerted; 3: model_calls and system_notices
+SCHEMA_VERSION = 4  # 2: opportunities.alerted; 3: model_calls and system_notices; 4: symbol_lookups
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -74,6 +76,14 @@ CREATE TABLE IF NOT EXISTS tickers (
     ticker TEXT PRIMARY KEY,
     valid INTEGER NOT NULL,
     checked TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS symbol_lookups (
+    ticker TEXT NOT NULL,    -- a symbol without prices
+    query TEXT NOT NULL,     -- the company name searched for
+    resolved TEXT,           -- the symbol found, NULL when nothing matched
+    name TEXT,               -- Yahoo's name for it
+    checked TEXT NOT NULL,
+    PRIMARY KEY (ticker, query)
 );
 CREATE TABLE IF NOT EXISTS opportunities (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -430,6 +440,37 @@ class Store:
                 (ticker.strip().upper(), int(bool(valid)), _ts(checked)),
             )
 
+    # --- symbol lookups (symbols.py) ---
+
+    def symbol_lookup(self, ticker: str, query: str, *, now: datetime) -> tuple[str | None, str | None] | None:
+        """(symbol found or None, its name) of a search for query made for ticker in the last 7 days, else None."""
+        rows = self._query(
+            "SELECT resolved, name FROM symbol_lookups WHERE ticker = ? AND query = ? AND checked > ?",
+            (ticker.strip().upper(), query, _ts(utc(now) - SYMBOL_LOOKUP_TTL)),
+        )
+        return (rows[0]["resolved"], rows[0]["name"]) if rows else None
+
+    def save_symbol_lookup(
+        self, ticker: str, query: str, resolved: str | None, name: str | None, *, checked: datetime
+    ) -> None:
+        """Remember what a search for query found for ticker (resolved None: nothing matched)."""
+        with self._write() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO symbol_lookups (ticker, query, resolved, name, checked) VALUES (?, ?, ?, ?, ?)",
+                (ticker.strip().upper(), query, resolved.strip().upper() if resolved else None, name, _ts(checked)),
+            )
+
+    def resolved_symbol(self, ticker: str, *, now: datetime) -> tuple[str, str, str] | None:
+        """(symbol, name, query) of the newest search in the last 7 days that found a replacement for ticker."""
+        rows = self._query(
+            "SELECT resolved, name, query FROM symbol_lookups WHERE ticker = ? AND resolved IS NOT NULL "
+            "AND checked > ? ORDER BY checked DESC LIMIT 1",
+            (ticker.strip().upper(), _ts(utc(now) - SYMBOL_LOOKUP_TTL)),
+        )
+        if not rows:
+            return None
+        return rows[0]["resolved"], rows[0]["name"] or rows[0]["resolved"], rows[0]["query"]
+
     # --- opportunities ---
 
     def add_opportunity(self, opp: Opportunity) -> Opportunity:
@@ -627,8 +668,8 @@ class Store:
         """Delete articles (and their impacts) older than the given time; returns how many were deleted.
 
         An article goes once both its publication and our first sighting of it are older than older_than (so an
-        old item still listed in a feed isn't re-inserted as new every day). Model call records older than that go
-        too. Opportunities are always kept.
+        old item still listed in a feed isn't re-inserted as new every day). Model call records and symbol lookups
+        older than that go too. Opportunities are always kept.
         """
         cutoff = _ts(older_than)
         with self._write() as conn:
@@ -637,6 +678,7 @@ class Store:
             deleted = conn.execute("DELETE FROM articles WHERE published < ? AND fetched < ?", (cutoff, cutoff))
             count = deleted.rowcount
             conn.execute("DELETE FROM model_calls WHERE created < ?", (cutoff,))
+            conn.execute("DELETE FROM symbol_lookups WHERE checked < ?", (cutoff,))
         if count:
             log.info("Pruned %d article(s) older than %s", count, cutoff)
         return count

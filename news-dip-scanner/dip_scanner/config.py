@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields, replace
@@ -376,12 +377,13 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
 
 # --- feeds.toml ----------------------------------------------------------------------------------------------------
 
-_FEED_KEYS = ("name", "url", "enabled", "category", "dedup_titles", "languages")
+_FEED_KEYS = ("name", "url", "enabled", "category", "dedup_titles", "languages", "exclude_titles")
 
 
 def load_feeds(path: Path) -> list[Feed]:
     """Read the feed list: one [feeds.<key>] table per source with url and optional name, enabled, category,
-    dedup_titles (default true) and languages (default ["en"]; [] keeps every language).
+    dedup_titles (default true), languages (default ["en"]; [] keeps every language) and exclude_titles (regular
+    expressions; items whose headline matches one are dropped, see _title_patterns).
 
     Disabled feeds are returned too (with enabled=False) so they can be listed; callers skip them when fetching.
     """
@@ -425,9 +427,27 @@ def load_feeds(path: Path) -> list[Feed]:
                 category=(entry.get("category") or "").strip() or "markets",
                 dedup_titles=entry.get("dedup_titles", True),
                 languages=tuple(dict.fromkeys(item.strip().lower().replace("_", "-") for item in languages)),
+                exclude_titles=_title_patterns(entry.get("exclude_titles", []), key, path),
             )
         )
     return feeds
+
+
+def _title_patterns(value: Any, key: str, path: Path) -> tuple[re.Pattern[str], ...]:
+    """exclude_titles of a feed compiled: Python regular expressions, searched anywhere in the headline (anchor them
+    with ^ and $), case-sensitive unless they start with (?i). A pattern that doesn't compile is a ConfigError."""
+    where = f'exclude_titles for feed "{key}" in {path}'
+    if not isinstance(value, list) or not all(isinstance(item, str) and item.strip() for item in value):
+        raise ConfigError(
+            f"{where} must be a list of regular expressions, e.g. ['^About .+ - Reuters$'] (got {value!r})."
+        )
+    patterns = []
+    for item in dict.fromkeys(value):
+        try:
+            patterns.append(re.compile(item))
+        except re.error as exc:
+            raise ConfigError(f"{where}: {item!r} is not a valid regular expression ({exc}).") from None
+    return tuple(patterns)
 
 
 # --- files ---------------------------------------------------------------------------------------------------------

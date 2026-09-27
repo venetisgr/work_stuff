@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, date, datetime
 from typing import Any
@@ -65,6 +66,9 @@ class Feed:
     # Items tagged with another language (dc:language) are dropped: the wires publish machine translations of every
     # release. Lowercase codes; "en" also matches "en-us". () keeps every language.
     languages: tuple[str, ...] = ("en",)
+    # Items whose headline matches any of these (re.search) are dropped: pages that aren't news, like the "About
+    # <company> (<RIC>) - Reuters" profiles Google News lists among Reuters stories.
+    exclude_titles: tuple[re.Pattern[str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,7 +87,7 @@ class Article:
 @dataclass(frozen=True)
 class Impact:
     article_id: str
-    ticker: str  # Yahoo Finance symbol, uppercase: AMD, ASML, SAP.DE, OPAP.AT, 7203.T
+    ticker: str  # Yahoo Finance symbol, uppercase: AMD, ASML, SAP.DE, ALWN.AT, 7203.T
     company: str
     relation: str  # RELATIONS
     direction: str  # DIRECTIONS

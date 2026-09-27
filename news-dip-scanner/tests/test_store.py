@@ -463,7 +463,7 @@ def test_a_version_1_database_gets_the_alerted_column(tmp_path):
 
     with Store(path) as store:
         assert store.last_alerted("AMD") is not None
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 3
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 4
 
 
 # --- model use and system notices ----------------------------------------------------------------------------------

@@ -93,6 +93,15 @@ def articles(count: int, **overrides) -> list[Article]:
         ("sap.de", "SAP.DE"),
         ("ATH:ETE", "ETE.AT"),
         ("ETE.AT", "ETE.AT"),
+        # Greek and Cyrillic letters that look like Latin ones (regression: "ΕΤΕ.ΑΤ" copied from a Greek article
+        # looks exactly like ETE.AT and was dropped), fullwidth letters too.
+        ("\u0395\u03a4\u0395.\u0391\u03a4", "ETE.AT"),  # ΕΤΕ.ΑΤ
+        ("ετε.ατ", "ETE.AT"),
+        ("ΜΟΗ.AT", "MOH.AT"),
+        ("\u0410\u041cD", "AMD"),  # Cyrillic А and М
+        ("ＡＭＤ", "AMD"),
+        ("ΟΠΑΠ.ΑΤ", None),  # Π has no Latin twin: a Greek name is still no symbol
+        ("ΔΕΗ", None),
         ("TSE:7203", "7203.T"),
         ("TSE:SHOP", "SHOP.TO"),
         ("7203.T", "7203.T"),

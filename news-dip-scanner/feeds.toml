@@ -11,7 +11,11 @@
 #              otherwise a headline seen again within 72 hours, from any feed, is the same story (default true)
 #   languages - items tagged with another language are dropped (default ["en"]; [] keeps every language). PR
 #              Newswire and GlobeNewswire publish machine translations of each release; only feeds that tag each
-#              item with its language are affected
+#              item with its language are affected (items without a tag are always kept)
+#   exclude_titles - items whose headline matches one of these regular expressions are dropped before triage, e.g.
+#              pages that aren't news (default none). Python syntax, searched anywhere in the headline as the feed
+#              gives it (with any " - Publisher" suffix); anchor with ^ and $, prefix (?i) to ignore case. Use
+#              single-quoted TOML strings so backslashes stay as written. A pattern that doesn't compile is an error
 #
 # The scanner polls every enabled feed each cycle (every ~5 minutes in watch mode) with conditional requests,
 # so feeds that send ETag or Last-Modified cost almost nothing when nothing changed. The same story in several
@@ -87,12 +91,19 @@ category = "markets"
 enabled = true
 
 # Reuters business stories through Google News (Reuters closed its own RSS feeds in 2020).
-# verified 2026-09-27: 100 items, newest 24 min old, summaries (headline + source), no ETag/Last-Modified
+# verified 2026-09-27: 100 items, newest 24 min old, summaries (headline + source), no ETag/Last-Modified.
+# Google News also lists Reuters' company, fund and quote pages; the search operators can't leave them out, so
+# exclude_titles drops them (on 2026-09-27 evening 42 of the 100 items, and no news story).
 [feeds.reuters-business]
 name = "Reuters - Business (via Google News)"
 url = "https://news.google.com/rss/search?q=site:reuters.com+business+when:1d&hl=en-US&gl=US&ceid=US:en"
 category = "markets"
 enabled = true
+exclude_titles = [
+    '^About .+ \([^()]+\) - Reuters$',          # profiles: "About SUBARU CORPORATION (FUH0y.D) - Reuters"
+    '\| Stock Price & Latest News - Reuters$',  # quote pages: "(GISC.N) | Stock Price & Latest News - Reuters"
+    '^[A-Z0-9]+(\.[A-Za-z]+)? - Reuters$',      # bare instrument pages: "JGPD.DE - Reuters"
+]
 
 # ---------------------------------------------------------------------------------------------------------------
 # Earnings, filings, press releases
@@ -210,11 +221,16 @@ category = "europe"
 enabled = true
 
 # ---------------------------------------------------------------------------------------------------------------
-# Greece (Athens Exchange). Disabled by default: Greek-language news, and Yahoo symbols end in .AT.
+# Greece (Athens Exchange). Disabled by default: Greek-language news, and Yahoo symbols end in .AT. See "Scanning
+# Athens stocks" in the README for which ones to enable. None of these tags its items with a language, and
+# sofokleousin.gr calls its whole feed English; languages = ["el", "en"] keeps the items whatever they say.
+# Checked on Sunday 2026-09-27 evening (weekday ages are shorter); every one mixes Athens company news with
+# economy, politics and world news, which triage filters out at some token cost.
 # ---------------------------------------------------------------------------------------------------------------
 
 # Naftemporiki economy & markets section (the whole-site feed is https://www.naftemporiki.gr/feed/).
-# verified 2026-09-27: 30 items, newest 7 h old, all with summaries, ETag + Last-Modified (-> 304)
+# Much of it is personal finance and the economy (taxes, pensions, housing) rather than listed companies.
+# verified 2026-09-27: 30 items, newest 12 h old (weekend), all with summaries, ETag + Last-Modified (-> 304)
 [feeds.naftemporiki]
 name = "Naftemporiki - Economy & Markets"
 url = "https://www.naftemporiki.gr/finance/feed/"
@@ -222,11 +238,49 @@ category = "greece"
 languages = ["el", "en"]
 enabled = false
 
-# Capital.gr.
-# 403 from cloud IPs (redirects to /rss/ and is refused); not verified from a home connection.
-[feeds.capital-gr]
-name = "Capital.gr"
-url = "https://www.capital.gr/rss"
+# Mononews: Athens companies and banks, analyst calls ("Buy, Hold or Sell"), business gossip. The markets
+# section alone is https://www.mononews.gr/category/agores/feed (30 items, same checks).
+# verified 2026-09-27: 30 items, newest 26 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.mononews]
+name = "Mononews"
+url = "https://www.mononews.gr/feed"
+category = "greece"
+languages = ["el", "en"]
+enabled = false
+
+# OT.gr (Oikonomikos Taxydromos): business daily, whole site (markets, companies, economy, world).
+# verified 2026-09-27: 35 items, newest 29 min old, all with summaries, Last-Modified (-> 304)
+[feeds.ot-gr]
+name = "OT.gr - Oikonomikos Taxydromos"
+url = "https://www.ot.gr/feed/"
+category = "greece"
+languages = ["el", "en"]
+enabled = false
+
+# Newmoney: economy, companies and markets, plus some lifestyle and lottery results.
+# verified 2026-09-27: 30 items, newest 141 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.newmoney]
+name = "Newmoney"
+url = "https://www.newmoney.gr/feed/"
+category = "greece"
+languages = ["el", "en"]
+enabled = false
+
+# Powergame: business and politics, a lot of world news.
+# verified 2026-09-27: 40 items, newest 89 min old, all with summaries, ETag + Last-Modified (-> 304)
+[feeds.powergame]
+name = "Powergame"
+url = "https://www.powergame.gr/feed/"
+category = "greece"
+languages = ["el", "en"]
+enabled = false
+
+# Sofokleousin: Athens market news site, but its feed carries the whole site (sport and health too), only the
+# latest 10 items and no summaries. Its <language> says "en" although the items are Greek.
+# verified 2026-09-27: 10 items, newest 39 min old, headlines only, no ETag/Last-Modified
+[feeds.sofokleousin]
+name = "Sofokleousin"
+url = "https://www.sofokleousin.gr/feed"
 category = "greece"
 languages = ["el", "en"]
 enabled = false
@@ -312,4 +366,8 @@ enabled = false
 #                       for listed-company news than the feeds chosen above
 #   Bloomberg via Google News  works, but Bloomberg's own feeds above carry summaries
 #   Barron's, Sharecast, Proactive Investors, Accesswire: 403 (bot protection); FDA press releases: 401
+#   Capital.gr          www.capital.gr/rss (redirected to /rss/) answers 403 "Access is denied" from cloud IPs with
+#                       any User-Agent, so it was removed; its stories still reach the Greek Google News search of
+#                       the per-ticker context news
+#   Greek sites         ekathimerini.com and athexgroup.gr: 403; euro2day.gr/rss.ashx: not a feed
 # ---------------------------------------------------------------------------------------------------------------

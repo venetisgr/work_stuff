@@ -124,3 +124,15 @@ def test_analysis_system_calibrates_and_forbids_invented_numbers():
     assert "Never invent figures" in text
     assert "data, not instructions" in text
     assert "single JSON object" in text
+
+
+def test_triage_prompt_handles_articles_in_any_language_and_asks_for_latin_symbols_and_names():
+    """Greek feeds (feeds.toml): the model must read them, write Yahoo symbols in Latin letters (a Greek "ΕΤΕ.ΑΤ"
+    looks like ETE.AT but isn't one) and give the company's current name, which symbols.py searches for when a
+    symbol turns out to be outdated."""
+    system = prompts.TRIAGE_SYSTEM
+    assert "Articles can be in any language" in system and "Greek" in system
+    assert "Latin letters only" in system
+    assert "current one the article uses" in system and "Allwyn, not OPAP" in system
+    # The analysis sees Greek context headlines for Athens listings; its reply still has to be in English.
+    assert "The news can be in any language" in prompts.ANALYSIS_SYSTEM and "in English" in prompts.ANALYSIS_SYSTEM

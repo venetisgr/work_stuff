@@ -41,7 +41,18 @@ CONTACT_USER_AGENT_MISSING = (
 )
 
 YAHOO_TICKER_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
-GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl={hl}&gl={gl}&ceid={ceid}"
+# Google News editions for ticker_news, as (hl, gl, ceid, the word for "share" in that language): every listing is
+# searched in the US English edition, and listings on these exchanges (by Yahoo suffix) in the local one as well.
+GOOGLE_NEWS_ENGLISH = ("en-US", "US", "US:en", "stock")
+GOOGLE_NEWS_LOCAL = {
+    ".AT": ("el", "GR", "GR:el", "μετοχή"),
+    ".DE": ("de", "DE", "DE:de", "Aktie"),
+    ".PA": ("fr", "FR", "FR:fr", "action"),
+    ".MI": ("it", "IT", "IT:it", "azioni"),
+    ".MC": ("es", "ES", "ES:es", "acciones"),
+    ".AS": ("nl", "NL", "NL:nl", "aandeel"),
+}
 # ticker_news: context headlines older than this are left out (Google News goes back years for quiet tickers).
 MAX_CONTEXT_AGE = timedelta(days=30)
 
@@ -232,7 +243,7 @@ def parse_feed(feed: Feed, content: bytes, *, now: datetime, content_type: str |
 
     Items tagged with a language the feed isn't set up for (Feed.languages; PR Newswire and GlobeNewswire publish
     machine translations of every release, each with its own link and title) are dropped. Items without a language
-    tag are kept.
+    tag are kept. Items whose headline matches one of Feed.exclude_titles (pages that aren't news) are dropped too.
     """
     return _parse(feed, content, now=utc(now), content_type=content_type, publisher_names=False)
 
@@ -269,6 +280,8 @@ def _article(feed: Feed, entry: dict, *, now: datetime, publisher_names: bool) -
         if not summary:
             return None
         title = _truncate(summary, 150)
+    if any(pattern.search(title) for pattern in feed.exclude_titles):
+        return None
     if link:
         article_id = _sha1(link)
     elif guid:
@@ -503,22 +516,28 @@ def ticker_news(
 ) -> list[Article]:
     """Recent headlines about one ticker (Yahoo per-ticker RSS + Google News), newest first. Never raises.
 
-    Google News is searched for "<company or ticker> stock when:30d". Only headlines that are about the company are
-    kept (the title or summary names it, or its symbol; Yahoo's per-ticker feed is full of unrelated roundups) and
-    only those at most MAX_CONTEXT_AGE (30 days) old. They are deduplicated by title_key (so "AMD slides - Reuters"
-    on Google and "AMD slides" on Yahoo count once), and neither source gets more than half the places unless the
-    other has too few. Every article's source is "ticker:<SYM>"; Google News items are credited to their publisher
-    when the feed names one.
+    Google News is searched for "<company or ticker> stock when:30d" in its US English edition, and for listings on
+    the exchanges in GOOGLE_NEWS_LOCAL (Athens, Xetra, Paris, Milan, Madrid, Amsterdam) also in the local edition,
+    with the local word for "share" ("Jumbo μετοχή when:30d" in Greek for BELA.AT). Only headlines that are about the
+    company are kept (the title or summary names it, or its symbol; Yahoo's per-ticker feed is full of unrelated
+    roundups) and only those at most MAX_CONTEXT_AGE (30 days) old. They are deduplicated by title_key (so "AMD
+    slides - Reuters" on Google and "AMD slides" on Yahoo count once), and no source gets more than its share of the
+    places (half, or a third with a local edition) unless the others have too few. Every article's source is
+    "ticker:<SYM>"; Google News items are credited to their publisher when the feed names one.
     """
     now = utc(now) if now is not None else datetime.now(UTC)
     symbol = ticker.strip().upper()
     source = f"ticker:{symbol}"
-    name = _company_core(company or "") or symbol
-    query = f"{name} stock when:{MAX_CONTEXT_AGE.days}d"
-    sources = [
-        (Feed(key=source, name="Yahoo Finance", url=YAHOO_TICKER_RSS.format(symbol=quote(symbol))), False),
-        (Feed(key=source, name="Google News", url=GOOGLE_NEWS_RSS.format(query=quote_plus(query))), True),
-    ]
+    name = company_core(company or "") or symbol
+    sources = [(Feed(key=source, name="Yahoo Finance", url=YAHOO_TICKER_RSS.format(symbol=quote(symbol))), False)]
+    _, dot, suffix = symbol.rpartition(".")
+    editions = [GOOGLE_NEWS_ENGLISH]
+    if dot and (local := GOOGLE_NEWS_LOCAL.get(f".{suffix}")) is not None:
+        editions.append(local)
+    for hl, gl, ceid, word in editions:
+        query = quote_plus(f"{name} {word} when:{MAX_CONTEXT_AGE.days}d")
+        url = GOOGLE_NEWS_RSS.format(query=query, hl=hl, gl=gl, ceid=ceid)
+        sources.append((Feed(key=source, name="Google News", url=url, languages=()), True))
     about = _mentions_matcher(symbol, company)
     oldest = now - MAX_CONTEXT_AGE
 
@@ -549,19 +568,44 @@ def ticker_news(
     return chosen[:limit]
 
 
-# Legal-form words left out of a company name before looking for it in a headline.
-_LEGAL_WORDS = frozenset(
-    {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited", "plc", "sa", "s a", "ag", "nv",
-     "n v", "se", "spa", "s p a", "holdings", "holding", "group", "the", "class", "a", "b", "adr", "llc", "lp"}
-)  # fmt: skip
+# A legal form (or share class, or "Holding") at the end of a company name, dotted or not, after a space or comma:
+# "Inc.", "S.A.", "N.V.", "S.p.A.", "AG", "SE", "PLC", "A/S", "Holding N.V.", "Class A". company_core removes these
+# one at a time from the end, so the letters of "S.A." never end up as stray words.
+_LEGAL_SUFFIX = re.compile(
+    r"(?:\s*,\s*|\s+)(?:"
+    r"inc|incorporated|corp|corporation|co|company|ltd|limited|llc|l\.?\s?p|plc|p\.l\.c|pty|gmbh|kgaa|"
+    r"s\.?\s?a|s\.?\s?a\.?\s?s|s\.?\s?a\.?\s?b|s\.?\s?p\.?\s?a|s\.?\s?r\.?\s?l|n\.?\s?v|b\.?\s?v|a\.?\s?g|s\.?\s?e|"
+    r"a/s|asa|ab|oyj|k\.?\s?k|holdings?|group|class\s+[a-c]|adrs?|de\s+c\.?\s?v"
+    r")\.?(?:\s*\(publ\))?\s*$",
+    re.IGNORECASE,
+)
+# What a legal form can leave behind at the end: "Henkel AG & Co. KGaA" -> "Henkel AG &" -> "Henkel AG".
+_TRAILING_JOINER = re.compile(r"(?:\s*[,&-]|\s+and)\s*$", re.IGNORECASE)
 
 
-def _company_core(company: str) -> str:
-    """ "Advanced Micro Devices, Inc." -> "Advanced Micro Devices": the name without legal-form words."""
-    words = _PUNCTUATION.sub(" ", company.replace("&", " and ")).split()
-    while words and words[-1].casefold() in _LEGAL_WORDS:
-        words.pop()
-    while words and words[0].casefold() == "the":
+def strip_legal_forms(company: str) -> str:
+    """A company name without the legal forms, share classes and "Holding(s)"/"Group" at its end, dotted or not,
+    otherwise as written: "Metlen Energy & Metals PLC" -> "Metlen Energy & Metals", "ASML Holding N.V." -> "ASML",
+    "Eni S.p.A." -> "Eni". Only whole words at the end go, and the first word always stays, so "Group 1 Automotive"
+    and "Inc Research" keep their names."""
+    name = " ".join((company or "").split())
+    while True:
+        first = name.split(" ", 1)[0]
+        stripped = _TRAILING_JOINER.sub("", _LEGAL_SUFFIX.sub("", name))
+        if stripped == name or len(stripped) < len(first):
+            return name
+        name = stripped
+
+
+def company_core(company: str) -> str:
+    """The distinctive part of a company name, for searching and for spotting it in headlines.
+
+    Legal forms, share classes and "Holding(s)"/"Group" are removed from the end of the raw name first (see
+    strip_legal_forms: "Advanced Micro Devices, Inc." -> "Advanced Micro Devices", "National Bank of Greece S.A." ->
+    "National Bank of Greece"), then punctuation and a leading "The"; "&" becomes "and".
+    """
+    words = _PUNCTUATION.sub(" ", strip_legal_forms(company).replace("&", " and ")).split()
+    while len(words) > 1 and words[0].casefold() == "the":
         words.pop(0)
     return " ".join(words)
 
@@ -569,12 +613,12 @@ def _company_core(company: str) -> str:
 def _mentions_matcher(symbol: str, company: str | None):
     """A test for "is this article about the company": its name (without legal-form words) as whole words, or its
     symbol without the exchange suffix, case-sensitive; symbols of one or two letters only as $T, (T) or :T."""
-    bare = symbol.split(".")[0]  # OPAP.AT -> OPAP
+    bare = symbol.split(".")[0]  # BELA.AT -> BELA
     if len(bare) <= 2:
         symbol_pattern = re.compile(rf"(?:\$|\(|:){re.escape(bare)}\b")
     else:
         symbol_pattern = re.compile(rf"(?<![\w$-]){re.escape(bare)}(?![\w-])|\${re.escape(bare)}\b")
-    core = _company_core(company or "").casefold()
+    core = company_core(company or "").casefold()
     name_pattern = re.compile(rf"\b{re.escape(core)}\b") if core else None
 
     def about(article: Article) -> bool:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 import math
 import re
+import unicodedata
 from collections.abc import Callable
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
@@ -67,19 +68,28 @@ _US_RIC = re.compile(r"([A-Z]{1,5})\.(O|OQ|N)")
 # What models write when they don't know the symbol.
 _PLACEHOLDERS = {"N/A", "NONE", "NULL", "UNKNOWN", "PRIVATE", "TBD", "UNLISTED", "NOT LISTED"}
 _YAHOO_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9&-]{0,11}(\.[A-Z]{1,3})?")
+# Greek and Cyrillic capitals that look like Latin ones. A model reading Greek news can copy "ΕΤΕ.ΑΤ" in Greek letters,
+# which looks exactly like ETE.AT but is no Yahoo symbol. Letters without a Latin twin (Π, Σ, Δ...) stay, so a name
+# written in Greek ("ΟΠΑΠ") is still rejected.
+_HOMOGLYPHS = str.maketrans(
+    "ΑΆΒΕΈΖΗΉΙΊΪΚΜΝΟΌΡΤΥΎΫΧАВЕЁКМНОРСТУХІЈЅҮ",
+    "AABEEZHHIIIKMNOOPTYYYXABEEKMHOPCTYXIJSY",
+)
 
 
 def normalise_ticker(raw: Any) -> str | None:
     """A Yahoo Finance symbol for what the model wrote, or None when it isn't a usable single-company ticker.
 
-    Strips whitespace, "$" and "NASDAQ:"/"NYSE:" prefixes, uppercases, turns other exchange prefixes ("LON:VOD") and
+    Strips whitespace, "$" and "NASDAQ:"/"NYSE:" prefixes, uppercases, turns Greek and Cyrillic letters that look like
+    Latin ones into those ("ΕΤΕ.ΑΤ" in Greek letters -> "ETE.AT"; see _HOMOGLYPHS) and fullwidth characters into
+    plain ones, turns other exchange prefixes ("LON:VOD") and
     Bloomberg codes ("VOD LN") into Yahoo suffixes ("VOD.L"), turns Reuters codes of US listings into plain symbols
     ("AMZN.O" -> "AMZN"), writes US share classes the Yahoo way ("BRK.B" -> "BRK-B"), pads Hong Kong codes ("700.HK"
     -> "0700.HK"), and rejects placeholders ("N/A", "unknown"), indices, ETFs, currencies and crypto pairs.
     """
     if not isinstance(raw, str):
         return None
-    text = " ".join(raw.upper().split())
+    text = " ".join(unicodedata.normalize("NFKC", raw).upper().translate(_HOMOGLYPHS).split())
     if text in _PLACEHOLDERS:
         return None
     text = re.sub(r"\s*\(.*\)$", "", text)  # "TSM (NYSE)"

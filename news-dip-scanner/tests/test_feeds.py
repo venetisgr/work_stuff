@@ -1,6 +1,9 @@
 import hashlib
+import re
+from dataclasses import replace
 from datetime import timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 import feedparser
 import pytest
@@ -12,6 +15,7 @@ from dip_scanner.feeds import (
     FeedParseError,
     FeedState,
     canonical_link,
+    company_core,
     fetch_all,
     fetch_feed,
     needs_contact_user_agent,
@@ -275,6 +279,54 @@ def test_parse_drops_translated_copies_of_a_release():
         "WSP met à jour son événement",
     ]
     assert len(parse_feed(Feed(key="all", name="All", url=wire.url, languages=()), items, now=NOW)) == 5
+
+
+def test_parse_keeps_greek_items_of_a_feed_that_calls_itself_english():
+    """Live sofokleousin.gr: the channel says <language>en</language>, the items are Greek. With languages = ["el",
+    "en"] (feeds.toml) nothing is lost whether or not an item carries a tag."""
+    items = rss(
+        "<item><title>Jumbo: Κέρδη €120,6 εκατ. στο εξάμηνο</title><link>https://example.gr/1</link></item>",
+        "<item><title>ΔΕΗ: Νέα επένδυση στη Ρουμανία</title><link>https://example.gr/2</link>"
+        "<dc:language>el</dc:language></item>",
+        "<item><title>Allwyn buys back shares</title><link>https://example.gr/3</link>"
+        "<dc:language>en</dc:language></item>",
+    ).replace(b"<title>T</title>", b"<title>T</title><language>en</language>")
+    items = items.replace(b'<rss version="2.0">', b'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">')
+    greek = Feed(
+        key="sofokleousin", name="Sofokleousin", url="https://www.sofokleousin.gr/feed", languages=("el", "en")
+    )
+    assert len(parse_feed(greek, items, now=NOW)) == 3
+    english = Feed(key="en", name="English", url="https://www.sofokleousin.gr/feed")
+    assert [a.title for a in parse_feed(english, items, now=NOW)] == [
+        "Jumbo: Κέρδη €120,6 εκατ. στο εξάμηνο",  # untagged: the channel's language doesn't count
+        "Allwyn buys back shares",
+    ]
+
+
+def test_parse_drops_headlines_matching_exclude_titles():
+    """Live Reuters via Google News: 42 of 100 items were company, fund and quote pages, not news."""
+    patterns = (
+        re.compile(r"^About .+ \([^()]+\) - Reuters$"),
+        re.compile(r"\| Stock Price & Latest News - Reuters$"),
+        re.compile(r"^[A-Z0-9]+(\.[A-Za-z]+)? - Reuters$"),
+    )
+    reuters = Feed(key="reuters", name="Reuters", url="https://news.google.com/rss/search?q=x", exclude_titles=patterns)
+    titles = [
+        "About SUBARU CORPORATION (FUH0y.D) - Reuters",
+        "Armani open to more than one investor for sale of 15% stake, CEO says - Reuters",
+        "(GISC.N) | Stock Price &amp; Latest News - Reuters",
+        "JGPD.DE - Reuters",
+        "About time: Fed signals cuts as inflation cools - Reuters",
+        "Barrick Mining reaches deal with unions at Mali gold mine (ABX.TO) - Reuters",
+    ]
+    items = rss(*(f"<item><title>{t}</title><link>https://example.com/{n}</link></item>" for n, t in enumerate(titles)))
+
+    assert [a.title for a in parse_feed(reuters, items, now=NOW)] == [
+        "Armani open to more than one investor for sale of 15% stake, CEO says - Reuters",
+        "About time: Fed signals cuts as inflation cools - Reuters",
+        "Barrick Mining reaches deal with unions at Mali gold mine (ABX.TO) - Reuters",
+    ]
+    assert len(parse_feed(replace(reuters, exclude_titles=()), items, now=NOW)) == 6
 
 
 def test_parse_keys_an_aggregator_item_without_its_publisher():
@@ -541,3 +593,107 @@ def test_ticker_news_gives_each_source_half_the_places_unless_the_other_has_too_
     assert len(articles) == 15
     assert sum("analysis piece" in a.title for a in articles) == 5  # every relevant Google item made it
     assert [a.published for a in articles] == sorted((a.published for a in articles), reverse=True)
+
+
+@pytest.mark.parametrize(
+    ("company", "core"),
+    [
+        ("Advanced Micro Devices, Inc.", "Advanced Micro Devices"),
+        ("National Bank of Greece S.A.", "National Bank of Greece"),
+        ("ASML Holding N.V.", "ASML"),
+        ("Eni S.p.A.", "Eni"),
+        ("Industria de Diseño Textil, S.A.", "Industria de Diseño Textil"),
+        ("Jumbo SA", "Jumbo"),
+        ("Allwyn AG", "Allwyn"),
+        ("SAP SE", "SAP"),
+        ("Shell plc", "Shell"),
+        ("Novo Nordisk A/S", "Novo Nordisk"),
+        ("Volvo AB (publ)", "Volvo"),
+        ("Henkel AG & Co. KGaA", "Henkel"),
+        ("JPMorgan Chase & Co.", "JPMorgan Chase"),
+        ("Alphabet Inc. Class A", "Alphabet"),
+        ("Alibaba Group Holding Limited", "Alibaba"),
+        ("Grupo Televisa, S.A.B. de C.V.", "Grupo Televisa"),
+        ("Alpha Services and Holdings S.A.", "Alpha Services"),
+        ("Metlen Energy & Metals PLC", "Metlen Energy and Metals"),
+        ("The Walt Disney Company", "Walt Disney"),
+        # Only whole words at the end go, and never the first word.
+        ("Group 1 Automotive, Inc.", "Group 1 Automotive"),
+        ("Chase", "Chase"),
+        ("Coface SA", "Coface"),
+        ("Holding", "Holding"),
+        ("Inc.", "Inc"),
+        ("", ""),
+    ],
+)
+def test_company_core_strips_legal_forms_dotted_or_not(company, core):
+    """Regression (live): legal forms were dropped word by word after punctuation became spaces, so the letters of
+    "S.A.", "N.V." and "S.p.A." stayed: "National Bank of Greece S", "ASML Holding N V", "Eni S p"."""
+    assert company_core(company) == core
+
+
+def test_ticker_news_matches_names_with_dotted_legal_forms():
+    """Regression (live): Jumbo S.A. got 1 context headline instead of 15, Public Power Corporation S.A. none."""
+    google = rss(
+        _item("National Bank of Greece raises its payout - Reuters", NOW - timedelta(hours=3)),
+        _item("Greek banks rally - Kathimerini", NOW - timedelta(hours=4)),
+    )
+    session = FakeSession({YAHOO: rss(), GOOGLE: google})
+
+    articles = ticker_news(session, "NBGIF", company="National Bank of Greece S.A.", now=NOW)
+
+    assert [a.title for a in articles] == ["National Bank of Greece raises its payout - Reuters"]
+    assert parse_qs(urlsplit(session.urls[1]).query)["q"] == ["National Bank of Greece stock when:30d"]
+
+
+def test_ticker_news_also_searches_the_local_edition_for_athens_listings():
+    english = rss(
+        _item("Jumbo S.A. (ATH:BELA) beats estimates - Simply Wall St", NOW - timedelta(hours=2)),
+        _item("SoftBank starts high-yield bond sale - Yahoo Finance", NOW - timedelta(hours=3)),
+    )
+    greek = rss(
+        _item("Jumbo: Κέρδη €120,6 εκατ. στο εξάμηνο - Sofokleousin.gr", NOW - timedelta(hours=1)),
+        _item("ΔΕΗ: Νέα επένδυση στη Ρουμανία - Capital.gr", NOW - timedelta(hours=4)),  # not about Jumbo
+        _item("Jumbo: Τιμή στόχος από την Citi - euro2day.gr", NOW - timedelta(days=40)),  # too old
+        *(_item(f"Jumbo: ανάλυση {n} - euro2day.gr", NOW - timedelta(days=1, hours=n)) for n in range(12)),
+    )
+    session = FakeSession({YAHOO: rss(), GOOGLE: lambda method, url, call: greek if "hl=el" in url else english})
+
+    articles = ticker_news(session, "BELA.AT", company="Jumbo S.A.", now=NOW, limit=10)
+
+    queries = [parse_qs(urlsplit(url).query) for url in session.urls[1:]]
+    assert [(q["q"][0], q["hl"][0], q["gl"][0], q["ceid"][0]) for q in queries] == [
+        ("Jumbo stock when:30d", "en-US", "US", "US:en"),
+        ("Jumbo μετοχή when:30d", "el", "GR", "GR:el"),
+    ]
+    titles = [a.title for a in articles]
+    assert len(titles) == 10  # still capped
+    assert titles[:2] == [
+        "Jumbo: Κέρδη €120,6 εκατ. στο εξάμηνο - Sofokleousin.gr",
+        "Jumbo S.A. (ATH:BELA) beats estimates - Simply Wall St",  # the English edition keeps its place
+    ]
+    assert not any(word in title for title in titles for word in ("ΔΕΗ", "SoftBank", "Citi"))
+    assert articles[0].source_name == "Sofokleousin.gr" and {a.source for a in articles} == {"ticker:BELA.AT"}
+
+
+@pytest.mark.parametrize(
+    ("ticker", "edition"),
+    [
+        ("SAP.DE", ("SAP Aktie when:30d", "de", "DE", "DE:de")),
+        ("MC.PA", ("SAP action when:30d", "fr", "FR", "FR:fr")),
+        ("ENI.MI", ("SAP azioni when:30d", "it", "IT", "IT:it")),
+        ("ITX.MC", ("SAP acciones when:30d", "es", "ES", "ES:es")),
+        ("ASML.AS", ("SAP aandeel when:30d", "nl", "NL", "NL:nl")),
+        ("AMD", None),
+        ("BRK-B", None),
+        ("VOD.L", None),
+        ("7203.T", None),
+    ],
+)
+def test_ticker_news_local_editions_by_exchange(ticker, edition):
+    session = FakeSession({YAHOO: rss(), GOOGLE: rss()})
+    ticker_news(session, ticker, company="SAP SE", now=NOW)
+    queries = [parse_qs(urlsplit(url).query) for url in session.urls[1:]]
+    assert (queries[0]["q"][0], queries[0]["hl"][0]) == ("SAP stock when:30d", "en-US")
+    local = [(q["q"][0], q["hl"][0], q["gl"][0], q["ceid"][0]) for q in queries[1:]]
+    assert local == ([edition] if edition else [])

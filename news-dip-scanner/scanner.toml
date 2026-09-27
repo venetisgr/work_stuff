@@ -53,6 +53,7 @@ include_indirect = true
 # need a dip, and [dip] directions still applies.
 watchlist = []
 # watchlist = ["AMD", "NVDA", "ASML", "MSFT", "TSM"]
+# Athens: see "Scanning Athens stocks" in the README for current codes, e.g. ["ETE.AT", "PPC.AT", "ALWN.AT"].
 # Only ever consider the watchlist.
 only_watchlist = false
 # Never consider these tickers.

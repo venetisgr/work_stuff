@@ -42,6 +42,7 @@ from .pipeline import Scanner, thesis_change_line, usage_lines
 from .prices import PriceError, PriceFetchError, YahooPrices
 from .report import render_html, render_markdown, render_news_digest
 from .store import Store
+from .symbols import SymbolResolver
 from .track import Outcome, evaluate, quote_day, render_track_record, summarize
 from .triage import normalise_ticker
 
@@ -292,6 +293,7 @@ def _scanner(args: argparse.Namespace, settings: Settings, *, notify: bool, feed
             session=session,
             notify=notify,
             clock=_now,
+            symbols=SymbolResolver(session, store),
         )
     finally:
         store.close()
