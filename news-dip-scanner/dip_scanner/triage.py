@@ -16,7 +16,8 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from . import prompts
-from .llm import ChatModel, LLMError, LLMUnavailableError, complete_json
+from .config import ConfigError
+from .llm import ChatModel, LLMError, LLMRequestError, LLMSetupError, LLMUnavailableError, complete_json
 from .models import DIRECTIONS, EVENT_TYPES, RELATIONS, Article, Impact, utc
 
 if TYPE_CHECKING:
@@ -61,6 +62,10 @@ _NOT_EQUITIES = {
 }  # fmt: skip
 _CRYPTO_PAIR = re.compile(r"-(USD|USDT|USDC|EUR|GBP|BTC|ETH)$")
 _CLASS_SHARE = re.compile(r"([A-Z]{1,5})[./ ]([A-Z])")
+# Reuters instrument codes of US listings (AMZN.O Nasdaq, IBM.N NYSE): the plain symbol on Yahoo.
+_US_RIC = re.compile(r"([A-Z]{1,5})\.(O|OQ|N)")
+# What models write when they don't know the symbol.
+_PLACEHOLDERS = {"N/A", "NONE", "NULL", "UNKNOWN", "PRIVATE", "TBD", "UNLISTED", "NOT LISTED"}
 _YAHOO_SYMBOL = re.compile(r"[A-Z0-9][A-Z0-9&-]{0,11}(\.[A-Z]{1,3})?")
 
 
@@ -68,14 +73,19 @@ def normalise_ticker(raw: Any) -> str | None:
     """A Yahoo Finance symbol for what the model wrote, or None when it isn't a usable single-company ticker.
 
     Strips whitespace, "$" and "NASDAQ:"/"NYSE:" prefixes, uppercases, turns other exchange prefixes ("LON:VOD") and
-    Bloomberg codes ("VOD LN") into Yahoo suffixes ("VOD.L"), writes US share classes the Yahoo way ("BRK.B" ->
-    "BRK-B"), pads Hong Kong codes ("700.HK" -> "0700.HK"), and rejects indices, ETFs, currencies and crypto pairs.
+    Bloomberg codes ("VOD LN") into Yahoo suffixes ("VOD.L"), turns Reuters codes of US listings into plain symbols
+    ("AMZN.O" -> "AMZN"), writes US share classes the Yahoo way ("BRK.B" -> "BRK-B"), pads Hong Kong codes ("700.HK"
+    -> "0700.HK"), and rejects placeholders ("N/A", "unknown"), indices, ETFs, currencies and crypto pairs.
     """
     if not isinstance(raw, str):
         return None
     text = " ".join(raw.upper().split())
+    if text in _PLACEHOLDERS:
+        return None
     text = re.sub(r"\s*\(.*\)$", "", text)  # "TSM (NYSE)"
     text = text.removesuffix(" EQUITY").lstrip("$").strip()
+    if (ric := _US_RIC.fullmatch(text)) is not None:
+        text = ric.group(1)
     suffix: str | None = None  # None: nothing said about the exchange
     if ":" in text:
         prefix, _, text = (part.strip() for part in text.partition(":"))
@@ -206,12 +216,18 @@ def _article_impacts(article_id: str, entries: list[dict]) -> list[Impact]:
 # --- the model's reply ---------------------------------------------------------------------------------------------
 
 
+# Keys some models use instead of "companies"; taken as the same thing.
+_COMPANY_KEY_ALIASES = ("affected_companies", "impacts")
+
+
 def validate_triage(data: Any, ids: list[str]) -> dict[str, list[dict]]:
     """Check the model's triage reply has the expected shape; ValueError says what's wrong.
 
-    Returns the company entries (dicts, not yet cleaned) for every id in ids. Ids the model left out get no
-    companies and ids it made up are ignored, but a reply that covers none of the ids, or fewer than half of a
-    batch of three or more, is rejected so complete_json asks again.
+    Returns the company entries (dicts, not yet cleaned) of the ids the reply covers; ids it left out are not in
+    the result (the caller keeps those articles for another try) and ids it made up are ignored. A reply that covers
+    fewer than half of the ids (none of one or two) is rejected so complete_json asks again. An entry without
+    "companies" counts as "none affected", unless it holds another list: "affected_companies" and "impacts" are
+    read as companies, anything else is rejected, since the companies would be lost.
     """
     wanted = set(ids)
     if isinstance(data, dict) and "articles" not in data and wanted & set(data):
@@ -234,6 +250,15 @@ def validate_triage(data: Any, ids: list[str]) -> dict[str, list[dict]]:
         if entry_id not in wanted and f"a{entry_id}" in wanted:  # "1" for "a1"
             entry_id = f"a{entry_id}"
         companies = entry.get("companies")
+        if companies is None and "companies" not in entry:
+            companies = next((entry[key] for key in _COMPANY_KEY_ALIASES if isinstance(entry.get(key), list)), None)
+        if companies is None and "companies" not in entry:
+            other = next((key for key, value in entry.items() if isinstance(value, list) and value), None)
+            if other is not None:
+                raise ValueError(
+                    f'Article {entry_id} has no "companies" list (found "{other}"); put the affected companies '
+                    'under "companies".'
+                )
         if companies is None:
             companies = []
         if not isinstance(companies, list):
@@ -247,13 +272,13 @@ def validate_triage(data: Any, ids: list[str]) -> dict[str, list[dict]]:
         log.debug("Ignored triage entries for unknown article ids: %s", ", ".join(unknown))
     if entries and ids and not covered:
         raise ValueError(f"None of the ids in the reply match the articles; use the ids given ({', '.join(ids)}).")
-    if len(ids) >= 3 and len(covered) * 2 < len(ids):
+    if ids and len(covered) * 2 < len(ids):
         missing = ", ".join(article_id for article_id in ids if article_id not in covered)
         raise ValueError(
             f"The reply covers only {len(covered)} of the {len(ids)} articles (missing: {missing}). "
             'Include every id, with "companies": [] when no listed company is affected.'
         )
-    return result
+    return {article_id: companies for article_id, companies in result.items() if article_id in covered}
 
 
 # --- prompting -----------------------------------------------------------------------------------------------------
@@ -289,10 +314,16 @@ def article_block(short_id: str, article: Article) -> str:
 def triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -> list[Impact]:
     """The impacts the model finds in one batch of articles (invalid entries dropped, tickers normalised).
 
-    Raises LLMError when the model's reply is unusable even after a corrective retry.
+    Raises LLMError when the model's reply is unusable even after a corrective retry. Articles the reply left out
+    simply give no impacts here; triage() keeps them for another try (see _triage_batch).
     """
+    return _triage_batch(model, articles, now=now)[0]
+
+
+def _triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) -> tuple[list[Impact], set[str]]:
+    """(impacts, ids of the articles the reply covered) for one batch."""
     if not articles:
-        return []
+        return [], set()
     ids = [f"a{number}" for number in range(1, len(articles) + 1)]
     today = utc(now)
     prompt = prompts.TRIAGE_PROMPT.format(
@@ -302,9 +333,12 @@ def triage_batch(model: ChatModel, articles: list[Article], *, now: datetime) ->
     )
     companies = complete_json(model, prompts.TRIAGE_SYSTEM, prompt, validate=lambda data: validate_triage(data, ids))
     impacts: list[Impact] = []
+    covered: set[str] = set()
     for short_id, article in zip(ids, articles, strict=True):
-        impacts.extend(_article_impacts(article.id, companies[short_id]))
-    return impacts
+        if short_id in companies:
+            covered.add(article.id)
+            impacts.extend(_article_impacts(article.id, companies[short_id]))
+    return impacts, covered
 
 
 # --- the triage step of a scan cycle -------------------------------------------------------------------------------
@@ -318,8 +352,12 @@ def triage(
     Articles go to the model in batches of batch_size, oldest first. When a batch fails (LLMError), it is split in
     halves to find the article(s) that break it, so one bad article can't sink the other nineteen; the ones that
     still fail get a failed attempt recorded (the store gives up on them after max_attempts, and each article is
-    tried at most once per cycle). When the service is unreachable or keeps throttling (LLMUnavailableError), triage
-    stops for this cycle and the remaining articles stay pending. LLMSetupError propagates: every call would fail.
+    tried at most once per cycle). Articles a reply leaves out are not "done": they get a failed attempt too, so
+    they are sent again next cycle. When the service is unreachable or keeps throttling (LLMUnavailableError), or
+    refuses every request of the cycle the same way (an LLMRequestError for a whole batch before anything worked:
+    a spend limit, a setting the model rejects), triage stops for this cycle and the remaining articles stay pending
+    without using up attempts. LLMSetupError propagates: every call would fail. Any other exception (a bug, an odd
+    reply) counts as a failed batch.
     """
     batch_size = max(1, batch_size)
     triaged = 0
@@ -328,16 +366,30 @@ def triage(
     left_pending = 0  # articles that failed this cycle but may still be pending in the store
 
     def attempt(batch: list[Article]) -> LLMError | None:
-        nonlocal triaged
+        nonlocal triaged, left_pending
         try:
-            found = triage_batch(model, batch, now=now)
-        except LLMUnavailableError:
+            found, covered = _triage_batch(model, batch, now=now)
+        except (LLMUnavailableError, LLMSetupError, ConfigError):
             raise
         except LLMError as exc:
             return exc
-        store.record_triage([article.id for article in batch], found)
-        triaged += len(batch)
+        except Exception as exc:  # not the model's usual failures: count it, don't retry the batch forever
+            log.warning("Triage of %d article(s) failed unexpectedly", len(batch), exc_info=True)
+            return LLMError(f"{type(exc).__name__}: {exc}")
+        done = [article.id for article in batch if article.id in covered]
+        store.record_triage(done, found)
+        triaged += len(done)
         impacts.extend(found)
+        missing = [article for article in batch if article.id not in covered]
+        if missing:
+            left_pending += len(missing)
+            store.record_triage_failure([article.id for article in missing], max_attempts=max_attempts)
+            log.warning(
+                "The triage reply left out %d of %d article(s) (%s); they stay pending for another try.",
+                len(missing),
+                len(batch),
+                "; ".join(article.title for article in missing[:3]) + (" ..." if len(missing) > 3 else ""),
+            )
         return None
 
     try:
@@ -351,6 +403,12 @@ def triage(
             if error is None:
                 continue
             failed, error = _isolate_failures(attempt, batch, error)
+            if isinstance(error, LLMRequestError) and len(failed) == len(batch) and not triaged:
+                log.warning(
+                    "Stopped triage for this cycle: the model refused every request (%s); the articles stay pending.",
+                    error,
+                )
+                break
             if failed:
                 left_pending += len(failed)
                 store.record_triage_failure([article.id for article in failed], max_attempts=max_attempts)

@@ -86,9 +86,10 @@ and "companies": [] for articles that affect no listed company:
 
 # --- analysis: is the dip fear or real damage? ---------------------------------------------------------------------
 
-ANALYSIS_SYSTEM = f"""You are a sceptical, numerate buy-side equity analyst. A stock has dropped on news. Decide \
-whether the market is overreacting to a fear that is likely to fade (a possible buying opportunity) or correctly \
-pricing real, lasting damage to the business, and put calibrated numbers on it for a 6-month horizon. A human \
+ANALYSIS_SYSTEM = f"""You are a sceptical, numerate buy-side equity analyst. A stock has fallen and there is news \
+about it. Decide whether the market is overreacting to a fear that is likely to fade (a possible buying \
+opportunity) or correctly pricing real, lasting damage to the business, and put calibrated numbers on it for a \
+6-month horizon. A human \
 investor reads your analysis, does their own checks and decides whether to place limit orders. You never trade and \
 you are not selling anything: an honest "this is not an opportunity" is a good answer.
 
@@ -103,7 +104,9 @@ a failed trial of a key drug, heavy dilution, a debt or liquidity problem, a key
 3. Weigh the price reaction against the news using the price block. A drop far larger than the news justifies, on \
 heavy volume, in a stock that was healthy before, leans towards overreaction. A small drop on news that removes a \
 large part of future profit means the market may not have finished repricing. Compare the move with the stock's \
-normal volatility: a 3% day in a stock with 60% annual volatility is noise.
+normal volatility: a 3% day in a stock with 60% annual volatility is noise. Compare the news dates with the time \
+of the prices ("as of"): news that came out after the last session can't explain a drop in it. Then the market has \
+not reacted to that news yet; say so, and treat the earlier drop as unexplained by it (often "unclear").
 4. Use the fundamentals, if given, to judge whether the business was healthy before the news (growth, margins, \
 profitability, cash flow). If they are missing, do not assume them: say what to look up in checks.
 5. List what could still go wrong (risks) and what could lift the price (catalysts). Mention dates only if the input \

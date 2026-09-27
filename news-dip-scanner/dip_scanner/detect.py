@@ -10,11 +10,13 @@ from __future__ import annotations
 import logging
 import math
 from collections import Counter
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import DipConfig, ScannerConfig
-from .models import Article, Candidate, Impact, PriceStats, utc
+from .models import Article, Candidate, Impact, Opportunity, PriceStats, utc
 from .prices import PriceError
 
 if TYPE_CHECKING:
@@ -25,6 +27,16 @@ log = logging.getLogger(__name__)
 
 # Tolerance for comparing drops with thresholds, so a drop of exactly 3% isn't missed through float rounding.
 _EPSILON = 1e-9
+# Yahoo's instrumentType of single-company shares (ADRs included); ETFs, funds and indices aren't candidates.
+_EQUITY_TYPES = frozenset({"EQUITY"})
+# Currencies Yahoo quotes in hundredths: London pence, Johannesburg cents, Tel Aviv agorot.
+_MINOR_UNITS = {"GBp": 100, "GBX": 100, "ZAc": 100, "ILA": 100}
+
+
+def major_units(price: float, currency: str) -> float:
+    """A price in the currency's main unit: 150 GBp (pence) is 1.50 (pounds); other currencies are unchanged."""
+    return price / _MINOR_UNITS.get((currency or "").strip(), 1)
+
 
 # severity() weights, see its docstring.
 _RELATION_WEIGHTS = {"direct": 1.0, "indirect": 0.5}
@@ -39,18 +51,22 @@ _MAX_VOLUME_BONUS = 3.0
 # --- dips ----------------------------------------------------------------------------------------------------------
 
 
-def dip_reasons(stats: PriceStats, cfg: DipConfig) -> list[str]:
+def dip_reasons(stats: PriceStats, cfg: DipConfig, *, now: datetime | None = None) -> list[str]:
     """Human-readable reasons the price counts as a dip, e.g. "down 6.2% today"; an empty list means no dip.
 
     Three independent tests, each against its [dip] threshold (a positive number of percent):
-    - the last session's change vs the previous close: "down 6.2% today" (min_drop_1d_pct);
+    - the last session's change vs the previous close: "down 6.2% today" (min_drop_1d_pct), or "down 6.2% on Fri
+      25 Sep" when that session isn't today on the exchange's calendar (weekends, holidays, before the open; the
+      session date is the exchange's, now's too; without now it is taken to be today);
     - the change over 5 sessions: "down 8.1% over 5 days" (min_drop_5d_pct);
     - the distance below the 20-session high: "12.4% below its 20-day high" (min_drawdown_20d_pct).
     A test only counts when the price actually fell, so a threshold of 0 means "any fall".
     """
     reasons = []
     if _dropped(stats.change_1d_pct, cfg.min_drop_1d_pct):
-        reasons.append(f"down {-stats.change_1d_pct:.1f}% today")
+        session = session_day(stats)
+        when = "today" if now is None or session == _local_date(now, stats.timezone) else f"on {session:%a %d %b}"
+        reasons.append(f"down {-stats.change_1d_pct:.1f}% {when}")
     if _dropped(stats.change_5d_pct, cfg.min_drop_5d_pct):
         reasons.append(f"down {-stats.change_5d_pct:.1f}% over 5 days")
     if _dropped(stats.drawdown_20d_pct, cfg.min_drawdown_20d_pct):
@@ -62,6 +78,20 @@ def _dropped(change_pct: float, threshold_pct: float) -> bool:
     return change_pct < 0 and -change_pct >= abs(threshold_pct) - _EPSILON
 
 
+def session_day(stats: PriceStats) -> date:
+    """The date of the latest session in the price data, on the exchange's calendar (UTC without a time zone)."""
+    return _local_date(stats.as_of, stats.timezone)
+
+
+def _local_date(moment: datetime, zone: str | None) -> date:
+    if zone:
+        try:
+            return utc(moment).astimezone(ZoneInfo(zone)).date()
+        except (ZoneInfoNotFoundError, ValueError, OSError):
+            pass
+    return utc(moment).date()
+
+
 def severity(stats: PriceStats, impacts: list[tuple[Impact, Article]]) -> float:
     """Ranking score for candidates: bigger drops and stronger, more direct negative news rank higher.
 
@@ -70,7 +100,8 @@ def severity(stats: PriceStats, impacts: list[tuple[Impact, Article]]) -> float:
       slower 5-day and 20-day measures scaled down to be comparable with a one-day drop;
     - news = 1.5 * the strongest impact's magnitude (1-5) * relation weight (direct 1.0, indirect 0.5)
       * direction weight (negative 1.0, mixed 0.7, neutral/positive 0.3);
-    - corroboration = 0.5 for every further article about the company, at most 2.0;
+    - corroboration = 0.5 for every further story about the company (articles with the same title_key, e.g.
+      syndicated copies, count once), at most 2.0;
     - volume = min(3, volume_ratio - 1) when the last session traded above its 20-day average volume, else 0
       (heavy selling means the market is really reacting).
     Example: a 5% one-day drop that is 13.6% below the 20-day high (drop 6.82), one direct negative magnitude-4
@@ -78,7 +109,7 @@ def severity(stats: PriceStats, impacts: list[tuple[Impact, Article]]) -> float:
     """
     drop = max(0.0, -stats.change_1d_pct, -stats.change_5d_pct / 1.5, -stats.drawdown_20d_pct / 2)
     news = max((_impact_weight(impact) for impact, _ in impacts), default=0.0)
-    articles = len({article.id for _, article in impacts})
+    articles = len({article.title_key or article.id for _, article in impacts})
     corroboration = min(_MAX_EXTRA_ARTICLE_BONUS, _EXTRA_ARTICLE_BONUS * max(0, articles - 1))
     ratio = stats.volume_ratio
     volume = min(_MAX_VOLUME_BONUS, max(0.0, ratio - 1)) if ratio is not None and math.isfinite(ratio) else 0.0
@@ -114,6 +145,7 @@ def select_candidates(
     cfg: ScannerConfig,
     *,
     now: datetime,
+    waiting: Callable[[str], str | None] | None = None,
 ) -> tuple[list[Candidate], list[str]]:
     """Candidates sorted by severity (highest first, capped per cycle) and notes about every ticker left out.
 
@@ -123,12 +155,19 @@ def select_candidates(
     3. Each ticker's impacts must match [dip]: directions, min_magnitude and include_indirect. Watchlist tickers
        skip the magnitude and relation tests (any relation, magnitude >= 1) but not the direction test.
     4. Cooldown: a ticker analysed less than [scan] cooldown_hours ago is skipped unless one of its qualifying
-       articles was published or fetched after that analysis.
-    5. Tickers the store marks invalid (no prices recently) are skipped without asking for prices. When the price
+       articles was not part of that analysis, or that analysis came before any trading on its news (every
+       article newer than its prices) and a newer session has traded since.
+    5. waiting(ticker), when given, returns a reason while the ticker's last analysis failed recently (the
+       pipeline's backoff); such tickers are skipped here, before the cap, so they don't take a place.
+    6. Tickers the store marks invalid (no prices recently) are skipped without asking for prices. When the price
        source raises PriceError the ticker is marked invalid; other errors (network) are noted but don't mark it.
-    6. Prices below [universe] min_price, and prices that don't pass dip_reasons, are skipped.
+    7. Instruments that aren't company shares (Yahoo's instrumentType ETF, MUTUALFUND, INDEX...) are skipped and
+       marked invalid; so are prices below [universe] min_price (in the currency's main unit: pence, cents and
+       agorot quotes are divided by 100) and prices that don't pass dip_reasons.
     The rest become candidates, sorted by severity; those beyond [scan] max_candidates_per_cycle are left for the
-    next cycle and named in a note.
+    next cycle and named in a note. When every qualifying article came out after the latest session in the price
+    data (news after the close or at the weekend), the drop can't be a reaction to it: the candidate is marked
+    news_after_session and its reasons say that the price hasn't reacted yet.
     """
     now = utc(now)
     scan, dip, universe = cfg.scan, cfg.dip, cfg.universe
@@ -175,23 +214,48 @@ def select_candidates(
             continue
         qualifying.sort(key=lambda pair: (utc(pair[1].published), utc(pair[1].fetched)), reverse=True)
 
-        if (cooldown := _cooldown(ticker, qualifying, store, scan.cooldown_hours, now)) is not None:
-            notes.add(f"Analysed within the {_hours(scan.cooldown_hours)} cooldown, no new news since", cooldown)
+        stats: PriceStats | None = None
+        last = store.last_opportunity(ticker) if scan.cooldown_hours > 0 else None
+        if (cooldown := _cooldown(ticker, qualifying, last, scan.cooldown_hours, now)) is not None:
+            reacted = False
+            if last is not None and last.news_after_session:  # analysed before its news could move the price
+                stats = _stats(ticker, prices, store, notes, now)
+                if stats is None:
+                    continue
+                moved = abs(stats.change_1d_pct) >= dip.min_drop_1d_pct - _EPSILON  # the market's answer to it
+                reacted = session_day(stats) > session_day(last.stats) and moved
+            if not reacted:
+                notes.add(f"Analysed within the {_hours(scan.cooldown_hours)} cooldown, no new news since", cooldown)
+                continue
+
+        if waiting is not None and (why := waiting(ticker)) is not None:
+            notes.add("Analysis failed recently, waiting before trying again", why)
             continue
 
-        stats = _stats(ticker, prices, store, notes, now)
+        if stats is None:
+            stats = _stats(ticker, prices, store, notes, now)
         if stats is None:
             continue
-        if stats.price < universe.min_price:
+        if stats.instrument_type is not None and stats.instrument_type not in _EQUITY_TYPES:
+            store.set_ticker_valid(ticker, False, checked=now)
+            notes.add("Not a company's shares (a fund, index or other instrument; marked invalid)", ticker)
+            continue
+        if major_units(stats.price, stats.currency) < universe.min_price:
             notes.add(
                 f"Price below [universe] min_price {universe.min_price:g}",
                 f"{ticker} ({_money(stats.price)} {stats.currency})",
             )
             continue
-        reasons = dip_reasons(stats, dip)
+        reasons = dip_reasons(stats, dip, now=now)
         if not reasons:
             notes.add("No dip (price not down enough)", f"{ticker} ({_moves(stats)})")
             continue
+        unpriced = news_after_session(stats, qualifying)
+        if unpriced:
+            reasons.append(
+                f"no trading since this news (last session {session_day(stats):%a %d %b}); the price has not "
+                "reacted to it yet"
+            )
         candidates.append(
             Candidate(
                 ticker=ticker,
@@ -200,6 +264,7 @@ def select_candidates(
                 impacts=qualifying,
                 dip_reasons=reasons,
                 severity=severity(stats, qualifying),
+                news_after_session=unpriced,
             )
         )
 
@@ -251,22 +316,30 @@ def _rejection(impact: Impact, dip: DipConfig, *, on_watchlist: bool) -> str | N
     return None
 
 
+def news_after_session(stats: PriceStats, impacts: list[tuple[Impact, Article]]) -> bool:
+    """Whether every article came out after the latest session in the price data, which has closed (so the drop
+    can't be a reaction to them). While a session is running the quote is live, so this is False."""
+    if not impacts or stats.session_elapsed is not None:
+        return False
+    return all(utc(article.published) > utc(stats.as_of) for _, article in impacts)
+
+
 def _cooldown(
-    ticker: str, impacts: list[tuple[Impact, Article]], store: Store, cooldown_hours: float, now: datetime
+    ticker: str, impacts: list[tuple[Impact, Article]], last: Opportunity | None, cooldown_hours: float, now: datetime
 ) -> str | None:
     """A note item when the ticker is still in its cooldown with nothing new since its last analysis, else None."""
-    if cooldown_hours <= 0:
-        return None
-    last = store.last_opportunity(ticker)
-    if last is None:
+    if cooldown_hours <= 0 or last is None:
         return None
     created = utc(last.created)
     if created <= now - timedelta(hours=cooldown_hours):
         return None
     analysed = set(last.article_ids)
     for _, article in impacts:
-        newer = max(utc(article.published), utc(article.fetched)) > created
-        if newer and article.id not in analysed:
+        if article.id in analysed:
+            continue
+        # Qualifying news the last analysis never saw, however old it is: it may have been triaged a cycle late
+        # (the model was unavailable). Records from before article_ids existed fall back to the time test.
+        if analysed or max(utc(article.published), utc(article.fetched)) > created:
             return None
     ago = max(0.0, (now - created).total_seconds() / 3600)
     return f"{ticker} (analysed {ago:.1f}h ago)"

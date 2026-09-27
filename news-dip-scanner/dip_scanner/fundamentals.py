@@ -42,8 +42,15 @@ TICKERS_TTL = 24 * 3600  # seconds
 FACTS_TTL = 12 * 3600
 MIN_INTERVAL = 0.2  # seconds between requests: at most 5 a second (the SEC allows 10)
 
-QUARTER_DAYS = (80, 100)
+# 11-18 weeks: 13-week quarters, a 14-week Q4 in 53-week years, and the 12/12/12/16-week retail calendars (Costco,
+# PepsiCo, Kroger; 17 weeks in a 53-week year). Half years (~180 days) and years stay well clear of it.
+QUARTER_DAYS = (77, 126)
 YEAR_DAYS = (350, 380)  # 52/53-week fiscal years included
+# Proxy and information statements (DEF 14A, PRE 14A...) tag several years of net income in their pay-versus-
+# performance table, often rounded or on another basis. They are filed after the 10-K, so under "the latest filing
+# wins" they would replace the audited figures; their facts are ignored.
+_NON_STATEMENT_FORMS = ("DEF 14", "DEFA14", "DEFR14", "DEFM14", "DEFC14", "DEFN14", "PRE 14", "PREM14", "PRER14",
+                        "PREC14", "PREN14")  # fmt: skip
 QUARTERS = 5
 YEARS = 3
 _SLACK = timedelta(days=3)  # how far apart a period's end and the next one's start may be
@@ -60,7 +67,9 @@ CONCEPTS: dict[str, dict[str, tuple[str, ...]]] = {
         ),
         "gross_profit": ("GrossProfit",),
         "operating_income": ("OperatingIncomeLoss",),
-        "net_income": ("NetIncomeLoss",),
+        # Some filers (Ford, American Tower, Realty Income) stopped tagging NetIncomeLoss and only tag the net income
+        # available to common stockholders.
+        "net_income": ("NetIncomeLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"),
         "eps_diluted": ("EarningsPerShareDiluted",),
         "operating_cash_flow": ("NetCashProvidedByUsedInOperatingActivities",),
     },
@@ -306,7 +315,7 @@ class _Fact:
     start: date
     end: date
     value: float
-    filed: str  # YYYY-MM-DD; later filings (restatements, comparatives) win
+    filed: str  # YYYY-MM-DD; later financial-statement filings (restatements, comparatives) win
 
     @property
     def days(self) -> int:
@@ -316,16 +325,22 @@ class _Fact:
 def parse_company_facts(ticker: str, cik: str, facts: dict) -> Fundamentals:
     """Fundamentals from a companyfacts JSON document.
 
-    Quarters are facts lasting 80-100 days and fiscal years 350-380 days; when several facts end on the same day the
-    latest filing wins. Missing quarters of flow items (not EPS) are derived from the fiscal year or year-to-date
-    totals: Q4 = year - (Q1 + Q2 + Q3), and for cash flow Q2 = H1 - Q1 and so on. Keeps the 5 newest quarters and 3
-    newest years, newest first; a metric the company doesn't report is None.
+    Quarters are facts lasting 77-126 days (11-18 weeks) and fiscal years 350-380 days; when several facts end on the
+    same day the latest financial-statement filing wins (proxy statements are ignored). Missing quarters of flow items
+    (not EPS) are derived from the fiscal year or year-to-date totals: Q4 = year - (Q1 + Q2 + Q3), and for cash flow
+    Q2 = H1 - Q1 and so on. Keeps the 5 newest quarters and 3 newest years, newest first; a metric the company
+    doesn't report is None.
+
+    Of the taxonomies (us-gaap, ifrs-full) the one with the most recent figures is read (us-gaap on a tie): a company
+    that moved from US GAAP to IFRS keeps its old us-gaap facts for years.
     """
     taxonomies = facts.get("facts") if isinstance(facts.get("facts"), dict) else {}
-    taxonomy = next(
-        (name for name, concepts in CONCEPTS.items() if _has_any(taxonomies.get(name), concepts.values())),
-        "us-gaap",
-    )
+    candidates = [
+        (_latest_end(taxonomies[name], concepts) or date.min, -order, name)
+        for order, (name, concepts) in enumerate(CONCEPTS.items())
+        if _has_any(taxonomies.get(name), concepts.values())
+    ]
+    taxonomy = max(candidates)[2] if candidates else "us-gaap"
     concepts = CONCEPTS[taxonomy]
     source = taxonomies.get(taxonomy) or {}
     currency = _currency(source, (names for metric, names in concepts.items() if metric not in PER_SHARE))
@@ -348,6 +363,21 @@ def parse_company_facts(ticker: str, cik: str, facts: dict) -> Fundamentals:
 
 def _has_any(source: Any, concept_lists: Iterable[tuple[str, ...]]) -> bool:
     return isinstance(source, dict) and any(name in source for names in concept_lists for name in names)
+
+
+def _latest_end(source: dict, concepts: dict[str, tuple[str, ...]]) -> date | None:
+    """The end of the most recent period any flow metric (not EPS) of this taxonomy reports, in any unit."""
+    latest: date | None = None
+    for metric, names in concepts.items():
+        if metric in PER_SHARE:
+            continue
+        for name in names:
+            units = (source.get(name) or {}).get("units") if isinstance(source.get(name), dict) else None
+            for items in units.values() if isinstance(units, dict) else ():
+                for fact in map(_fact, items if isinstance(items, list) else ()):
+                    if fact is not None and (latest is None or fact.end > latest):
+                        latest = fact.end
+    return latest
 
 
 def _currency(source: dict, concept_lists: Iterable[tuple[str, ...]]) -> str:
@@ -386,8 +416,10 @@ def _concept_facts(source: dict, names: tuple[str, ...], unit: str) -> list[_Fac
 
 
 def _fact(item: Any) -> _Fact | None:
-    """A duration fact, or None for instants (balance sheet items) and malformed entries."""
+    """A duration fact, or None for instants (balance sheet items), proxy-statement facts and malformed entries."""
     if not isinstance(item, dict):
+        return None
+    if str(item.get("form") or "").strip().upper().startswith(_NON_STATEMENT_FORMS):
         return None
     try:
         start, end = date.fromisoformat(item["start"]), date.fromisoformat(item["end"])
@@ -400,7 +432,8 @@ def _fact(item: Any) -> _Fact | None:
 
 
 def _periods(found: list[_Fact], *, derive: bool) -> tuple[dict[date, _Fact], dict[date, _Fact]]:
-    """(quarters by end date, fiscal years by end date); the latest filing wins for each end date."""
+    """(quarters by end date, fiscal years by end date); for each end date the latest financial-statement filing
+    wins."""
     quarters: dict[date, _Fact] = {}
     years: dict[date, _Fact] = {}
     totals: list[_Fact] = []  # longer than a quarter and starting a fiscal year: half years, 9 months, years

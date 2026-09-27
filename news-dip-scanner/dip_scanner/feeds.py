@@ -10,6 +10,7 @@ import hashlib
 import html
 import io
 import logging
+import math
 import re
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -41,6 +42,8 @@ CONTACT_USER_AGENT_MISSING = (
 
 YAHOO_TICKER_RSS = "https://feeds.finance.yahoo.com/rss/2.0/headline?s={symbol}&region=US&lang=en-US"
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+# ticker_news: context headlines older than this are left out (Google News goes back years for quiet tickers).
+MAX_CONTEXT_AGE = timedelta(days=30)
 
 # Query parameters that only track where a click came from; dropping them makes the same story's links match.
 _TRACKING_PARAMS = {"fbclid", "gclid", "dclid", "msclkid", "mc_cid", "mc_eid", "ref", "ref_src", ".tsrc"}
@@ -51,6 +54,29 @@ _MAX_SOURCE_WORDS = 5
 _MAX_SOURCE_CHARS = 40
 # A suffix with these characters is part of the headline ("- Dow up 500 points", "(0000320193) (Filer)").
 _NOT_A_SOURCE = re.compile(r"[\d()?!:,%$\"]")
+# title_key only drops a " - X" suffix when X is one of these publishers (or the item's own <source>): a suffix can
+# as well be a company ("Profit warning - Puma SE") or part of the headline ("... - and Washington is worried").
+_KNOWN_PUBLISHERS = frozenset(
+    {
+        "reuters", "bloomberg", "bloomberg.com", "bnn bloomberg", "cnbc", "cnbc tv18", "marketwatch",
+        "the wall street journal", "wall street journal", "wsj", "financial times", "ft", "ft.com", "yahoo finance",
+        "yahoo", "yahoo news", "investing.com", "seeking alpha", "barron's", "barrons", "ap", "ap news",
+        "associated press", "the information", "business insider", "insider", "markets insider", "fortune", "forbes",
+        "cnn", "cnn business", "bbc", "bbc news", "the guardian", "guardian", "benzinga", "the motley fool",
+        "motley fool", "nasdaq", "tipranks", "zacks", "zacks investment research", "simply wall st",
+        "simply wall st.", "techcrunch", "the verge", "naftemporiki", "stocktwits", "aol", "msn", "fox business",
+        "the economist", "axios", "politico", "the new york times", "nyt", "the washington post", "morningstar",
+        "thestreet", "investopedia", "24/7 wall st", "24/7 wall st.", "9to5mac", "9to5google", "kiplinger",
+        "electrek", "tom's hardware", "gurufocus", "marketbeat", "finviz", "quartz", "wired", "ars technica",
+        "endpoints news", "fierce biotech", "fiercebiotech", "stat", "stat news", "oilprice.com", "euronews",
+        "investor's business daily", "ibd", "the globe and mail", "nikkei asia", "south china morning post", "scmp",
+        "fxstreet", "proactive investors", "sharecast", "the times", "the telegraph", "evening standard", "sky news",
+        "capital.gr", "business wire", "businesswire", "pr newswire", "globenewswire", "accesswire", "techmeme",
+        "reuters.com", "cnbc.com", "the hill", "semafor", "dow jones newswires",
+    }
+)  # fmt: skip
+# GlobeNewswire links name the language: /news-release/2026/09/27/3369451/0/fr/...
+_GLOBENEWSWIRE_LANGUAGE = re.compile(r"/news-release/\d{4}/\d{2}/\d{2}/\d+/\d+/([a-z]{2}(?:-[a-z]+)?)/")
 
 _DROP_BLOCKS = re.compile(r"<(script|style|head|title)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL)
 _COMMENT = re.compile(r"<!--.*?-->", re.DOTALL)
@@ -110,19 +136,42 @@ def _is_tracking(name: str) -> bool:
     return name.startswith("utm_") or name in _TRACKING_PARAMS
 
 
-def title_key(title: str) -> str:
-    """Normalise a headline for cross-source dedup (casefold, no trailing " - Source", no punctuation).
+def title_key(title: str, publisher: str | None = None) -> str:
+    """Normalise a headline for cross-source dedup (casefold, no trailing " - Publisher", no punctuation).
 
-    The publisher suffix is only dropped when it looks like one: at most 5 words, no digits, brackets or
-    sentence punctuation, and at least two words of headline left in front of it. So "AMD slides - Reuters"
-    and "AMD slides" match, while "8-K - APPLE INC (0000320193) (Filer)" keeps the company name.
+    A trailing " - X" (or " | X", " — X") is only dropped when X is a known publisher (_KNOWN_PUBLISHERS) or the
+    publisher the feed names for the item (publisher, e.g. Google News' <source>), with at least two words of headline
+    left in front; up to two such suffixes go ("... chips – The Information - Investing.com"). So "AMD slides -
+    Reuters" and "AMD slides" match, while "Profit warning - Continental AG" and "Profit warning - Puma SE" don't,
+    and "8-K - APPLE INC (0000320193) (Filer)" keeps the company name.
     """
-    headline, _ = split_source(_WHITESPACE.sub(" ", html.unescape(title or "")).strip())
+    headline = _WHITESPACE.sub(" ", html.unescape(title or "")).strip()
+    for _ in range(2):
+        separators = list(_SEPARATOR.finditer(headline))
+        if not separators:
+            break
+        last = separators[-1]
+        head, suffix = headline[: last.start()].strip(), headline[last.end() :].strip()
+        if len(head.split()) < 2 or not _is_publisher(suffix, publisher):
+            break
+        headline = head
     return " ".join(_PUNCTUATION.sub(" ", headline.casefold()).split())
 
 
+def _is_publisher(name: str, publisher: str | None) -> bool:
+    def norm(text: str) -> str:
+        return " ".join(text.casefold().replace("’", "'").split()).rstrip(".")
+
+    wanted = norm(name)
+    return bool(wanted) and (wanted == norm(publisher or "") or wanted in _KNOWN_PUBLISHERS)
+
+
 def split_source(title: str) -> tuple[str, str | None]:
-    """(headline, publisher) when the title ends in something that looks like " - Publisher", else (title, None)."""
+    """(headline, publisher) when the title ends in something that looks like " - Publisher", else (title, None).
+
+    "Looks like": at most 5 words, no digits, brackets or sentence punctuation, and at least two words of headline
+    in front. Only used to credit aggregator items to their publisher; title_key is stricter.
+    """
     separators = list(_SEPARATOR.finditer(title))
     if not separators:
         return title, None
@@ -180,6 +229,10 @@ def parse_feed(feed: Feed, content: bytes, *, now: datetime, content_type: str |
     Dates are converted to UTC; an item without one gets now, and one dated more than an hour in the future gets
     now too. content_type (the HTTP header) helps feedparser pick the character encoding. Raises FeedParseError
     when the bytes aren't a feed at all; an empty but valid feed gives an empty list.
+
+    Items tagged with a language the feed isn't set up for (Feed.languages; PR Newswire and GlobeNewswire publish
+    machine translations of every release, each with its own link and title) are dropped. Items without a language
+    tag are kept.
     """
     return _parse(feed, content, now=utc(now), content_type=content_type, publisher_names=False)
 
@@ -209,6 +262,8 @@ def _article(feed: Feed, entry: dict, *, now: datetime, publisher_names: bool) -
     summary = strip_html(_entry_text(entry))
     link = canonical_link(_entry_link(entry))
     guid = (entry.get("id") or "").strip()
+    if not _wanted_language(feed, _entry_language(entry, link)):
+        return None
     headline_from_summary = not title
     if headline_from_summary:
         if not summary:
@@ -221,16 +276,17 @@ def _article(feed: Feed, entry: dict, *, now: datetime, publisher_names: bool) -
     else:  # nothing stable to go on: the same headline in the same feed is the same item
         article_id = _sha1(f"{feed.key}\n{title}")
 
-    key = title_key(title)
+    entry_source = strip_html((entry.get("source") or {}).get("title") or "")  # Google News names the publisher
+    key = title_key(title, entry_source or None)
     # Google News descriptions just repeat the headline and publisher; that's no summary.
     if headline_from_summary:
         summary = "" if summary == title else summary
-    elif key and title_key(summary).startswith(key) and len(summary) <= len(title) + 80:
+    elif key and title_key(summary, entry_source or None).startswith(key) and len(summary) <= len(title) + 80:
         summary = ""
 
     source_name = feed.name
     if publisher_names:  # aggregators: credit the publisher from <source>, else from a " - Publisher" suffix
-        publisher = strip_html((entry.get("source") or {}).get("title") or "") or split_source(title)[1]
+        publisher = entry_source or split_source(title)[1]
         source_name = publisher or feed.name
 
     return Article(
@@ -244,6 +300,21 @@ def _article(feed: Feed, entry: dict, *, now: datetime, publisher_names: bool) -
         fetched=now,
         title_key=key,
     )
+
+
+def _entry_language(entry: dict, link: str) -> str:
+    """The item's own language tag (dc:language), else the one in a GlobeNewswire link, lowercased; "" if none."""
+    language = entry.get("language")
+    if isinstance(language, str) and language.strip():
+        return language.strip().lower().replace("_", "-")
+    match = _GLOBENEWSWIRE_LANGUAGE.search(link) if "globenewswire.com" in link else None
+    return match.group(1) if match else ""
+
+
+def _wanted_language(feed: Feed, language: str) -> bool:
+    if not language or not feed.languages:
+        return True
+    return any(language == wanted or language.startswith(f"{wanted}-") for wanted in feed.languages)
 
 
 def _entry_link(entry: dict) -> str:
@@ -432,33 +503,85 @@ def ticker_news(
 ) -> list[Article]:
     """Recent headlines about one ticker (Yahoo per-ticker RSS + Google News), newest first. Never raises.
 
-    Google News is searched for "<company or ticker> stock". Headlines are merged and deduplicated by title_key
-    (so "AMD slides - Reuters" on Google and "AMD slides" on Yahoo count once). Every article's source is
-    "ticker:<SYM>"; Google News items are credited to their publisher when the feed names one.
+    Google News is searched for "<company or ticker> stock when:30d". Only headlines that are about the company are
+    kept (the title or summary names it, or its symbol; Yahoo's per-ticker feed is full of unrelated roundups) and
+    only those at most MAX_CONTEXT_AGE (30 days) old. They are deduplicated by title_key (so "AMD slides - Reuters"
+    on Google and "AMD slides" on Yahoo count once), and neither source gets more than half the places unless the
+    other has too few. Every article's source is "ticker:<SYM>"; Google News items are credited to their publisher
+    when the feed names one.
     """
     now = utc(now) if now is not None else datetime.now(UTC)
     symbol = ticker.strip().upper()
     source = f"ticker:{symbol}"
-    query = f"{(company or '').strip() or symbol} stock"
+    name = _company_core(company or "") or symbol
+    query = f"{name} stock when:{MAX_CONTEXT_AGE.days}d"
     sources = [
         (Feed(key=source, name="Yahoo Finance", url=YAHOO_TICKER_RSS.format(symbol=quote(symbol))), False),
         (Feed(key=source, name="Google News", url=GOOGLE_NEWS_RSS.format(query=quote_plus(query))), True),
     ]
+    about = _mentions_matcher(symbol, company)
+    oldest = now - MAX_CONTEXT_AGE
 
-    articles: list[Article] = []
-    for feed, publisher_names in sources:
+    tagged: list[tuple[int, Article]] = []
+    for index, (feed, publisher_names) in enumerate(sources):
         result = _fetch(session, feed, None, now=now, timeout=timeout, publisher_names=publisher_names)
-        articles += result.articles  # a failed source is logged and gives nothing; use what the other one gave
+        # A failed source is logged and gives nothing; use what the other one gave.
+        tagged += [(index, a) for a in result.articles if utc(a.published) >= oldest and about(a)]
 
-    articles.sort(key=lambda article: article.published, reverse=True)
-    merged: list[Article] = []
+    tagged.sort(key=lambda item: item[1].published, reverse=True)
+    per_source: list[list[Article]] = [[] for _ in sources]
     seen_ids: set[str] = set()
     seen_titles: set[str] = set()
-    for article in articles:
+    for index, article in tagged:
         if article.id in seen_ids or article.title_key in seen_titles:
             continue
         seen_ids.add(article.id)
         if article.title_key:
             seen_titles.add(article.title_key)
-        merged.append(article)
-    return merged[: max(0, limit)]
+        per_source[index].append(article)
+
+    limit = max(0, limit)
+    share = math.ceil(limit / len(sources))
+    chosen = [article for items in per_source for article in items[:share]]
+    rest = sorted((a for items in per_source for a in items[share:]), key=lambda a: a.published, reverse=True)
+    chosen += rest[: max(0, limit - len(chosen))]
+    chosen.sort(key=lambda article: article.published, reverse=True)
+    return chosen[:limit]
+
+
+# Legal-form words left out of a company name before looking for it in a headline.
+_LEGAL_WORDS = frozenset(
+    {"inc", "incorporated", "corp", "corporation", "co", "company", "ltd", "limited", "plc", "sa", "s a", "ag", "nv",
+     "n v", "se", "spa", "s p a", "holdings", "holding", "group", "the", "class", "a", "b", "adr", "llc", "lp"}
+)  # fmt: skip
+
+
+def _company_core(company: str) -> str:
+    """ "Advanced Micro Devices, Inc." -> "Advanced Micro Devices": the name without legal-form words."""
+    words = _PUNCTUATION.sub(" ", company.replace("&", " and ")).split()
+    while words and words[-1].casefold() in _LEGAL_WORDS:
+        words.pop()
+    while words and words[0].casefold() == "the":
+        words.pop(0)
+    return " ".join(words)
+
+
+def _mentions_matcher(symbol: str, company: str | None):
+    """A test for "is this article about the company": its name (without legal-form words) as whole words, or its
+    symbol without the exchange suffix, case-sensitive; symbols of one or two letters only as $T, (T) or :T."""
+    bare = symbol.split(".")[0]  # OPAP.AT -> OPAP
+    if len(bare) <= 2:
+        symbol_pattern = re.compile(rf"(?:\$|\(|:){re.escape(bare)}\b")
+    else:
+        symbol_pattern = re.compile(rf"(?<![\w$-]){re.escape(bare)}(?![\w-])|\${re.escape(bare)}\b")
+    core = _company_core(company or "").casefold()
+    name_pattern = re.compile(rf"\b{re.escape(core)}\b") if core else None
+
+    def about(article: Article) -> bool:
+        text = f"{article.title} {article.summary}"
+        if symbol_pattern.search(text):
+            return True
+        plain = " ".join(_PUNCTUATION.sub(" ", text.replace("&", " and ").casefold()).split())
+        return bool(name_pattern and name_pattern.search(plain))
+
+    return about

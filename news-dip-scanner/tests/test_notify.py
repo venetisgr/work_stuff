@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import logging
 import smtplib
+from datetime import timedelta
 
 import pytest
 import requests
-from conftest import FakeResponse, FakeSession, make_analysis, make_opportunity
+from conftest import NOW, FakeResponse, FakeSession, make_analysis, make_opportunity
 
 from dip_scanner.config import ConfigError, NotifySettings
 from dip_scanner.notify import (
+    ALERT_FOOTER,
     DISCORD_LIMIT,
     MAX_RETRY_WAIT,
     SLACK_LIMIT,
@@ -153,6 +155,34 @@ def test_email_without_user_does_not_log_in():
 def test_email_sender_defaults_to_the_smtp_user():
     notifier = EmailNotifier(email_settings(smtp_from=None), smtp_factory=smtp_factory([]))
     assert notifier.sender == "bot@example.com"
+
+
+@pytest.mark.parametrize(
+    ("step", "message"),
+    [
+        ("starttls", "doesn't offer STARTTLS"),
+        # Regression: a server without AUTH (or an address needing SMTPUTF8) was also blamed on STARTTLS, with the
+        # advice to turn TLS off.
+        ("login", "unset SMTP_USER"),
+        ("send_message", "SMTPUTF8"),
+    ],
+)
+def test_email_names_the_step_the_server_does_not_support(monkeypatch, step, message):
+    created: list[FakeSMTP] = []
+    error = {
+        "starttls": "STARTTLS extension not supported by server.",
+        "login": "SMTP AUTH extension not supported by server.",
+        "send_message": "SMTPUTF8 not supported by server",
+    }[step]
+
+    def unsupported(*args, **kwargs):
+        raise smtplib.SMTPNotSupportedError(error)
+
+    monkeypatch.setattr(FakeSMTP, step, unsupported)
+    with pytest.raises(NotifyError, match=message) as caught:
+        EmailNotifier(email_settings(), smtp_factory=smtp_factory(created)).send("s", "m", "<p>h</p>")
+    if step != "starttls":
+        assert "STARTTLS" not in str(caught.value)
 
 
 def test_email_login_failure_is_a_notify_error():
@@ -453,8 +483,22 @@ def test_short_alert_one_line_per_opportunity_best_first():
         "- AMD (Advanced Micro Devices) · score 72.4 · 68% chance up in 6m · price $142.50 · entry $132.00 · "
         "target $168.00 (+17.9%) · low $118.00 · Temporary fear, medium confidence"
     )
-    assert lines[3].startswith("Not investment advice")
+    # The numbers are the model's uncalibrated estimate, and the low is no floor: the alert says so itself.
+    assert lines[3] == ALERT_FOOTER and "uncalibrated" in ALERT_FOOTER and "not a floor" in ALERT_FOOTER
+    assert "Not investment advice" in ALERT_FOOTER
     assert len(lines) == 4
+
+
+def test_short_alert_labels_alerts_that_could_not_be_sent_earlier():
+    """Regression: a 20-hour-old retried alert was listed as "new", next to the newer analysis of the same stock."""
+    now = NOW + timedelta(hours=20)
+    retried = make_opportunity(ticker="NVDA", score=70.0)  # analysed at NOW
+    fresh = make_opportunity(created=now)
+    lines = short_alert([retried, fresh], now=now).splitlines()
+    assert lines[0] == "1 new dip opportunity, 1 not sent earlier:"
+    assert lines[1].startswith("- AMD") and "not sent earlier" not in lines[1]
+    assert lines[2].endswith("· not sent earlier: analysed 20.0h ago (2026-09-25 15:00 UTC)")
+    assert short_alert([retried], now=now).splitlines()[0] == "1 dip opportunity not sent earlier:"
 
 
 def test_short_alert_empty_and_single():

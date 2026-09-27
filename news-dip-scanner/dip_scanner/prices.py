@@ -5,7 +5,9 @@ browser-like User-Agent. Its meta block has the live price (regularMarketPrice a
 range; the timestamp and indicators.quote arrays hold one row per session, with nulls for rows Yahoo has no prices
 for. Daily bars are stamped at the session open, so a bar's day is its date in the exchange's time zone.
 
-Beware meta.chartPreviousClose: it is the close before the requested range starts, not yesterday's close.
+Beware meta.chartPreviousClose: it is the close before the requested range starts, not yesterday's close. And the
+bars are split-adjusted after the fact: once a stock splits 10:1, every earlier bar is divided by 10, so prices
+recorded before a split can only be compared with them after scaling (history_since returns the splits too).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
-from .models import PriceBar, PriceStats, utc
+from .models import PriceBar, PriceStats, Split, utc
 
 log = logging.getLogger(__name__)
 
@@ -42,6 +44,9 @@ VOLATILITY_RETURNS = 60
 VOLUME_SESSIONS = 20
 DRAWDOWN_WINDOW = 126  # about 6 months of sessions
 STAT_LOW_Z = 1.645  # 5th percentile of the normal distribution
+# During the session the volume so far is compared with this share of a normal day at least, so the first minutes
+# (thin data, and the open is busier than the average minute) can't produce an absurd pace.
+MIN_SESSION_SHARE = 0.1
 # A quote older than this means the stock isn't trading (suspended or delisted); long holidays are shorter.
 STALE_AFTER = timedelta(days=14)
 
@@ -97,12 +102,17 @@ class YahooPrices:
 
         Raises PriceError when Yahoo has no data for the symbol and PriceFetchError when Yahoo can't be reached.
         """
+        meta, bars, _ = self._chart(ticker, {"range": range_, "interval": interval})
+        return meta, bars
+
+    def _chart(self, ticker: str, params: dict[str, str]) -> tuple[dict, list[PriceBar], list[Split]]:
         symbol = _symbol(ticker)
-        result = self._fetch(symbol, {"range": range_, "interval": interval})
+        result = self._fetch(symbol, params)
         meta = result.get("meta")
         if not isinstance(meta, dict):
             raise PriceError(f"Yahoo Finance returned no quote details for {symbol}.")
-        return meta, parse_bars(result, _exchange_tz(meta))
+        tz = _exchange_tz(meta)
+        return meta, parse_bars(result, tz), parse_splits(result, tz)
 
     def stats(self, ticker: str, *, now: datetime | None = None) -> PriceStats:
         """PriceStats for a ticker, cached for cache_seconds.
@@ -132,6 +142,18 @@ class YahooPrices:
         today = utc(now if now is not None else self._clock()).date()
         _, bars = self.chart(ticker, range_=range_for(start, today))
         return [bar for bar in bars if bar.day >= start]
+
+    def history_since(
+        self, ticker: str, start: date, *, now: datetime | None = None
+    ) -> tuple[list[PriceBar], list[Split]]:
+        """Daily bars from start (inclusive) to today plus the splits Yahoo reports in the range, oldest first.
+
+        The bars are adjusted for every split, including ones after start: compare prices recorded earlier with them
+        only after dividing by the ratios of the splits since (see track.evaluate).
+        """
+        today = utc(now if now is not None else self._clock()).date()
+        _, bars, splits = self._chart(ticker, {"range": range_for(start, today), "interval": "1d", "events": "split"})
+        return [bar for bar in bars if bar.day >= start], splits
 
     def _fetch(self, symbol: str, params: dict[str, str]) -> dict:
         """The chart result for symbol: query1 first, query2 on connection errors and 5xx, one retry after a 429."""
@@ -241,6 +263,27 @@ def parse_bars(result: dict, tz: tzinfo) -> list[PriceBar]:
     return [by_day[day] for day in sorted(by_day)]
 
 
+def parse_splits(result: dict, tz: tzinfo) -> list[Split]:
+    """The splits in a chart result (requested with events=split), oldest first.
+
+    Yahoo sends events.splits as {"<epoch>": {"date": epoch, "numerator": 10, "denominator": 1, ...}}; the date is the
+    ex-date's session open, so its exchange-local date is the ex-date. Entries without a positive ratio are skipped.
+    """
+    events = result.get("events")
+    raw = events.get("splits") if isinstance(events, dict) else None
+    splits: list[Split] = []
+    for item in raw.values() if isinstance(raw, dict) else ():
+        if not isinstance(item, dict):
+            continue
+        stamp, numerator, denominator = item.get("date"), item.get("numerator"), item.get("denominator")
+        if not (_is_number(stamp) and _positive(numerator) and _positive(denominator)):
+            continue
+        ratio = float(numerator) / float(denominator)
+        if ratio != 1:
+            splits.append(Split(day=datetime.fromtimestamp(stamp, UTC).astimezone(tz).date(), ratio=ratio))
+    return sorted(splits, key=lambda split: split.day)
+
+
 def range_for(start: date, today: date) -> str:
     """The smallest Yahoo range whose history reaches back to start."""
     days = (today - start).days + _RANGE_MARGIN_DAYS
@@ -253,7 +296,13 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     The latest session is the exchange-local day of regularMarketTime. Its close is the live price (regularMarketPrice)
     whether or not Yahoo has sent a bar for it yet, so the same numbers come out during the session, after the close
     and before the next open. previous_close is the close of the last bar before that day; the 5- and 20-day changes
-    compare the price with the close 5 and 20 sessions before the latest one.
+    compare the price with the close 5 and 20 sessions before the latest one. Bars dated after that day (placeholder
+    rows Yahoo sometimes adds for a holiday) are ignored.
+
+    volume_ratio compares the latest session's volume with the average of the 20 before it. While the session is
+    still running (regularMarketTime inside meta.currentTradingPeriod.regular), the latest bar only holds the volume
+    so far, so the average is pro-rated to the share of the session that has passed (at least MIN_SESSION_SHARE),
+    and session_elapsed says how far the session was.
     """
     bars = sorted(bars, key=lambda bar: bar.day)
     if len(bars) < MIN_BARS:
@@ -268,7 +317,7 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     market_day = as_of.astimezone(tz).date()
 
     before = [bar for bar in bars if bar.day < market_day]  # completed sessions before the latest one
-    latest = bars[-1] if bars[-1].day >= market_day else None  # the latest session's bar, if Yahoo sent it
+    latest = next((bar for bar in bars if bar.day == market_day), None)  # the latest session's bar, if Yahoo sent it
     if len(before) < MIN_BARS - 1:
         raise PriceError(
             f"{ticker} has only {len(before)} sessions of prices before {market_day}; at least {MIN_BARS - 1} are "
@@ -287,6 +336,12 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
     low_52w = min(low_52w, price)
     volatility = _volatility_pct(closes[-(VOLATILITY_RETURNS + 1) :])
     base_volume = statistics.fmean(bar.volume for bar in before[-VOLUME_SESSIONS:])
+    elapsed = _session_elapsed(meta, market_time) if latest is not None else None
+    volume_ratio = None
+    if latest is not None and base_volume > 0:
+        share = 1.0 if elapsed is None else max(MIN_SESSION_SHARE, elapsed)
+        volume_ratio = latest.volume / (base_volume * share)
+    zone = meta.get("exchangeTimezoneName")
     name = meta.get("longName") or meta.get("shortName")
     name = " ".join(name.split()) if isinstance(name, str) else ""  # shortName can end in padding
     return PriceStats(
@@ -309,10 +364,29 @@ def compute_stats(ticker: str, meta: dict, bars: list[PriceBar]) -> PriceStats:
         sma_50=statistics.fmean(closes[-50:]) if len(closes) >= 50 else None,
         sma_200=statistics.fmean(closes[-200:]) if len(closes) >= 200 else None,
         volatility_pct=volatility,
-        volume_ratio=latest.volume / base_volume if latest is not None and base_volume > 0 else None,
+        volume_ratio=volume_ratio,
         stat_low_6m=price * math.exp(-STAT_LOW_Z * (volatility / 100) * math.sqrt(0.5)),
         worst_6m_drawdown_pct=worst_drawdown_pct(closes, DRAWDOWN_WINDOW),
+        session_elapsed=elapsed,
+        timezone=zone.strip() if isinstance(zone, str) and zone.strip() else None,
+        instrument_type=str(meta.get("instrumentType") or "").strip().upper() or None,
     )
+
+
+def _session_elapsed(meta: dict, market_time: Any) -> float | None:
+    """The share of the regular session that had passed at market_time, or None when it wasn't during the session.
+
+    After the close (and on weekends) currentTradingPeriod can describe the last or the next session, so only a
+    quote time strictly inside [start, end) counts as a session in progress.
+    """
+    period = meta.get("currentTradingPeriod")
+    regular = period.get("regular") if isinstance(period, dict) else None
+    if not isinstance(regular, dict) or not _is_number(market_time):
+        return None
+    start, end = regular.get("start"), regular.get("end")
+    if not (_is_number(start) and _is_number(end)) or end <= start or not start <= market_time < end:
+        return None
+    return (market_time - start) / (end - start)
 
 
 def _volatility_pct(closes: Sequence[float]) -> float:

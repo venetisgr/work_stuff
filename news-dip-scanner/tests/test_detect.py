@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 import requests
@@ -292,6 +293,29 @@ def test_cooldown_lets_a_ticker_through(created_hours_ago, cooldown_hours, fetch
     assert notes == []
 
 
+def test_news_the_last_analysis_never_saw_lifts_the_cooldown_even_if_fetched_before_it():
+    """Regression: an article polled in the same cycle as the analysis but triaged a cycle later (the model was
+    unavailable) had fetched == created, so its serious news was treated as old and the ticker locked for 24h."""
+    seen = news(hours_ago=3)
+    late = news(title="AMD CFO resigns amid accounting probe", hours_ago=2.5, fetched_hours_ago=2, magnitude=5)
+    last = make_opportunity(created=NOW - timedelta(hours=2), article_ids=[seen[1].id])
+
+    candidates, notes = select([late, seen], FakePrices({"AMD": make_stats()}), FakeStore(last={"AMD": last}))
+
+    assert [candidate.ticker for candidate in candidates] == ["AMD"] and notes == []
+
+
+def test_syndicated_copies_of_one_story_add_no_corroboration():
+    stats = make_stats(change_1d_pct=-4.0, change_5d_pct=-3.0, drawdown_20d_pct=-5.0, volume_ratio=None)
+    story = news(title="HPE stock drops 11% after Evercore downgrade")
+    copies = [
+        (make_impact(article_id=article.id), article)
+        for article in (replace(story[1], id=f"copy-{n}", link=f"https://news.example.com/{n}") for n in range(3))
+    ]
+    assert severity(stats, copies) == severity(stats, copies[:1])  # one story, however many links
+    assert severity(stats, [*copies, news(title="HPE cuts its outlook")]) == severity(stats, copies[:1]) + 0.5
+
+
 def test_cooldown_ignores_articles_the_last_analysis_already_used():
     impacts = [news(hours_ago=3, fetched_hours_ago=1)]
     last = make_opportunity(created=NOW - timedelta(hours=2), article_ids=[impacts[0][1].id])
@@ -398,9 +422,8 @@ def test_every_skipped_ticker_is_named_in_the_notes():
             "MSFT": make_stats(ticker="MSFT", **NO_DIP),
         }
     )
-    store = FakeStore(
-        last={"NVDA": make_opportunity(ticker="NVDA", created=NOW - timedelta(hours=1))}, valid={"ZZZZ": False}
-    )
+    nvda = make_opportunity(ticker="NVDA", created=NOW - timedelta(hours=1), article_ids=[impacts[3][1].id])
+    store = FakeStore(last={"NVDA": nvda}, valid={"ZZZZ": False})
     cfg = config(universe={"exclude": ("GME",), "allowed_suffixes": ("",)})
 
     candidates, notes = select(impacts, prices, store, cfg)
@@ -410,3 +433,93 @@ def test_every_skipped_ticker_is_named_in_the_notes():
     for ticker in ("GME", "AAPL", "NVDA", "ZZZZ", "NOPE", "PENNY", "MSFT", "0700.HK", "OLD"):
         assert ticker in text, ticker
     assert "AMD" not in text
+
+
+# --- news that came out after the last session ---------------------------------------------------------------------
+
+FRIDAY_CLOSE = datetime(2026, 9, 25, 20, 0, tzinfo=UTC)
+SUNDAY = datetime(2026, 9, 27, 17, 21, tzinfo=UTC)
+NEW_YORK = "America/New_York"
+
+
+def test_a_drop_from_an_earlier_session_is_dated_not_today():
+    stats = make_stats(as_of=FRIDAY_CLOSE, timezone=NEW_YORK, change_1d_pct=-3.3)
+    assert dip_reasons(stats, DipConfig(), now=SUNDAY)[0] == "down 3.3% on Fri 25 Sep"
+    assert (
+        dip_reasons(stats, DipConfig(), now=FRIDAY_CLOSE + timedelta(hours=3))[0] == "down 3.3% today"
+    )  # 19:00 in New York
+    assert dip_reasons(stats, DipConfig())[0] == "down 3.3% today"
+
+
+def test_weekend_news_is_labelled_as_not_yet_priced():
+    """Regression (smoke run): Sunday headlines were paired with Friday's drop, "down 3.3% today", as if the market
+    had reacted to them."""
+    stats = make_stats(as_of=FRIDAY_CLOSE, timezone=NEW_YORK, change_1d_pct=-3.3)
+    article = make_article(title="Meta slides after Goldman cut", published=SUNDAY - timedelta(hours=13.5))
+    impacts = [(make_impact(article_id=article.id, ticker="META"), article)]
+
+    [candidate], notes = select_candidates(
+        impacts, FakePrices({"META": replace(stats, ticker="META")}), FakeStore(), config(), now=SUNDAY
+    )
+
+    assert candidate.news_after_session and notes == []
+    assert candidate.dip_reasons[0] == "down 3.3% on Fri 25 Sep"
+    assert candidate.dip_reasons[-1] == (
+        "no trading since this news (last session Fri 25 Sep); the price has not reacted to it yet"
+    )
+
+    # News from before the close is what the drop may be reacting to: no label.
+    before = make_article(title="Meta slides after Goldman cut", published=FRIDAY_CLOSE - timedelta(hours=2))
+    [candidate], _ = select_candidates(
+        [(make_impact(article_id=before.id, ticker="META"), before)],
+        FakePrices({"META": replace(stats, ticker="META")}),
+        FakeStore(),
+        config(),
+        now=SUNDAY,
+    )
+    assert not candidate.news_after_session and "no trading" not in " ".join(candidate.dip_reasons)
+
+
+def test_an_analysis_before_the_market_reacted_is_redone_after_the_first_session_moves():
+    """Regression: the Monday -10% reaction to Sunday's news was skipped for 24h ("no new news since")."""
+    friday = make_stats(ticker="META", as_of=FRIDAY_CLOSE, timezone=NEW_YORK, change_1d_pct=-3.3)
+    article = make_article(title="Meta slides after Goldman cut", published=SUNDAY - timedelta(hours=13.5))
+    impacts = [(make_impact(article_id=article.id, ticker="META"), article)]
+    last = make_opportunity(
+        ticker="META", created=SUNDAY, stats=friday, article_ids=[article.id], news_after_session=True
+    )
+    monday = datetime(2026, 9, 28, 15, 0, tzinfo=UTC)
+
+    def select_on_monday(change_1d_pct):
+        stats = replace(friday, as_of=monday - timedelta(minutes=15), change_1d_pct=change_1d_pct)
+        store = FakeStore(last={"META": last})
+        return select_candidates(impacts, FakePrices({"META": stats}), store, config(), now=monday)
+
+    [candidate], _ = select_on_monday(-10.0)
+    assert candidate.ticker == "META" and not candidate.news_after_session
+
+    candidates, notes = select_on_monday(-0.5)  # nothing much happened: still in the cooldown
+    assert candidates == [] and "cooldown" in notes[0]
+
+
+def test_min_price_counts_pence_and_cents_quotes_in_pounds_and_rand():
+    """Regression: a 5p London stock (quoted as GBp 5.0) passed min_price 1.0."""
+    prices = FakePrices(
+        {
+            "PENNY.L": make_stats(ticker="PENNY.L", price=5.0, currency="GBp"),
+            "VOD.L": make_stats(ticker="VOD.L", price=150.0, currency="GBp"),
+        }
+    )
+    candidates, notes = select([news("PENNY.L"), news("VOD.L")], prices)
+    assert [candidate.ticker for candidate in candidates] == ["VOD.L"]
+    assert notes == ["Price below [universe] min_price 1: PENNY.L (5.00 GBp)"]
+
+
+def test_funds_and_indices_are_not_candidates():
+    """Regression: an ETF the triage mapped (SOXL) got a company "fear vs fundamentals" analysis."""
+    store = FakeStore()
+    prices = FakePrices({"SOXL": make_stats(ticker="SOXL", instrument_type="ETF"), "AMD": make_stats()})
+    candidates, notes = select([news("SOXL"), news("AMD")], prices, store)
+    assert [candidate.ticker for candidate in candidates] == ["AMD"]
+    assert notes == ["Not a company's shares (a fund, index or other instrument; marked invalid): SOXL"]
+    assert ("SOXL", False, NOW) in store.marked

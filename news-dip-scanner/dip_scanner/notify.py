@@ -17,6 +17,7 @@ import smtplib
 import ssl
 import time
 from collections.abc import Callable, Iterable
+from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid, parseaddr
 from typing import Any, Protocol
@@ -25,8 +26,8 @@ from urllib.parse import urlsplit
 import requests
 
 from .config import WEBHOOK_FORMATS, ConfigError, NotifySettings
-from .models import Opportunity
-from .report import format_pct, format_price, safe_url, verdict_label
+from .models import Opportunity, utc
+from .report import format_pct, format_price, format_when, safe_url, verdict_label
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,10 @@ TELEGRAM_LIMIT = 4000  # Telegram allows 4,096
 MAX_MESSAGES = 10  # chat messages per send; beyond that the text is cut with TRUNCATED_NOTE
 TRUNCATED_NOTE = "… (cut short: the full report is in the reports folder)"
 MAX_RETRY_WAIT = 10.0  # seconds; a 429 is retried once after the wait the service asks for (capped at this)
+ALERT_FOOTER = (
+    "Chances and scores are a language model's uncalibrated estimate (see `dip-scanner track`); the potential low "
+    "is not a floor or a stop. Not investment advice; check before placing any order."
+)
 TELEGRAM_API = "https://api.telegram.org"
 SMTP_IMPLICIT_TLS_PORT = 465
 
@@ -150,7 +155,13 @@ class EmailNotifier:
         try:
             with self._connect(self.host, self.port, self.implicit_tls, self._timeout) as smtp:
                 if self.starttls:
-                    smtp.starttls(context=ssl.create_default_context())
+                    try:
+                        smtp.starttls(context=ssl.create_default_context())
+                    except smtplib.SMTPNotSupportedError as exc:
+                        raise NotifyError(
+                            f"{where} doesn't offer STARTTLS. Use port 465 for implicit TLS, or set "
+                            "SMTP_STARTTLS=false only for a server on a trusted network."
+                        ) from exc
                 if self.user:
                     smtp.login(self.user, self._password)
                 refused = smtp.send_message(
@@ -161,10 +172,10 @@ class EmailNotifier:
                 f"{where} rejected the login for {self.user} ({exc.smtp_code}). Check SMTP_USER and SMTP_PASSWORD "
                 "(many providers need an app password)."
             ) from exc
-        except smtplib.SMTPNotSupportedError as exc:
+        except smtplib.SMTPNotSupportedError as exc:  # from login (no AUTH offered) or sending (needs SMTPUTF8)
             raise NotifyError(
-                f"{where} doesn't offer STARTTLS. Use port 465 for implicit TLS, or set SMTP_STARTTLS=false only "
-                "for a server on a trusted network."
+                f"{where} doesn't support what this email needs: {exc} If it offers no login (AUTH), unset "
+                "SMTP_USER or use the provider's submission port (587 or 465)."
             ) from exc
         except (smtplib.SMTPException, OSError) as exc:
             raise NotifyError(f"Couldn't send the email through {where}: {exc}") from exc
@@ -551,19 +562,31 @@ def build_notifiers(settings: NotifySettings, *, session=None) -> list[Notifier]
     return notifiers
 
 
-def short_alert(opps: list[Opportunity]) -> str:
+def _opportunities(count: int) -> str:
+    return "opportunity" if count == 1 else "opportunities"
+
+
+def short_alert(opps: list[Opportunity], *, now: datetime | None = None) -> str:
     """Compact text for chat notifiers: a count line, then one line per opportunity (best score first), e.g.
 
     - AMD (Advanced Micro Devices) · score 72.4 · 68% chance up in 6m · price $142.50 · entry $132.00 ·
       target $168.00 (+17.9%) · low $118.00 · Temporary fear, medium confidence
 
-    (on one line), and a not-investment-advice reminder.
+    (on one line), and a reminder that the numbers are an uncalibrated model estimate and not investment advice.
+    Given now, opportunities analysed before it (alerts that couldn't be sent earlier) say how old they are.
     """
     if not opps:
         return "No new dip opportunities."
     ranked = sorted(opps, key=lambda opp: opp.score, reverse=True)
-    count = len(ranked)
-    lines = [f"{count} new dip {'opportunity' if count == 1 else 'opportunities'}:"]
+    earlier = [opp for opp in ranked if now is not None and utc(opp.created) < utc(now)]
+    fresh = len(ranked) - len(earlier)
+    if not earlier:
+        head = f"{fresh} new dip {_opportunities(fresh)}"
+    elif fresh:
+        head = f"{fresh} new dip {_opportunities(fresh)}, {len(earlier)} not sent earlier"
+    else:
+        head = f"{len(earlier)} dip {_opportunities(len(earlier))} not sent earlier"
+    lines = [f"{head}:"]
     for opp in ranked:
         analysis, currency = opp.analysis, opp.currency
         parts = [
@@ -576,6 +599,9 @@ def short_alert(opps: list[Opportunity]) -> str:
             f"low {format_price(analysis.potential_low, currency)}",
             f"{verdict_label(analysis.verdict)}, {analysis.confidence} confidence",
         ]
+        if opp in earlier:
+            hours = (utc(now) - utc(opp.created)).total_seconds() / 3600
+            parts.append(f"not sent earlier: analysed {hours:.1f}h ago ({format_when(opp.created)})")
         lines.append("- " + " · ".join(parts))
-    lines.append("Not investment advice; check before placing any order.")
+    lines.append(ALERT_FOOTER)
     return "\n".join(lines)

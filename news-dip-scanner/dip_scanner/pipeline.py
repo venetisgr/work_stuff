@@ -24,7 +24,7 @@ from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError
 from .models import Candidate, Feed, Opportunity, utc
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
 from .prices import YahooPrices
-from .report import render_html, render_markdown, write_reports
+from .report import format_price, format_when, render_html, render_markdown, verdict_label, write_reports
 from .store import Store
 from .triage import normalise_ticker, triage
 
@@ -33,6 +33,11 @@ log = logging.getLogger(__name__)
 CONTEXT_NEWS_LIMIT = 15  # per-ticker headlines (Yahoo + Google News) added to each analysis
 PRUNE_EVERY = timedelta(days=1)
 ALERT_RETRY_WINDOW = timedelta(hours=24)  # alerts that couldn't be sent are retried for this long
+# A ticker alerted within this long (the 6-month horizon of the idea) whose new analysis no longer passes [alerts],
+# or whose chance of being higher fell by THESIS_DROP_POINTS or more, gets a "thesis change" notice.
+THESIS_WINDOW = timedelta(days=183)
+THESIS_DROP_POINTS = 20
+THESIS_TITLE = "Thesis changes: review open orders"
 # After a failed analysis a ticker waits this long before the next try, doubling with every failure in a row (up to
 # MAX_FAILURE_BACKOFF), so one article the model keeps choking on doesn't cost a request every five minutes.
 FAILURE_BACKOFF = timedelta(minutes=30)
@@ -59,6 +64,8 @@ class CycleResult:
     candidates: int = 0
     opportunities: list[Opportunity] = field(default_factory=list)
     alerts: list[Opportunity] = field(default_factory=list)
+    # (the earlier alert, the new analysis that no longer supports it), sent as "thesis change" notices
+    thesis_changes: list[tuple[Opportunity, Opportunity]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     report_paths: list[Path] = field(default_factory=list)
 
@@ -133,6 +140,9 @@ class Scanner:
         "New" counts the articles young enough to triage ([scan] max_article_age_hours): older new ones are stored
         as skipped, which is what keeps the first cycle after a fresh install from triaging days of backlog. A 304
         (not modified) counts as ok.
+
+        The articles are stored before the feeds' new ETag/Last-Modified are saved: if storing fails, the next poll
+        asks again without them and gets the items again, instead of a 304 that would lose them.
         """
         now = utc(now)
         states = {feed.key: state for feed in self.feeds if (state := self.store.feed_state(feed.key)) is not None}
@@ -144,6 +154,13 @@ class Scanner:
             now=now,
             user_agents=self.user_agents,
         )
+        listed = [article for result in results for article in result.articles]
+        new = self.store.add_articles(
+            listed,
+            max_age_hours=self.config.scan.max_article_age_hours,
+            now=now,
+            same_source_titles={feed.key for feed in self.feeds if not feed.dedup_titles},
+        )
         ok = failed = 0
         for result in results:
             self.store.save_feed_state(
@@ -153,8 +170,6 @@ class Scanner:
                 ok += 1
             else:
                 failed += 1
-        listed = [article for result in results for article in result.articles]
-        new = self.store.add_articles(listed, max_age_hours=self.config.scan.max_article_age_hours, now=now)
         log.debug(
             "Polled %d feed(s): %d ok, %d failed; %d article(s) listed, %d new.",
             len(results),
@@ -170,7 +185,10 @@ class Scanner:
 
         A failed analysis is noted and the next candidate is tried (the ticker then waits, see FAILURE_BACKOFF);
         when the analysis model is unreachable the remaining candidates are left for the next cycle. LLMSetupError
-        and ConfigError propagate: no later call could succeed. Notification failures are noted, never raised.
+        and ConfigError stop the analyses (no later call could succeed): the opportunities already found are still
+        reported and alerted, then the error propagates. Notification failures are noted, never raised.
+        Without notifications (notify=False or no channel set up) the cycle's opportunities count as handled, so a
+        later run doesn't send them.
         """
         now = utc(now) if now is not None else utc(self._clock())
         started = time.monotonic()
@@ -178,6 +196,13 @@ class Scanner:
         result = CycleResult(started=now)
 
         result.feeds_ok, result.feeds_failed, result.new_articles = self.poll(now)
+        # Articles left pending by an unavailable model are only worth triaging while they're young enough.
+        stale = self.store.skip_stale_pending(now - timedelta(hours=scan.max_article_age_hours))
+        if stale:
+            log.info(
+                "Skipped %s older than [scan] max_article_age_hours that the model couldn't triage in time.",
+                _count(stale, "pending article"),
+            )
         result.triaged, impacts = triage(
             self.triage_model,
             self.store,
@@ -188,11 +213,13 @@ class Scanner:
         result.impacts = len(impacts)
 
         recent = self.store.recent_impacts(now - timedelta(hours=scan.lookback_hours))
-        candidates, notes = select_candidates(recent, self.prices, self.store, self.config, now=now)
+        candidates, notes = select_candidates(
+            recent, self.prices, self.store, self.config, now=now, waiting=lambda ticker: self._waiting(ticker, now)
+        )
         result.notes.extend(notes)
-        candidates = self._ready(candidates, now, result.notes)
         result.candidates = len(candidates)
 
+        fatal: Exception | None = None
         for index, candidate in enumerate(candidates):
             try:
                 opportunity = self._analyze(candidate, now)
@@ -201,8 +228,12 @@ class Scanner:
                 result.notes.append(f"The analysis model is unavailable, left for the next cycle: {left} ({exc})")
                 log.warning("%s", result.notes[-1])
                 break
-            except (LLMSetupError, ConfigError):
-                raise
+            except (LLMSetupError, ConfigError) as exc:  # no later call can work; report what was found first
+                left = ", ".join(c.ticker for c in candidates[index:])
+                result.notes.append(f"Analysis stopped, the model can't be used: {exc}. Not analysed: {left}")
+                log.error("%s", result.notes[-1])
+                fatal = exc
+                break
             except Exception as exc:  # LLMError, or a bug: note it, back off this ticker, go on with the next
                 failures = self.store.record_analysis_failure(candidate.ticker, when=now, error=str(exc))
                 result.notes.append(
@@ -214,13 +245,21 @@ class Scanner:
             self.store.clear_analysis_failures(candidate.ticker)
             result.opportunities.append(self.store.add_opportunity(opportunity))
 
-        if result.opportunities:
-            result.report_paths = write_reports(
-                result.opportunities, self.settings.data_dir, generated=now, notes=result.notes
-            )
-        result.alerts = [opp for opp in result.opportunities if self.is_alert(opp)]
-        if self.notify:
-            self._send_alerts(now, result)
+        try:
+            if result.opportunities:
+                result.report_paths = write_reports(
+                    result.opportunities, self.settings.data_dir, generated=now, notes=result.notes
+                )
+            result.alerts = [opp for opp in result.opportunities if self.is_alert(opp)]
+            if self.notify and self.notifiers:
+                self._send_alerts(now, result)
+            else:  # shown in the summary and the report; a later notifying run mustn't push them (like `analyze`)
+                self.store.mark_notified(
+                    [opp.id for opp in result.opportunities if opp.id is not None], when=now, sent=False
+                )
+        finally:
+            if fatal is not None:
+                raise fatal  # after the report and the alerts, so the analyses already paid for aren't stranded
         self._prune(now)
         result.finished = now + timedelta(seconds=time.monotonic() - started)
         return result
@@ -234,18 +273,12 @@ class Scanner:
             and opp.analysis.verdict in alerts.verdicts
         )
 
-    def _ready(self, candidates: list[Candidate], now: datetime, notes: list[str]) -> list[Candidate]:
-        """The candidates whose last analysis didn't fail recently (see FAILURE_BACKOFF)."""
-        ready, waiting = [], []
-        for candidate in candidates:
-            failed = self.store.analysis_failures(candidate.ticker)
-            if failed is not None and now < (retry := _retry_at(failed[1], failed[0])):
-                waiting.append(f"{candidate.ticker} ({_count(failed[0], 'failure')}, next try {retry:%H:%M} UTC)")
-            else:
-                ready.append(candidate)
-        if waiting:
-            notes.append(f"Analysis failed recently, waiting before trying again: {', '.join(waiting)}")
-        return ready
+    def _waiting(self, ticker: str, now: datetime) -> str | None:
+        """Why a ticker waits (its last analysis failed recently, see FAILURE_BACKOFF), or None when it may go."""
+        failed = self.store.analysis_failures(ticker)
+        if failed is not None and now < (retry := _retry_at(failed[1], failed[0])):
+            return f"{ticker} ({_count(failed[0], 'failure')}, next try {retry:%H:%M} UTC)"
+        return None
 
     def _analyze(self, candidate: Candidate, now: datetime, *, context_news: bool | None = None) -> Opportunity:
         """Gather per-ticker news and fundamentals for a candidate and ask the analysis model."""
@@ -260,39 +293,122 @@ class Scanner:
         return analyze_candidate(self.analysis_model, candidate, fundamentals=fundamentals, extra_news=extra, now=now)
 
     def _send_alerts(self, now: datetime, result: CycleResult) -> None:
-        """Send this cycle's alerts, plus any from the last day that couldn't be sent, to every notifier.
+        """Send this cycle's alerts and thesis changes, plus any from the last day that couldn't be sent.
+
+        Only the newest analysis of a ticker counts: an older unsent one is superseded (never sent, even when the
+        newer analysis isn't an alert). An alert for a ticker already alerted within [alerts] repeat_hours is only
+        sent when something material changed (see _material); otherwise it is noted and dropped. A new analysis of a
+        ticker alerted within THESIS_WINDOW that no longer passes [alerts] (or whose chance of being higher fell by
+        THESIS_DROP_POINTS) is sent as a "thesis change", so open orders on the earlier idea get reviewed.
 
         Email and generic webhooks get the full report; Slack, Discord and Telegram get the compact short_alert
-        text. The alerts count as sent (store.mark_notified) when at least one notifier took them.
+        text. Messages count as sent (store.mark_notified) when at least one notifier took them; alerts from an
+        earlier cycle are labelled as such.
         """
-        if not self.notifiers:
-            return
-        pending = [opp for opp in self.store.unnotified(since=now - ALERT_RETRY_WINDOW) if self.is_alert(opp)]
-        if not pending:
-            return
-        pending.sort(key=lambda opp: opp.score, reverse=True)
-        subject = alert_subject(pending)
-        markdown = render_markdown(pending, title=ALERT_TITLE, generated=now)
-        html = render_html(pending, title=ALERT_TITLE, generated=now)
-        short = short_alert(pending)
-        if len(result.report_paths) > 1:
-            short += f"\n\nFull report: {result.report_paths[1]}"
+        alerts: list[Opportunity] = []
+        handled: list[Opportunity] = []  # decided not to send: superseded or a repeat
+        repeats: list[str] = []
+        seen: set[str] = set()
+        for opp in self.store.unnotified(since=now - ALERT_RETRY_WINDOW):  # newest first
+            latest = self.store.last_opportunity(opp.ticker)
+            if opp.ticker in seen or (latest is not None and latest.id != opp.id):
+                handled.append(opp)  # a newer analysis of this ticker exists
+                continue
+            seen.add(opp.ticker)
+            previous = self.store.last_alerted(opp.ticker, before=opp.created)
+            if previous is not None and utc(previous.created) < now - THESIS_WINDOW:
+                previous = None
+            if previous is not None and self.is_alert(previous) and self._weakened(previous, opp):
+                result.thesis_changes.append((previous, opp))
+            elif self.is_alert(opp):
+                recent = previous is not None and utc(previous.created) >= now - self._repeat_window()
+                if recent and self.is_alert(previous) and not self._material(opp, previous):
+                    handled.append(opp)
+                    repeats.append(f"{opp.ticker} (score {opp.score:.1f}, alerted at {previous.score:.1f})")
+                else:
+                    alerts.append(opp)
+        if repeats:
+            result.notes.append(
+                f"Alerted within the last {self.config.alerts.repeat_hours:g}h and nothing material changed, not "
+                f"sent again: {', '.join(repeats)}"
+            )
+        if handled:
+            self.store.mark_notified([opp.id for opp in handled if opp.id is not None], when=now, sent=False)
+
+        if alerts:
+            alerts.sort(key=lambda opp: opp.score, reverse=True)
+            self._deliver(
+                alerts,
+                result,
+                subject=alert_subject(alerts),
+                markdown=render_markdown(alerts, title=ALERT_TITLE, generated=now),
+                html=render_html(alerts, title=ALERT_TITLE, generated=now),
+                short=short_alert(alerts, now=now),
+                what="alerts",
+                now=now,
+            )
+        if result.thesis_changes:
+            lines = [thesis_change_line(previous, opp) for previous, opp in result.thesis_changes]
+            changed = [opp for _, opp in result.thesis_changes]
+            self._deliver(
+                changed,
+                result,
+                subject=thesis_subject(result.thesis_changes),
+                markdown=render_markdown(changed, title=THESIS_TITLE, generated=now, notes=lines),
+                html=render_html(changed, title=THESIS_TITLE, generated=now, notes=lines),
+                short="\n".join(["Thesis change: review open orders on these ideas.", *lines, _NOT_ADVICE]),
+                what="thesis changes",
+                now=now,
+            )
+
+    def _deliver(
+        self,
+        opps: list[Opportunity],
+        result: CycleResult,
+        *,
+        subject: str,
+        markdown: str,
+        html: str,
+        short: str,
+        what: str,
+        now: datetime,
+    ) -> None:
         sent = False
         for notifier in self.notifiers:
             name = getattr(notifier, "name", type(notifier).__name__)
             try:
                 notifier.send(subject, short if _is_chat(notifier) else markdown, html)
             except NotifyError as exc:
-                result.notes.append(f"Couldn't send the alerts by {name}: {exc}")
+                result.notes.append(f"Couldn't send the {what} by {name}: {exc}")
                 log.warning("%s", result.notes[-1])
             except Exception as exc:  # a notifier bug must not stop the scanner
-                result.notes.append(f"Couldn't send the alerts by {name}: {type(exc).__name__}: {exc}")
+                result.notes.append(f"Couldn't send the {what} by {name}: {type(exc).__name__}: {exc}")
                 log.warning("%s", result.notes[-1], exc_info=True)
             else:
                 sent = True
-                log.info("Sent %s by %s.", _count(len(pending), "alert"), name)
+                log.info("Sent %s by %s.", _count(len(opps), what.rstrip("s")), name)
         if sent:
-            self.store.mark_notified([opp.id for opp in pending if opp.id is not None], when=now)
+            self.store.mark_notified([opp.id for opp in opps if opp.id is not None], when=now)
+
+    def _repeat_window(self) -> timedelta:
+        return timedelta(hours=self.config.alerts.repeat_hours)
+
+    def _material(self, opp: Opportunity, previous: Opportunity) -> bool:
+        """Whether a new alert says something the last one didn't: the score rose by [alerts] min_score_change, the
+        verdict changed, or the price fell by another [dip] min_drop_1d_pct since."""
+        alerts = self.config.alerts
+        further_drop = opp.stats.price <= previous.stats.price * (1 - self.config.dip.min_drop_1d_pct / 100)
+        return (
+            opp.score - previous.score >= alerts.min_score_change
+            or opp.analysis.verdict != previous.analysis.verdict
+            or (previous.stats.currency == opp.stats.currency and further_drop)
+        )
+
+    def _weakened(self, previous: Opportunity, opp: Opportunity) -> bool:
+        """Whether a new analysis undercuts an earlier alert: it isn't an alert, or its chance of being higher in 6
+        months is THESIS_DROP_POINTS or more lower."""
+        drop = previous.analysis.probability_up_6m - opp.analysis.probability_up_6m
+        return not self.is_alert(opp) or drop >= THESIS_DROP_POINTS
 
     def _prune(self, now: datetime) -> None:
         if self._last_prune is not None and now - self._last_prune < PRUNE_EVERY:
@@ -359,10 +475,40 @@ class Scanner:
             company=company,
             stats=stats,
             impacts=impacts,
-            dip_reasons=dip_reasons(stats, self.config.dip),
+            dip_reasons=dip_reasons(stats, self.config.dip, now=now),
             severity=severity(stats, impacts),
         )
         return self._analyze(candidate, now, context_news=True)
+
+
+_NOT_ADVICE = "Not investment advice; check before placing or cancelling any order."
+
+
+def thesis_subject(changes: list[tuple[Opportunity, Opportunity]]) -> str:
+    """The subject of a thesis-change notice, e.g. "Thesis change: AMD now Fundamental damage (was Temporary fear,
+    entry $132.00) - review open orders"."""
+    if len(changes) == 1:
+        previous, opp = changes[0]
+        return (
+            f"Thesis change: {opp.ticker} now {verdict_label(opp.analysis.verdict)} "
+            f"(was {verdict_label(previous.analysis.verdict)}, entry "
+            f"{format_price(previous.analysis.entry_price, previous.currency)}) - review open orders"
+        )
+    names = ", ".join(opp.ticker for _, opp in changes[:4])
+    more = f" and {len(changes) - 4} more" if len(changes) > 4 else ""
+    return f"Thesis changes: {names}{more} - review open orders"
+
+
+def thesis_change_line(previous: Opportunity, opp: Opportunity) -> str:
+    """One line saying what changed between an earlier alert and the new analysis."""
+    was, now = previous.analysis, opp.analysis
+    return (
+        f"{opp.ticker}: now {verdict_label(now.verdict)}, {now.probability_up_6m}% chance up in 6m, score "
+        f"{opp.score:.1f} (analysed {format_when(opp.created)}). Was {verdict_label(was.verdict)}, "
+        f"{was.probability_up_6m}%, entry {format_price(was.entry_price, previous.currency)}, target "
+        f"{format_price(was.target_price, previous.currency)} (alerted {format_when(previous.created)}). "
+        "If you placed orders on the earlier idea, review them."
+    )
 
 
 def alert_subject(opps: list[Opportunity]) -> str:

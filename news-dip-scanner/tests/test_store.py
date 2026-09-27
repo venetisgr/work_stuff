@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import threading
 from dataclasses import replace
@@ -109,22 +110,90 @@ def test_add_articles_skips_the_same_headline_from_another_source_within_72_hour
 
 
 def test_add_articles_dedups_within_one_batch(store):
-    first = article("Fed signals more cuts", source="a")
-    same_id = article("Fed signals more cuts", source="b")  # same link -> same id
-    same_title = article("Fed signals more cuts", source="c", link="https://example.com/other")
-    assert add(store, first, same_id, same_title) == [first]
+    first = article("Fed signals more rate cuts ahead", source="a")
+    same_id = article("Fed signals more rate cuts ahead", source="b")  # same link -> same id
+    same_title = article("Fed signals more rate cuts ahead", source="c", link="https://example.com/other")
+    same_feed = article("Fed signals more rate cuts ahead", source="a", link="https://example.com/syndicated")
+    assert add(store, first, same_id, same_title, same_feed) == [first]
 
 
-def test_the_same_title_from_the_same_source_with_a_new_link_is_a_new_article(store):
+def test_a_repeated_headline_in_the_same_feed_is_the_same_story(store):
+    """Regression: Google News lists one story from several outlets, each with its own link; every copy was triaged
+    again, added corroboration and lifted the cooldown (a second alert for the same news)."""
+    first = article("HPE stock drops 11% after Evercore downgrade - Stocktwits", source="google-news-stock-drops")
+    copy = article(
+        "HPE stock drops 11% after Evercore downgrade - Yahoo Finance",
+        source="google-news-stock-drops",
+        link="https://news.google.com/rss/articles/other",
+    )
+    assert add(store, first) == [first]
+    assert add(store, copy, now=NOW + timedelta(minutes=30)) == []
+
+
+def test_the_same_title_from_a_formulaic_feed_with_a_new_link_is_a_new_article(store):
     # SEC 8-K titles repeat for every filing of a company; each filing has its own link (and id).
     title = "8-K - Advanced Micro Devices Inc (0000002488) (Filer)"
     first = article(title, source="sec-8k-filings", link="https://www.sec.gov/Archives/edgar/data/2488/1-index.htm")
     second = article(title, source="sec-8k-filings", link="https://www.sec.gov/Archives/edgar/data/2488/2-index.htm")
-    assert add(store, first) == [first]
-    assert add(store, second, now=NOW + timedelta(hours=5)) == [second]
+    exempt = {"sec-8k-filings"}
+    assert store.add_articles([first], max_age_hours=24, now=NOW, same_source_titles=exempt) == [first]
+    later = NOW + timedelta(hours=5)
+    assert store.add_articles([second], max_age_hours=24, now=later, same_source_titles=exempt) == [second]
     # ...while the same headline from another source is still a duplicate.
     elsewhere = article(title, source="google", link="https://example.com/amd-8k")
     assert add(store, elsewhere, now=NOW + timedelta(hours=6)) == []
+
+
+def test_short_formulaic_headlines_of_different_companies_are_all_kept(store):
+    """Regression: "Profit warning - Continental AG" and "Profit warning - Puma SE" (and "Transaction in Own
+    Shares" from any issuer) had the same key; the second company's news was never stored."""
+    continental = article("Profit warning - Continental AG", source="pr-newswire")
+    puma = article("Profit warning - Puma SE", source="globenewswire", link="https://example.com/puma")
+    shares = [
+        article("Transaction in Own Shares", source=source, link=f"https://example.com/{source}")
+        for source in ("rns-a", "rns-b")
+    ]
+    assert continental.title_key != puma.title_key
+    assert add(store, continental) == [continental]
+    assert add(store, puma, *shares, now=NOW + timedelta(hours=1)) == [puma, *shares]
+
+
+def test_an_old_skipped_copy_does_not_hide_a_fresh_story(store):
+    """Regression: Google News listed a 200-day-old "Boeing halts 737 MAX deliveries"; stored as skipped (fetched
+    now), it blocked the fresh CNBC story with the same headline for 72 hours."""
+    old = article("Boeing halts 737 MAX deliveries again", hours_ago=200 * 24, source="reuters-business")
+    fresh = article("Boeing halts 737 MAX deliveries again", source="cnbc", link="https://example.com/fresh")
+    assert add(store, old) == [] and store.article_status(old.id) == ("skipped", 0)
+    assert add(store, fresh, now=NOW + timedelta(hours=1)) == [fresh]
+
+
+def test_an_article_another_process_stored_meanwhile_is_skipped_not_an_error(tmp_path):
+    """Regression: `run` next to `watch` could insert the same id between the check and the insert; the
+    IntegrityError aborted the whole poll."""
+    path = tmp_path / "scanner.sqlite3"
+    story = article("AMD slides")  # too short to be matched by title: only the id decides
+    with Store(path) as mine, Store(path) as other:
+        real = mine._conn
+
+        class RacingConnection:
+            def execute(self, sql, params=()):
+                result = real.execute(sql, params)
+                if sql.startswith("SELECT 1 FROM articles WHERE id"):  # the other process wins the race
+                    other.add_articles([story], max_age_hours=24, now=NOW)
+                return result
+
+            def __enter__(self):
+                return real.__enter__()
+
+            def __exit__(self, *exc):
+                return real.__exit__(*exc)
+
+        mine._conn = RacingConnection()
+        try:
+            assert mine.add_articles([story], max_age_hours=24, now=NOW) == []
+        finally:
+            mine._conn = real
+        assert [a.id for a in other.get_articles([story.id])] == [story.id]
 
 
 def test_too_old_articles_are_stored_as_skipped_and_never_triaged(store):
@@ -133,6 +202,16 @@ def test_too_old_articles_are_stored_as_skipped_and_never_triaged(store):
     assert store.article_status(stale.id) == ("skipped", 0)
     assert store.pending_triage(10, max_attempts=3) == [fresh]
     assert add(store, stale) == []  # already stored, so still not new
+
+
+def test_stale_pending_articles_are_retired(store):
+    """Regression: after a model outage, days-old pending articles were still triaged, oldest first."""
+    story = article("AMD shares slide after weak guidance")
+    add(store, story)
+    assert store.skip_stale_pending(NOW - timedelta(hours=4)) == 0  # 20 hours later, with a 24-hour limit
+    assert store.skip_stale_pending(NOW) == 1  # 25 hours later
+    assert store.pending_triage(10, max_attempts=3) == []
+    assert store.article_status(story.id) == ("skipped", 0)
 
 
 def test_pending_triage_is_oldest_first_and_limited(store):
@@ -363,3 +442,25 @@ def test_concurrent_writers_from_threads(store):
     assert len(store.news(NOW - timedelta(days=1))) == 160
     assert len(store.recent_impacts(NOW - timedelta(days=1))) == 160
     assert len(store.opportunities()) == 8
+
+
+def test_a_version_1_database_gets_the_alerted_column(tmp_path):
+    """Opportunities notified before `alerted` existed count as sent (thesis changes and repeats compare with them)."""
+    path = tmp_path / "old.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "CREATE TABLE opportunities (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT NOT NULL, created TEXT NOT NULL,"
+        " score REAL NOT NULL, data TEXT NOT NULL, notified TEXT); PRAGMA user_version = 1;"
+    )
+    data = make_opportunity().to_dict()
+    data.pop("id")
+    conn.execute(
+        "INSERT INTO opportunities (ticker, created, score, data, notified) VALUES (?, ?, ?, ?, ?)",
+        ("AMD", NOW.isoformat(timespec="microseconds"), 72.4, json.dumps(data), NOW.isoformat(timespec="microseconds")),
+    )
+    conn.commit()
+    conn.close()
+
+    with Store(path) as store:
+        assert store.last_alerted("AMD") is not None
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 2

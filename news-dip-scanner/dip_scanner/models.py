@@ -35,6 +35,9 @@ FUNDAMENTAL_METRICS = (
     "eps_diluted",
     "operating_cash_flow",
 )
+# Fundamentals whose newest period ended longer ago than this carry a warning (a 20-F filer's latest fiscal year can
+# legitimately be 12-16 months old, so the limit is above that).
+STALE_FUNDAMENTALS_DAYS = 548
 _METRIC_LABELS = {
     "revenue": "Revenue",
     "gross_profit": "Gross profit",
@@ -52,6 +55,12 @@ class Feed:
     url: str
     enabled: bool = True
     category: str = "markets"  # free text label shown in reports
+    # A headline seen again (from any feed, this one included) is the same story. Off for feeds whose titles are
+    # formulaic, like the SEC's "8-K - APPLE INC (0000320193) (Filer)" for every new filing of a company.
+    dedup_titles: bool = True
+    # Items tagged with another language (dc:language) are dropped: the wires publish machine translations of every
+    # release. Lowercase codes; "en" also matches "en-us". () keeps every language.
+    languages: tuple[str, ...] = ("en",)
 
 
 @dataclass(frozen=True)
@@ -90,6 +99,15 @@ class PriceBar:
 
 
 @dataclass(frozen=True)
+class Split:
+    """A stock split: from day (the exchange-local ex-date) on, one old share is ratio new shares (10:1 -> 10.0,
+    a 1:10 reverse split -> 0.1). Yahoo divides every price before day by ratio."""
+
+    day: date
+    ratio: float
+
+
+@dataclass(frozen=True)
 class PriceStats:
     ticker: str
     name: str | None
@@ -110,10 +128,17 @@ class PriceStats:
     sma_50: float | None
     sma_200: float | None
     volatility_pct: float  # annualised stdev of daily log returns over the last 60 sessions, in %
-    volume_ratio: float | None  # latest session volume / mean volume of the 20 sessions before it
-    # 5th-percentile 6-month price, zero drift lognormal: price * exp(-1.645 * (volatility_pct/100) * sqrt(0.5))
+    # Latest session volume / mean volume of the 20 sessions before it. During the session (session_elapsed set) the
+    # expected volume is pro-rated to the part of the session that has passed, so it is the pace so far.
+    volume_ratio: float | None
+    # 5th-percentile price at the 6-month mark (not the lowest price along the way), zero drift lognormal:
+    # price * exp(-1.645 * (volatility_pct/100) * sqrt(0.5))
     stat_low_6m: float
     worst_6m_drawdown_pct: float  # worst peak-to-trough decline within any 126-session window of the history, <= 0
+    # The share (0..1) of the regular session that had passed when the quote was taken during it; None otherwise.
+    session_elapsed: float | None = None
+    timezone: str | None = None  # the exchange's IANA time zone (e.g. America/New_York), when Yahoo gives it
+    instrument_type: str | None = None  # Yahoo's instrumentType: EQUITY, ETF, MUTUALFUND, INDEX...
 
     def as_text(self) -> str:
         """A compact block of the price picture, readable by people and by the analysis model."""
@@ -127,7 +152,14 @@ class PriceStats:
             f"{label} {_price(value)}" if value is not None else f"{label} n/a"
             for label, value in (("50-day average", self.sma_50), ("200-day average", self.sma_200))
         )
-        volume = f"; latest volume {self.volume_ratio:.1f}x the 20-day average" if self.volume_ratio is not None else ""
+        volume = ""
+        if self.volume_ratio is not None and self.session_elapsed is not None:
+            volume = (
+                f"; volume so far today at about {self.volume_ratio:.1f}x the normal pace "
+                f"(session {self.session_elapsed * 100:.0f}% done, an estimate)"
+            )
+        elif self.volume_ratio is not None:
+            volume = f"; latest volume {self.volume_ratio:.1f}x the 20-day average"
         return "\n".join(
             [
                 f"{title}, prices in {cur}, as of {utc(self.as_of):%Y-%m-%d %H:%M} UTC",
@@ -139,8 +171,9 @@ class PriceStats:
                 f"({_pct(self.drawdown_52w_pct)} from the high, {_pct(self.above_low_52w_pct)} above the low)",
                 averages,
                 f"Volatility {self.volatility_pct:.1f}% a year (annualised, last 60 sessions){volume}",
-                f"Statistical 6-month low (5th percentile): {_price(self.stat_low_6m)} "
-                f"({_pct(_change(self.stat_low_6m, self.price))} from the price)",
+                f"Statistical 6-month low (5th percentile of the price in 6 months): {_price(self.stat_low_6m)} "
+                f"({_pct(_change(self.stat_low_6m, self.price))} from the price; the lowest price along the way "
+                "falls below it about twice as often)",
                 f"Worst 6-month drawdown in the price history: {_pct(self.worst_6m_drawdown_pct)}",
             ]
         )
@@ -156,12 +189,13 @@ class Fundamentals:
     quarters: list[dict]
     annual: list[dict]  # newest first, same keys, fiscal years
 
-    def as_text(self) -> str:
+    def as_text(self, today: date | None = None) -> str:
         """Table-like text of recent quarters and fiscal years, with growth where it can be worked out.
 
         Quarter growth is year over year (y/y) when the same quarter a year earlier is in the list, else quarter
         over quarter (q/q) against the previous quarter. Growth is left out when the earlier figure is zero or
-        negative, because a percentage would be meaningless.
+        negative, because a percentage would be meaningless. Given today, a note warns when the newest period ended
+        more than STALE_FUNDAMENTALS_DAYS (about 18 months) earlier.
         """
         header = (
             f"{self.ticker}: {self.entity} (SEC CIK {self.cik}). Amounts in {self.currency} millions except EPS; "
@@ -170,6 +204,13 @@ class Fundamentals:
         if not self.quarters and not self.annual:
             return f"{header}\nNo income statement figures were found in the SEC filings."
         lines = [header]
+        newest = max(filter(None, (_period(row) for row in [*self.quarters, *self.annual])), default=None)
+        if today is not None and newest is not None and (today - newest).days > STALE_FUNDAMENTALS_DAYS:
+            months = (today.year - newest.year) * 12 + today.month - newest.month
+            lines.append(
+                f"Note: the newest figures are for the period ending {newest:%Y-%m-%d}, about {months} months ago; "
+                "they may not reflect the business today."
+            )
         if self.quarters:
             lines += ["", "Quarters (newest first):", _table_header("Quarter ending")]
             for index, row in enumerate(self.quarters):
@@ -215,6 +256,9 @@ class Opportunity:
     dip_reasons: list[str]
     model: str  # model/deployment that wrote the analysis
     id: int | None = None  # set by the store
+    # Every flagged article came out after the last session in the price data: the price hadn't reacted to the
+    # news yet when this was analysed (see detect.select_candidates).
+    news_after_session: bool = False
 
     def upside_pct(self) -> float:
         """How far the target price is above the price at the time of the analysis, in %."""
@@ -240,6 +284,7 @@ class Opportunity:
             "headlines": [_json_safe(headline) for headline in self.headlines],
             "dip_reasons": list(self.dip_reasons),
             "model": self.model,
+            "news_after_session": self.news_after_session,
         }
 
     @classmethod
@@ -259,6 +304,7 @@ class Opportunity:
             dip_reasons=list(data.get("dip_reasons") or []),
             model=data.get("model") or "",
             id=data.get("id"),
+            news_after_session=bool(data.get("news_after_session", False)),
         )
 
 
@@ -270,6 +316,7 @@ class Candidate:
     impacts: list[tuple[Impact, Article]]  # newest first
     dip_reasons: list[str]
     severity: float  # for ordering; higher = bigger/more newsworthy drop
+    news_after_session: bool = False  # every qualifying article is newer than stats.as_of (see Opportunity)
 
 
 def utc(dt: datetime) -> datetime:

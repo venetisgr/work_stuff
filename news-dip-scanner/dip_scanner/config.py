@@ -213,6 +213,10 @@ class AlertConfig:
     min_score: float = 65
     min_probability: int = 60
     verdicts: tuple[str, ...] = ("temporary_fear", "mixed")
+    # A ticker alerted within repeat_hours isn't alerted again unless the score rose by min_score_change, the
+    # verdict changed or the price fell by another [dip] min_drop_1d_pct.
+    repeat_hours: float = 24
+    min_score_change: float = 10
 
 
 @dataclass(frozen=True)
@@ -230,6 +234,7 @@ def load_scanner_config(path: Path | None) -> ScannerConfig:
     """Read scanner.toml. No path or a missing file gives the defaults; every key in the file is optional.
 
     Unknown sections or keys (usually typos) raise ConfigError naming them, so a setting is never silently ignored.
+    (The command line insists that a file named with --config or SCANNER_CONFIG exists.)
     """
     if path is None or not Path(path).exists():
         return ScannerConfig()
@@ -306,7 +311,10 @@ def _normalise(section: Any) -> Any:
 
 
 def _tickers(values: tuple[str, ...]) -> tuple[str, ...]:
-    return tuple(dict.fromkeys(value.strip().upper() for value in values if value.strip()))
+    """Symbols written the way triage writes them ("BRK.B" -> "BRK-B", "NASDAQ:TSLA" -> "TSLA"), so they match."""
+    from .triage import normalise_ticker  # here: triage imports this module
+
+    return tuple(dict.fromkeys(normalise_ticker(value) or value.strip().upper() for value in values if value.strip()))
 
 
 def _suffix(value: str) -> str:
@@ -330,6 +338,8 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
         (universe.min_price >= 0, "universe.min_price can't be negative"),
         (0 <= alerts.min_score <= 100, "alerts.min_score must be between 0 and 100"),
         (0 <= alerts.min_probability <= 100, "alerts.min_probability must be between 0 and 100"),
+        (alerts.repeat_hours >= 0, "alerts.repeat_hours can't be negative"),
+        (alerts.min_score_change >= 0, "alerts.min_score_change can't be negative"),
     ]
     for ok, message in checks:
         if not ok:
@@ -348,11 +358,12 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
 
 # --- feeds.toml ----------------------------------------------------------------------------------------------------
 
-_FEED_KEYS = ("name", "url", "enabled", "category")
+_FEED_KEYS = ("name", "url", "enabled", "category", "dedup_titles", "languages")
 
 
 def load_feeds(path: Path) -> list[Feed]:
-    """Read the feed list: one [feeds.<key>] table per source with url and optional name, enabled, category.
+    """Read the feed list: one [feeds.<key>] table per source with url and optional name, enabled, category,
+    dedup_titles (default true) and languages (default ["en"]; [] keeps every language).
 
     Disabled feeds are returned too (with enabled=False) so they can be listed; callers skip them when fetching.
     """
@@ -375,19 +386,27 @@ def load_feeds(path: Path) -> list[Feed]:
         url = entry.get("url")
         if not isinstance(url, str) or not url.strip().lower().startswith(("http://", "https://")):
             raise ConfigError(f'Feed "{key}" in {path} needs a url starting with http:// or https://.')
-        enabled = entry.get("enabled", True)
-        if not isinstance(enabled, bool):
-            raise ConfigError(f'enabled for feed "{key}" in {path} must be true or false (got {enabled!r}).')
+        for name in ("enabled", "dedup_titles"):
+            if not isinstance(entry.get(name, True), bool):
+                raise ConfigError(f'{name} for feed "{key}" in {path} must be true or false (got {entry[name]!r}).')
         for name in ("name", "category"):
             if name in entry and not isinstance(entry[name], str):
                 raise ConfigError(f'{name} for feed "{key}" in {path} must be a string (got {entry[name]!r}).')
+        languages = entry.get("languages", ["en"])
+        if not isinstance(languages, list) or not all(isinstance(item, str) and item.strip() for item in languages):
+            raise ConfigError(
+                f'languages for feed "{key}" in {path} must be a list of language codes, e.g. ["en"] (got '
+                f"{languages!r})."
+            )
         feeds.append(
             Feed(
                 key=key,
                 name=(entry.get("name") or "").strip() or key,
                 url=url.strip(),
-                enabled=enabled,
+                enabled=entry.get("enabled", True),
                 category=(entry.get("category") or "").strip() or "markets",
+                dedup_titles=entry.get("dedup_titles", True),
+                languages=tuple(dict.fromkeys(item.strip().lower().replace("_", "-") for item in languages)),
             )
         )
     return feeds
@@ -412,6 +431,8 @@ def _read_toml(path: Path, what: str) -> dict[str, Any]:
             return tomllib.load(fh)
     except FileNotFoundError:
         raise ConfigError(f"{what} not found: {path}") from None
+    except OSError as exc:  # a folder, no permission...
+        raise ConfigError(f"{what} can't be read: {path} ({exc.strerror or exc})") from None
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"{path} is not valid TOML: {exc}") from None
 

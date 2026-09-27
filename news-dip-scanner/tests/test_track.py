@@ -5,12 +5,13 @@ from datetime import UTC, date, datetime, timedelta
 import pytest
 from conftest import NOW, make_analysis, make_opportunity, make_stats
 
-from dip_scanner.models import PriceBar
+from dip_scanner.models import PriceBar, Split
 from dip_scanner.track import (
     HORIZON_DAYS,
     STATUSES,
     Outcome,
     evaluate,
+    quote_day,
     render_track_record,
     score_bucket,
     signal_day,
@@ -27,10 +28,116 @@ def bar(day: date, high: float, low: float, close: float, open_: float | None = 
     return PriceBar(day=day, open=close if open_ is None else open_, high=high, low=low, close=close, volume=1000)
 
 
-def test_signal_day_is_the_utc_date_of_the_report():
+def test_signal_day_is_the_utc_date_of_the_report_without_a_time_zone():
     created = datetime(2026, 9, 26, 1, 30, tzinfo=UTC)  # still the 25th in New York
     assert signal_day(make_opportunity(created=created)) == date(2026, 9, 26)
     assert signal_day(make_opportunity()) == SIGNAL
+
+
+def test_signal_day_is_the_exchange_local_date_when_the_time_zone_is_known():
+    """Regression: an ASX report written in the first trading hour (23:30 UTC the day before, AEDT) was matched with
+    the previous session, and trading from before the report counted as fills."""
+    created = datetime(2026, 1, 13, 23, 30, tzinfo=UTC)  # 10:30 on the 14th in Sydney
+    stats = make_stats(ticker="BHP.AX", price=48.0, as_of=created, timezone="Australia/Sydney")
+    analysis = make_analysis(entry_price=47.60, potential_low=45.0, target_price=52.0)
+    opp = make_opportunity(ticker="BHP.AX", stats=stats, created=created, analysis=analysis)
+    assert signal_day(opp) == quote_day(opp) == date(2026, 1, 14)
+
+    bars = [
+        bar(date(2026, 1, 13), high=48.5, low=47.58, close=47.9),  # the session before the report: ignored
+        bar(date(2026, 1, 14), high=48.6, low=47.3, close=48.2),  # only 48.0..48.2 surely came after the report
+    ]
+    outcome = evaluate(opp, bars, now=datetime(2026, 1, 20, tzinfo=UTC))
+    assert outcome.entry_filled is None
+    assert outcome.status == "waiting_entry"
+
+
+# --- splits: Yahoo's bars are split-adjusted after the fact --------------------------------------------------------
+
+
+def _scaled(bars: list[PriceBar], factor: float) -> list[PriceBar]:
+    return [PriceBar(b.day, b.open * factor, b.high * factor, b.low * factor, b.close * factor, b.volume) for b in bars]
+
+
+def _comparable(outcome: Outcome) -> tuple:
+    return (
+        outcome.status,
+        outcome.entry_filled,
+        outcome.target_hit,
+        outcome.low_breached,
+        outcome.up_after_6m,
+        round(outcome.return_pct, 6),
+        round(outcome.max_gain_pct, 6),
+        round(outcome.max_loss_pct, 6),
+        None if outcome.trade_return_pct is None else round(outcome.trade_return_pct, 6),
+    )
+
+
+SPLIT_SCENARIO = [  # as traded, in the report's (pre-split) units
+    bar(SIGNAL, high=145, low=139, close=140, open_=144),
+    bar(date(2026, 9, 28), high=141, low=131, close=135),  # fill at 132
+    bar(date(2026, 10, 12), high=150, low=133, close=148),  # the split's ex-date
+    bar(date(2026, 11, 2), high=170, low=150, close=166),  # target 168
+    bar(date(2027, 3, 26), high=160, low=150, close=155),  # the 6-month close
+]
+
+
+@pytest.mark.parametrize("ratio", [10.0, 0.1])  # a 10:1 split and a 1:10 reverse split
+def test_a_later_split_gives_the_same_outcome_as_unsplit_prices(ratio):
+    """Regression: NVDA's 10:1 split turned a +20% idea into "below the low, -87.5%" because the report's $1,164 was
+    compared with Yahoo's split-adjusted $116 bars."""
+    now = datetime(2027, 4, 20, tzinfo=UTC)
+    stats = make_stats(timezone="America/New_York")
+    opp = make_opportunity(stats=stats)
+    unsplit = evaluate(opp, SPLIT_SCENARIO, now=now)
+    assert unsplit.status == "target_hit" and unsplit.entry_filled == date(2026, 9, 28)
+
+    yahoo = _scaled(SPLIT_SCENARIO, 1 / ratio)  # Yahoo rewrites the whole history on the new basis
+    adjusted = evaluate(opp, yahoo, now=now, splits=[Split(date(2026, 10, 12), ratio)])
+
+    assert _comparable(adjusted) == _comparable(unsplit)
+    assert adjusted.split_factor == ratio and not adjusted.price_mismatch
+    assert adjusted.last_price == pytest.approx(155 / ratio)  # on today's basis
+
+    # Without the split the same bars give nonsense, and the price check catches it.
+    wrong = evaluate(opp, yahoo, now=now)
+    assert wrong.price_mismatch
+
+
+def test_a_split_on_the_quote_day_is_already_in_the_price():
+    """The report was written after the open on the ex-date: its price is post-split, so nothing is scaled."""
+    now = datetime(2026, 10, 20, tzinfo=UTC)
+    opp = make_opportunity(stats=make_stats(timezone="America/New_York"))
+    bars = SPLIT_SCENARIO[:2]
+    plain = evaluate(opp, bars, now=now)
+    same_day = evaluate(opp, bars, now=now, splits=[Split(SIGNAL, 10.0), Split(date(2026, 9, 1), 2.0)])
+    assert same_day.split_factor == 1.0
+    assert _comparable(same_day) == _comparable(plain)
+
+
+def test_price_mismatches_are_left_out_of_the_summary_and_marked():
+    now = datetime(2026, 10, 20, tzinfo=UTC)
+    good = evaluate(make_opportunity(), SPLIT_SCENARIO[:2], now=now)
+    bad = evaluate(make_opportunity(ticker="BAD"), _scaled(SPLIT_SCENARIO[:2], 0.5), now=now)  # a 2:1 split, unreported
+    assert bad.price_mismatch and not good.price_mismatch
+
+    summary = summarize([good, bad])
+    assert summary["count"] == 1 and summary["price_mismatch"] == 1
+    text = render_track_record([good, bad], summary)
+    assert "1 opportunity is left out of the figures" in text
+    assert "(price mismatch, left out)" in next(line for line in text.splitlines() if "**BAD**" in line)
+
+    split = evaluate(
+        make_opportunity(), _scaled(SPLIT_SCENARIO[:2], 0.1), now=now, splits=[Split(SIGNAL.replace(day=30), 10)]
+    )
+    assert "(after a 10:1 split)" in render_track_record([split], summarize([split]))
+
+
+def test_tickers_without_prices_are_named_in_the_track_record():
+    outcomes = [evaluate(make_opportunity(), SPLIT_SCENARIO[:2], now=LATER)]
+    text = render_track_record(outcomes, summarize(outcomes), missing=[("OPAP.AT", 2)])
+    assert "Left out: 2 opportunities without prices from Yahoo Finance" in text and "OPAP.AT (2)" in text
+    assert "OPAP.AT" in render_track_record([], summarize([]), missing=[("OPAP.AT", 1)])
 
 
 def test_hand_computed_outcome_with_fill_then_target():
@@ -380,6 +487,21 @@ def test_render_track_record_end_to_end_from_bars():
     row = next(line for line in text.splitlines() if "**AMD**" in line)
     assert "| target hit | 2026-09-28 | 2026-09-29 | +15.8% | +19.3% | -8.1% | – |" in row
     assert "| Average return of filled limit orders | +27.3% |" in text
+
+
+def test_reported_range_uses_the_same_dates_as_the_rows():
+    """Regression (live smoke): a Hong Kong report written at 20:34 UTC on the 27th (04:34 on the 28th in Hong Kong)
+    made the header say "reported 2026-09-27 to 2026-09-28" while every row said 2026-09-27."""
+    created = datetime(2026, 9, 27, 20, 34, tzinfo=UTC)
+    stats = make_stats(ticker="1211.HK", price=78.1, as_of=created - timedelta(days=2), timezone="Asia/Hong_Kong")
+    analysis = make_analysis(potential_low=59.0, entry_price=71.4, target_price=92.0)
+    outcomes = [
+        evaluate(make_opportunity(ticker="1211.HK", stats=stats, created=created, analysis=analysis), [], now=created),
+        evaluate(make_opportunity(created=created), [], now=created),
+    ]
+    text = render_track_record(outcomes, summarize(outcomes))
+    assert "_2 opportunities reported on 2026-09-27 · 0 with 6 months of results_" in text
+    assert "| 2026-09-27 | **1211.HK** |" in text
 
 
 def test_render_track_record_escapes_and_handles_empty():

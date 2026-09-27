@@ -23,6 +23,7 @@ from dip_scanner.analyze import (
     score,
     validate_analysis,
 )
+from dip_scanner.config import PROJECT_ROOT, AlertConfig
 from dip_scanner.llm import LLMError
 from dip_scanner.models import Analysis, Fundamentals
 
@@ -68,6 +69,8 @@ def test_price_block_adds_the_move_in_proportion_and_the_low_anchors():
         "Anchors for potential_low (USD): 10th-percentile 6-month price 92.24, 5th-percentile 81.53, "
         "after a repeat of the worst 6-month drawdown 87.64."
     ) in block
+    # They are end-price percentiles, not path minimums: the model is told the difference.
+    assert "the lowest price along the way falls below each of them about twice as often" in block
 
 
 def test_price_block_without_volatility():
@@ -288,6 +291,31 @@ def test_target_step_is_at_least_five_percent():
     assert analysis.target_price == pytest.approx(138.6)  # 132 * 1.05
 
 
+@pytest.mark.parametrize("target", [1180.0, "1,180", "$1180"])
+def test_an_implausibly_high_target_is_capped(target):
+    """Regression: a slipped decimal (1180 for 118) lifted the score from 58 to 72, past the alert threshold."""
+    stats = make_stats(price=100.0, high_52w=130.0, volatility_pct=25.0)
+    values = dict(verdict="temporary_fear", confidence="high", probability_up_6m=60, potential_low=85.0)
+    sensible = sanitize(raw(**values, entry_price=95.0, target_price=118.0), stats)
+    assert sensible.warnings == []
+
+    analysis = sanitize(raw(**values, entry_price=95.0, target_price=target), stats)
+
+    ceiling = 100.0 * math.exp(2 * 0.25 * math.sqrt(0.5))  # 2 standard deviations of 6-month volatility: +42.4%
+    assert analysis.target_price == pytest.approx(round(ceiling, 2))
+    [warning] = analysis.warnings
+    assert warning.startswith("target_price 1180.00 was implausibly high (above the 52-week high 130.00")
+    assert score(analysis, 100.0) < 65 < score(replace(analysis, target_price=1180.0), 100.0)
+
+
+def test_a_target_up_to_the_52_week_high_is_kept():
+    stats = make_stats(price=100.0, high_52w=180.0, volatility_pct=10.0)  # a big fall from the high
+    assert sanitize(raw(potential_low=85.0, entry_price=95.0, target_price=175.0), stats).target_price == 175.0
+    # With no volatility and a high at the price, the ceiling still leaves room above the entry.
+    flat = make_stats(price=100.0, high_52w=100.0, volatility_pct=0.0)
+    assert sanitize(raw(potential_low=85.0, entry_price=100.0, target_price=90.0), flat).target_price == 105.0
+
+
 def test_sanitize_trims_lists():
     risks = [f"risk {n}" for n in range(1, 10)]
     analysis = sanitize(raw(risks=["", *risks], checks=[]), make_stats())
@@ -394,6 +422,13 @@ def test_analyze_candidate_builds_a_scored_opportunity():
     assert opportunity.id is None
 
 
+def test_analyze_candidate_warns_the_model_about_old_fundamentals():
+    old = replace(fundamentals(), quarters=[{"period_end": "2014-03-31", "revenue": 1.0e9}])
+    model = FakeChatModel(reply())
+    analyze_candidate(model, make_candidate(), fundamentals=old, extra_news=[], now=NOW)
+    assert "Note: the newest figures are for the period ending 2014-03-31, about 150 months ago" in model.prompts[0]
+
+
 def test_analyze_candidate_without_fundamentals_or_dip_reasons():
     model = FakeChatModel(reply())
     analyze_candidate(model, make_candidate(dip_reasons=[]), fundamentals=None, extra_news=[], now=NOW)
@@ -446,3 +481,31 @@ def test_analysis_round_trips_through_the_opportunity_dict():
     assert restored == opportunity
     assert isinstance(restored.analysis, Analysis)
     assert replace(restored.analysis, warnings=[]) == replace(opportunity.analysis, warnings=[])
+
+
+def test_the_readme_scoring_example_and_the_alert_calibration_notes_hold():
+    """The README and scanner.toml explain what the default [alerts] rules mean; keep the numbers in sync."""
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    toml = (PROJECT_ROOT / "scanner.toml").read_text(encoding="utf-8")
+    assert "score 58.5, which the default `[alerts] min_score` of 65 doesn't alert on" in readme
+    example = make_analysis()  # 68%, low 118, entry 132, target 168, temporary fear, medium confidence
+    assert score(example, 142.5) == 58.5 < AlertConfig().min_score
+
+    def lowest_probability(verdict: str, reward_risk: float) -> int | None:
+        for probability in range(0, 101):
+            analysis = make_analysis(
+                verdict=verdict,
+                confidence="high",
+                probability_up_6m=probability,
+                target_price=100 * (1 + reward_risk),
+                potential_low=100 * reward_risk,
+            )
+            if score(analysis, 100.0) >= AlertConfig().min_score:
+                return probability
+        return None
+
+    assert (lowest_probability("temporary_fear", 0.4), lowest_probability("temporary_fear", 0.2)) == (76, 85)
+    assert lowest_probability("mixed", 0.4) == 93 and lowest_probability("mixed", 0.2) is None
+    assert "about 76-85%" in readme and "about 76-85%" in toml and "93% or more" in readme and "93% or more" in toml
+    mixed = make_analysis(verdict="mixed", confidence="high", probability_up_6m=80, target_price=130, potential_low=30)
+    assert score(mixed, 100.0) == 55.2 and "scores 55.2" in readme

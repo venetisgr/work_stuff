@@ -6,12 +6,18 @@ Every model turns a system prompt and a user prompt into text. Failures come out
   caller should try again later rather than count it as a failed attempt. It is an LLMError, so code that only
   cares about "this call failed" can catch LLMError.
 - LLMError: this input failed (unusable JSON after a retry, content filter, refusal, empty or truncated reply).
+  Its subclass LLMRequestError is a request the service refused for a reason it didn't name more precisely (a 400
+  or other 4xx): that can be this input or a setting every request shares, so callers shouldn't use up an
+  article's attempts when every request is refused the same way.
+Anything else the SDKs raise (an Entra ID sign-in that fails, a gateway reply without choices) is mapped to one of
+these too.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -29,6 +35,11 @@ log = logging.getLogger(__name__)
 T = TypeVar("T")
 
 FOUNDRY_SCOPE = "https://ai.azure.com/.default"
+OPENAI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
+ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+# Anthropic 400s that are about the account, not the request: every later request fails the same way.
+_ANTHROPIC_ACCOUNT_REFUSAL = re.compile(r"credit balance|usage limit|spend limit|billing", re.IGNORECASE)
+_ANTHROPIC_CONTEXT_OVERFLOW = re.compile(r"too long|context limit|context window|exceed context", re.IGNORECASE)
 _AZURE_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com", ".cognitiveservices.azure.com")
 # OpenAI error codes that repeat on every request, so there's no point carrying on.
 _SETUP_ERROR_CODES = {"unsupported_parameter", "unsupported_value", "OperationNotSupported"}
@@ -54,6 +65,11 @@ class LLMError(Exception):
 
 class LLMUnavailableError(LLMError):
     """The service couldn't be reached or kept throttling. Not this input's fault: try again later."""
+
+
+class LLMRequestError(LLMError):
+    """The service refused the request without saying why more precisely (a 400 or other 4xx): this input, or a
+    setting every request shares."""
 
 
 class LLMSetupError(Exception):
@@ -167,13 +183,27 @@ def deployment_from_endpoint(endpoint: str) -> str | None:
 
 def _entra_token_provider() -> Callable[[], str]:
     try:
+        from azure.core.exceptions import ClientAuthenticationError
         from azure.identity import DefaultAzureCredential, get_bearer_token_provider
     except ImportError as exc:
         raise ConfigError(
             "FOUNDRY_API_KEY is empty, so the scanner signs in to Foundry with Entra ID, which needs azure-identity: "
             'pip install "news-dip-scanner[azure]". Or set FOUNDRY_API_KEY in .env.'
         ) from exc
-    return get_bearer_token_provider(DefaultAzureCredential(), FOUNDRY_SCOPE)
+    provider = get_bearer_token_provider(DefaultAzureCredential(), FOUNDRY_SCOPE)
+
+    def token() -> str:
+        # The SDK calls this for every request and lets its errors through unchanged.
+        try:
+            return provider()
+        except ClientAuthenticationError as exc:  # also CredentialUnavailableError: no az login, no identity
+            raise LLMSetupError(
+                "FOUNDRY_API_KEY is empty and signing in to Foundry with Entra ID failed (run `az login`, use a "
+                "managed identity or set AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET), or set "
+                f"FOUNDRY_API_KEY in .env: {(str(exc).splitlines() or [''])[0]}"
+            ) from exc
+
+    return token
 
 
 class _ChatCompletionsModel:
@@ -240,16 +270,21 @@ class _ChatCompletionsModel:
                     f"{self.name} rejected the request settings: {_detail(exc)} "
                     "(check LLM_REASONING_EFFORT and LLM_MAX_OUTPUT_TOKENS)."
                 ) from exc
-            raise LLMError(f"{self.service} rejected the request: {_detail(exc)}") from exc
+            raise LLMRequestError(f"{self.service} rejected the request: {_detail(exc)}") from exc
         except openai.InternalServerError as exc:
             raise LLMUnavailableError(
                 f"{self.service} had a server error ({exc.status_code}); try again later."
             ) from exc
         except openai.APIStatusError as exc:
-            raise LLMError(f"{self.service} rejected the request ({exc.status_code}): {_detail(exc)}") from exc
+            raise LLMRequestError(f"{self.service} rejected the request ({exc.status_code}): {_detail(exc)}") from exc
 
     def _reply(self, response: Any) -> str:
-        choice = response.choices[0]
+        # OpenAI-compatible gateways sometimes answer 200 with no choices, or with an error object instead.
+        choices = getattr(response, "choices", None)
+        if not choices or getattr(choices[0], "message", None) is None:
+            error = getattr(response, "error", None) or (getattr(response, "model_extra", None) or {}).get("error")
+            raise LLMError(f"{self.service} returned no reply" + (f": {error}" if error else " (no choices)."))
+        choice = choices[0]
         text = (choice.message.content or "").strip()
         usage = getattr(response, "usage", None)
         if usage is not None:
@@ -299,8 +334,13 @@ class OpenAIChatModel(_ChatCompletionsModel):
             if not settings.openai_base_url:
                 raise ConfigError("Set OPENAI_API_KEY in .env to use LLM_PROVIDER=openai.")
             api_key = "not-needed"  # local OpenAI-compatible servers (Ollama, LM Studio, vLLM) ignore the key
+        # Always explicit: given None, the SDK reads OPENAI_BASE_URL itself, and a blank one ("OPENAI_BASE_URL=" in
+        # .env) would become the base URL "".
         client = openai.OpenAI(
-            api_key=api_key, base_url=settings.openai_base_url, max_retries=max_retries, http_client=http_client
+            api_key=api_key,
+            base_url=settings.openai_base_url or OPENAI_DEFAULT_BASE_URL,
+            max_retries=max_retries,
+            http_client=http_client,
         )
         super().__init__(client, model, settings)
 
@@ -379,9 +419,13 @@ class AnthropicChatModel:
         self._sdk = _import_anthropic()
         if client is None:
             # Without ANTHROPIC_API_KEY the SDK still finds ANTHROPIC_AUTH_TOKEN or an `ant auth login` profile.
+            # A base URL is only passed when ANTHROPIC_BASE_URL is set but blank: the SDK would use "" as the base
+            # URL, while passing one always would override a profile's own base URL.
+            blank = os.environ.get("ANTHROPIC_BASE_URL") is not None and not os.environ["ANTHROPIC_BASE_URL"].strip()
+            extra = {"base_url": ANTHROPIC_DEFAULT_BASE_URL} if blank else {}
             try:
                 client = self._sdk.Anthropic(
-                    api_key=settings.anthropic_api_key, max_retries=max_retries, http_client=http_client
+                    api_key=settings.anthropic_api_key, max_retries=max_retries, http_client=http_client, **extra
                 )
             except self._sdk.CredentialsError as exc:
                 raise ConfigError(
@@ -399,6 +443,12 @@ class AnthropicChatModel:
                 _ANTHROPIC_NONSTREAMING_MAX_TOKENS,
             )
             self._max_tokens = _ANTHROPIC_NONSTREAMING_MAX_TOKENS
+        # Some models have a lower limit for requests without streaming; the SDK refuses larger ones.
+        limits = getattr(getattr(self._sdk, "_constants", None), "MODEL_NONSTREAMING_TOKENS", None) or {}
+        limit = limits.get(model) if isinstance(limits, dict) else None
+        if isinstance(limit, int) and 0 < limit < self._max_tokens:
+            log.warning("%s allows at most %d output tokens without streaming; using that.", model, limit)
+            self._max_tokens = limit
         self._effort = self._pick_effort(settings.reasoning_effort)
 
     def _pick_effort(self, effort: str | None) -> str | None:
@@ -452,14 +502,20 @@ class AnthropicChatModel:
             raise LLMUnavailableError("Couldn't connect to the Anthropic API. Check your network.") from exc
         except sdk.BadRequestError as exc:
             detail = _detail(exc)
-            if "too long" in detail.lower():
+            # This input is too long (checked first: the message also mentions max_tokens).
+            if _ANTHROPIC_CONTEXT_OVERFLOW.search(detail):
                 raise LLMError("The text is too long for the model's context window.") from exc
+            # Spend limits and an empty credit balance come as 400s too; no request can succeed until they're fixed.
+            if _ANTHROPIC_ACCOUNT_REFUSAL.search(detail):
+                raise LLMSetupError(
+                    f"Anthropic refused the request for billing or usage-limit reasons: {detail}"
+                ) from exc
             if "effort" in detail or "max_tokens" in detail:
                 raise LLMSetupError(
                     f"{self.name} rejected the request settings: {detail} "
                     "(check LLM_REASONING_EFFORT and LLM_MAX_OUTPUT_TOKENS)."
                 ) from exc
-            raise LLMError(f"Anthropic rejected the request: {detail}") from exc
+            raise LLMRequestError(f"Anthropic rejected the request: {detail}") from exc
         except sdk.APIStatusError as exc:
             if exc.status_code == 402 or exc.type == "billing_error":
                 raise LLMSetupError(f"Anthropic refused the request for billing reasons: {_detail(exc)}") from exc
@@ -469,7 +525,14 @@ class AnthropicChatModel:
                 raise LLMUnavailableError(
                     f"Anthropic had a server error or is overloaded ({exc.status_code}); try again later."
                 ) from exc
-            raise LLMError(f"Anthropic rejected the request ({exc.status_code}): {_detail(exc)}") from exc
+            raise LLMRequestError(f"Anthropic rejected the request ({exc.status_code}): {_detail(exc)}") from exc
+        except ValueError as exc:  # the SDK refuses, before sending, requests that would need streaming
+            if "streaming is required" not in str(exc).lower():
+                raise
+            raise LLMSetupError(
+                f"{self.name} needs streaming for max_tokens={self._max_tokens}; lower LLM_MAX_OUTPUT_TOKENS or pick "
+                "a current model."
+            ) from exc
         return self._reply(response)
 
     def _reply(self, response: Any) -> str:
@@ -484,7 +547,11 @@ class AnthropicChatModel:
             explanation = getattr(details, "explanation", None)
             reason = ": ".join(str(part) for part in (category, explanation) if part)
             raise LLMError(f"{self.name} declined to answer" + (f" ({reason})." if reason else "."))
-        if stop_reason in ("max_tokens", "model_context_window_exceeded"):
+        if stop_reason == "model_context_window_exceeded":
+            if not text:
+                raise LLMError("The text is too long for the model's context window (no room left for a reply).")
+            log.warning("A reply from %s filled the context window and may be cut short.", self.name)
+        if stop_reason == "max_tokens":
             if not text:
                 raise LLMError("The model ran out of output tokens before replying; raise LLM_MAX_OUTPUT_TOKENS.")
             log.warning("A reply from %s hit the output token limit and may be cut short.", self.name)

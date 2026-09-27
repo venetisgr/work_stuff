@@ -8,7 +8,7 @@ import pytest
 import requests
 from conftest import NOW, FakeResponse, FakeSession, make_bars
 
-from dip_scanner.models import PriceBar
+from dip_scanner.models import PriceBar, Split
 from dip_scanner.prices import (
     BROWSER_USER_AGENT,
     RATE_LIMIT_BACKOFF,
@@ -276,7 +276,36 @@ def test_compute_stats_during_the_session_uses_the_live_price():
     assert stats.change_1d_pct == pytest.approx((150 / 159.5 - 1) * 100)
     assert stats.change_5d_pct == pytest.approx((150 / 157.5 - 1) * 100)
     assert stats.change_20d_pct == pytest.approx(0.0)
-    assert stats.volume_ratio == pytest.approx(0.5)  # 21M so far / 42M
+    # Regression: 21M shares in the first 75 of 390 minutes is 2.6x the normal pace, not "0.5x the average".
+    assert stats.session_elapsed == pytest.approx(75 / 390)
+    assert stats.volume_ratio == pytest.approx(21 / (42 * 75 / 390))
+    assert "volume so far today at about 2.6x the normal pace (session 19% done" in stats.as_text()
+    assert stats.timezone == "America/New_York"
+
+
+def test_volume_pace_is_floored_in_the_first_minutes_and_plain_after_the_close():
+    doc = chart_doc()
+    meta = result_of(doc)["meta"]
+    meta["regularMarketTime"] = meta["currentTradingPeriod"]["regular"]["start"] + 60  # a minute after the open
+    result_of(doc)["indicators"]["quote"][0]["volume"][-1] = 2_100_000
+    prices, _, _ = prices_for({QUERY1: doc})
+    stats = compute_stats("AMD", *prices.chart("AMD"))
+    assert stats.volume_ratio == pytest.approx(2.1 / (42 * 0.1))  # the session counts as at least 10% done
+
+    # After the close (and before the next open, when the period describes another session) the bar is complete.
+    prices, _, _ = prices_for({QUERY1: chart_doc()})
+    stats = compute_stats("AMD", *prices.chart("AMD"))
+    assert stats.session_elapsed is None and stats.volume_ratio == pytest.approx(2.5)
+    assert "latest volume 2.5x the 20-day average" in stats.as_text()
+
+
+def test_a_placeholder_bar_after_the_quote_day_is_ignored():
+    """Regression (live TEVA.TA): a zero-volume row dated after regularMarketTime was taken as the latest session."""
+    bars = make_bars([100.0 + i % 3 for i in range(30)], volume=1_000_000)
+    placeholder = PriceBar(bars[-1].day + timedelta(days=1), 101.0, 101.0, 101.0, 101.0, 0)
+    stats = compute_stats("X", meta_for(bars), [*bars, placeholder])
+    assert stats.volume_ratio == pytest.approx(1.0)
+    assert stats.high_20d == max(bar.high for bar in bars[-20:])
 
 
 def test_compute_stats_before_yahoo_sends_the_latest_bar():
@@ -480,6 +509,28 @@ def test_bars_since_fetches_a_covering_range_and_drops_earlier_bars():
 
     prices.bars_since("AMD", date(2026, 2, 2))  # the clock says NOW
     assert session.calls[1]["params"]["range"] == "1y"
+
+
+def test_history_since_asks_for_splits_and_returns_them_with_the_bars():
+    doc = chart_doc()
+    result_of(doc)["events"] = {
+        "splits": {
+            "1790343000": {"date": 1790343000, "numerator": 10, "denominator": 1, "splitRatio": "10:1"},  # 25 Sep
+            "1780000000": {"date": 1780000000, "numerator": 1, "denominator": 10, "splitRatio": "1:10"},
+            "1": {"date": 1, "numerator": 0, "denominator": 1},  # no usable ratio: skipped
+            "2": "garbage",
+        }
+    }
+    prices, session, _ = prices_for({QUERY1: doc})
+
+    bars, splits = prices.history_since("AMD", date(2026, 9, 21), now=NOW)
+
+    assert [bar.day for bar in bars] == [date(2026, 9, day) for day in (21, 22, 23, 24, 25)]
+    assert splits == [Split(date(2026, 5, 28), 0.1), Split(LAST_DAY, 10.0)]  # exchange-local ex-dates, oldest first
+    assert session.calls[0]["params"] == {"range": "1mo", "interval": "1d", "events": "split"}
+
+    prices, _, _ = prices_for({QUERY1: chart_doc()})
+    assert prices.history_since("AMD", date(2026, 9, 21), now=NOW)[1] == []  # no events: no splits
 
 
 def test_compute_stats_does_not_touch_its_inputs():

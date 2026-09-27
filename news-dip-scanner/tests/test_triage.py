@@ -9,7 +9,7 @@ import pytest
 from conftest import NOW, FakeChatModel, make_article
 
 from dip_scanner import prompts
-from dip_scanner.llm import LLMError, LLMSetupError, LLMUnavailableError
+from dip_scanner.llm import LLMError, LLMRequestError, LLMSetupError, LLMUnavailableError
 from dip_scanner.models import Article, Impact
 from dip_scanner.triage import (
     MAX_COMPANIES_PER_ARTICLE,
@@ -100,6 +100,12 @@ def articles(count: int, **overrides) -> list[Article]:
         ("700 HK", "0700.HK"),
         ("005930.KS", "005930.KS"),
         ("M&M.NS", "M&M.NS"),
+        ("AMZN.O", "AMZN"),  # Reuters codes (regression: became "AMZN-O", an unknown symbol)
+        ("IBM.N", "IBM"),
+        ("MSFT.OQ", "MSFT"),
+        ("n/a", None),  # placeholders (regression: "N-A")
+        ("Unknown", None),
+        ("PRIVATE", None),
         ("^GSPC", None),
         ("EURUSD=X", None),
         ("CL=F", None),
@@ -124,18 +130,36 @@ def test_validate_triage_returns_companies_for_every_id():
     assert validate_triage(data, ["a1", "a2"]) == {"a1": [company()], "a2": []}
 
 
-def test_validate_triage_tolerates_omitted_and_unknown_ids():
+def test_validate_triage_leaves_out_omitted_ids_and_ignores_unknown_ones():
+    """Omitted ids are not "nothing affected": they aren't in the result, so triage() tries them again."""
     data = {"articles": [{"id": "a1", "companies": [company()]}, {"id": "a9", "companies": [company("X")]}]}
-    assert validate_triage(data, ["a1", "a2"]) == {"a1": [company()], "a2": []}
+    assert validate_triage(data, ["a1", "a2"]) == {"a1": [company()]}
 
 
 def test_validate_triage_accepts_small_variations_of_the_shape():
     assert validate_triage([{"id": "a1", "companies": None}], ["a1"]) == {"a1": []}
+    assert validate_triage([{"id": "a1"}], ["a1"]) == {"a1": []}
     assert validate_triage({"a1": [company()], "a2": []}, ["a1", "a2"]) == {"a1": [company()], "a2": []}
     assert validate_triage({"articles": [{"id": 1, "companies": [company()]}]}, ["a1"]) == {"a1": [company()]}
     merged = {"articles": [{"id": "a1", "companies": [company()]}, {"id": "a1", "companies": ["junk", company("X")]}]}
     assert validate_triage(merged, ["a1"]) == {"a1": [company(), company("X")]}
-    assert validate_triage({"articles": []}, ["a1"]) == {"a1": []}  # one article, nothing affected
+    aliased = {"articles": [{"id": "a1", "affected_companies": [company()]}, {"id": "a2", "impacts": []}]}
+    assert validate_triage(aliased, ["a1", "a2"]) == {"a1": [company()], "a2": []}
+
+
+@pytest.mark.parametrize(
+    ("data", "ids", "message"),
+    [
+        # Regression: companies under another key were read as "none affected" and lost.
+        ({"articles": [{"id": "a1", "tickers": [company()]}]}, ["a1"], 'no "companies" list \\(found "tickers"\\)'),
+        # Regression: an empty reply for one or two articles marked them all as triaged.
+        ({"articles": []}, ["a1"], "covers only 0 of the 1"),
+        ({"articles": []}, ["a1", "a2"], "covers only 0 of the 2"),
+    ],
+)
+def test_validate_triage_asks_again_when_companies_would_be_lost(data, ids, message):
+    with pytest.raises(ValueError, match=message):
+        validate_triage(data, ids)
 
 
 @pytest.mark.parametrize(
@@ -400,6 +424,45 @@ def test_triage_stops_for_the_cycle_when_the_service_is_unavailable():
     assert triaged == 1 and [i.article_id for i in impacts] == [items[0].id]
     assert store.failures == []  # not the articles' fault: no attempt used up
     assert [store.status[a.id] for a in items] == ["done", "pending", "pending"]
+
+
+def test_articles_a_reply_leaves_out_stay_pending_and_are_sent_again(caplog):
+    """Regression: a reply covering 10 of 20 articles marked all 20 as triaged; the other 10 were never looked at."""
+    items = articles(4)
+    store = FakeStore(items)
+    first_half = replier({"Story": [company()]})
+
+    def lossy(system, prompt, json_mode):
+        reply = first_half(system, prompt, json_mode)
+        if len(reply["articles"]) == 4:
+            reply["articles"] = reply["articles"][:2]  # a1 and a2 only: accepted, but a3 and a4 are missing
+        return reply
+
+    triaged, impacts = triage(FakeChatModel(lossy), store, batch_size=4, max_attempts=3, now=NOW)
+
+    assert triaged == 2 and [i.article_id for i in impacts] == [items[0].id, items[1].id]
+    assert [store.status[a.id] for a in items] == ["done", "done", "pending", "pending"]
+    assert [store.attempts[a.id] for a in items] == [0, 0, 1, 1]
+    assert "left out 2 of 4 article(s)" in caplog.text
+
+    triaged, impacts = triage(FakeChatModel(first_half), store, batch_size=4, max_attempts=3, now=NOW)
+    assert triaged == 2 and set(store.status.values()) == {"done"}
+
+
+def test_a_request_every_call_is_refused_for_uses_up_no_attempts():
+    """Regression: an account-level 400 (spend limit) failed every pending article for good after 3 cycles."""
+    store = FakeStore(articles(4))
+    model = FakeChatModel(LLMRequestError("Anthropic rejected the request: You have reached your usage limits"))
+    for _ in range(5):
+        assert triage(model, store, batch_size=4, max_attempts=3, now=NOW) == (0, [])
+    assert store.failures == [] and set(store.status.values()) == {"pending"}
+
+
+def test_unexpected_errors_count_as_a_failed_batch_instead_of_breaking_every_cycle():
+    """Regression: an IndexError from a gateway reply escaped triage, so the same batch was retried forever."""
+    store = FakeStore(articles(1))
+    triage(FakeChatModel(IndexError("list index out of range")), store, batch_size=4, max_attempts=3, now=NOW)
+    assert store.failures == [[store_id for store_id in store.articles]]
 
 
 def test_triage_lets_setup_errors_stop_the_run():

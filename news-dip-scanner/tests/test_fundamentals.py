@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -259,6 +260,149 @@ def test_ifrs_filers_are_read_from_ifrs_full():
             "operating_cash_flow": 9156.0,
         }
     ]
+
+
+def test_proxy_statement_figures_never_replace_the_10k():
+    """Regression (live VZ, GM, ORCL, JPM): the DEF 14A pay-versus-performance table, filed after the 10-K, tags
+    rounded or differently based net income; "latest filing wins" let it replace the audited figure and the Q4
+    derived from it."""
+    doc = facts_doc(
+        NetIncomeLoss={
+            "USD": [
+                fact("2025-01-01", "2025-03-31", 4000, filed="2025-04-25"),
+                fact("2025-04-01", "2025-06-30", 5000, filed="2025-07-25"),
+                fact("2025-07-01", "2025-09-30", 5832, filed="2025-10-25"),
+                fact("2025-01-01", "2025-12-31", 17174, filed="2026-02-17", form="10-K"),
+                fact("2025-01-01", "2025-12-31", 17608, filed="2026-04-06", form="DEF 14A"),
+                fact("2024-01-01", "2024-12-31", 17949, filed="2026-04-06", form="DEF 14A"),  # only in the proxy
+                fact("2024-01-01", "2024-12-31", 17506, filed="2025-02-10", form="10-K"),
+            ]
+        }
+    )
+
+    fundamentals = parse_company_facts("VZ", "732712", doc)
+
+    assert [(y["period_end"], y["net_income"]) for y in fundamentals.annual] == [
+        ("2025-12-31", 17174.0),
+        ("2024-12-31", 17506.0),
+    ]
+    assert fundamentals.quarters[0] == {**fundamentals.quarters[0], "period_end": "2025-12-31", "net_income": 2342.0}
+
+
+def test_a_filer_that_moved_to_ifrs_is_read_from_its_current_taxonomy():
+    """Regression (live TM, SONY, HMC): old us-gaap facts from before the switch were shown as the newest figures."""
+    doc = {
+        "cik": 715153,
+        "entityName": "HONDA MOTOR CO LTD",
+        "facts": {
+            "us-gaap": {
+                "Revenues": {"units": {"JPY": [fact("2013-04-01", "2014-03-31", 11_842_451, form="20-F")]}},
+                "NetIncomeLoss": {"units": {"JPY": [fact("2013-04-01", "2014-03-31", 574_107, form="20-F")]}},
+            },
+            "ifrs-full": {
+                "Revenue": {"units": {"JPY": [fact("2024-04-01", "2025-03-31", 21_688_767, form="20-F")]}},
+                "ProfitLossAttributableToOwnersOfParent": {
+                    "units": {"JPY": [fact("2024-04-01", "2025-03-31", 835_837, form="20-F")]}
+                },
+            },
+        },
+    }
+
+    fundamentals = parse_company_facts("HMC", "715153", doc)
+
+    assert fundamentals.currency == "JPY"
+    assert [(y["period_end"], y["revenue"], y["net_income"]) for y in fundamentals.annual] == [
+        ("2025-03-31", 21_688_767.0, 835_837.0)
+    ]
+
+    # With equally recent figures us-gaap still wins.
+    doc["facts"]["us-gaap"]["Revenues"]["units"]["JPY"].append(fact("2024-04-01", "2025-03-31", 1, form="20-F"))
+    assert parse_company_facts("HMC", "715153", doc).annual[0]["revenue"] == 1.0
+
+
+def test_net_income_falls_back_to_the_amount_available_to_common_stockholders():
+    """Regression (live F, AMT, O): these filers stopped tagging NetIncomeLoss, so the newest quarters and year showed
+    net income as n/a although the filings have it as NetIncomeLossAvailableToCommonStockholdersBasic."""
+    doc = facts_doc(
+        NetIncomeLoss={
+            "USD": [
+                fact("2025-01-01", "2025-03-31", 471, filed="2025-05-01"),
+                fact("2025-04-01", "2025-06-30", -36, filed="2025-07-31"),
+            ]
+        },
+        NetIncomeLossAvailableToCommonStockholdersBasic={
+            "USD": [
+                fact("2025-07-01", "2025-09-30", 2448, filed="2025-10-24"),
+                fact("2025-01-01", "2025-12-31", -8182, filed="2026-02-11", form="10-K"),
+                fact("2026-01-01", "2026-03-31", 2548, filed="2026-04-30"),
+            ]
+        },
+    )
+
+    fundamentals = parse_company_facts("F", "37996", doc)
+
+    assert [(q["period_end"], q["net_income"]) for q in fundamentals.quarters] == [
+        ("2026-03-31", 2548.0),
+        ("2025-12-31", -8182.0 - (471 - 36 + 2448)),  # Q4 derived from the year
+        ("2025-09-30", 2448.0),
+        ("2025-06-30", -36.0),
+        ("2025-03-31", 471.0),
+    ]
+    assert [(y["period_end"], y["net_income"]) for y in fundamentals.annual] == [("2025-12-31", -8182.0)]
+
+    # A company tagging both for the same periods keeps NetIncomeLoss (before preferred dividends).
+    both = facts_doc(
+        NetIncomeLoss={"USD": [fact("2026-01-01", "2026-03-31", 100)]},
+        NetIncomeLossAvailableToCommonStockholdersBasic={"USD": [fact("2026-01-01", "2026-03-31", 90)]},
+    )
+    assert parse_company_facts("T", "1", both).quarters[0]["net_income"] == 100.0
+
+
+def test_old_fundamentals_say_how_old_they_are():
+    fundamentals = parse_company_facts(
+        "OLD", "1", facts_doc(Revenues={"USD": [fact("2013-04-01", "2014-03-31", 100, form="10-K")]})
+    )
+    text = fundamentals.as_text(today=date(2026, 9, 27))
+    assert "Note: the newest figures are for the period ending 2014-03-31, about 150 months ago" in text
+    assert "Note:" not in fundamentals.as_text(today=date(2015, 6, 30))  # 15 months: a normal 20-F lag
+    assert "Note:" not in fundamentals.as_text()
+
+
+def test_a_16_week_fourth_quarter_is_derived():
+    """Regression (live COST, PEP): 12/12/12/16-week calendars; the 112-day Q4 was neither shown nor derived."""
+    doc = facts_doc(
+        Revenues={
+            "USD": [
+                fact("2024-09-02", "2024-11-24", 62_151),  # 83 days each
+                fact("2024-11-25", "2025-02-16", 63_723),
+                fact("2025-02-17", "2025-05-11", 63_205),
+                fact("2024-09-02", "2025-05-11", 189_079),  # nine months, 251 days
+                fact("2024-09-02", "2025-08-31", 275_235, form="10-K"),  # 363 days
+            ]
+        }
+    )
+
+    quarters = parse_company_facts("COST", "909832", doc).quarters
+
+    assert quarters[0]["period_end"] == "2025-08-31"
+    assert quarters[0]["revenue"] == 275_235 - 189_079
+
+
+def test_a_16_week_first_quarter_is_kept():
+    """Regression (live KR): the directly reported 111-day Q1 was treated as a year-to-date total and dropped."""
+    doc = facts_doc(
+        Revenues={
+            "USD": [
+                fact("2026-02-01", "2026-05-23", 46_121),  # 16 weeks
+                fact("2026-05-24", "2026-08-15", 33_900),  # 12 weeks
+                fact("2026-02-01", "2026-08-15", 80_021),  # half year, 195 days
+            ]
+        }
+    )
+
+    quarters = parse_company_facts("KR", "56873", doc).quarters
+
+    assert [(q["period_end"], q["revenue"]) for q in quarters] == [("2026-08-15", 33_900.0), ("2026-05-23", 46_121.0)]
 
 
 def test_a_company_without_figures_parses_to_empty_lists():

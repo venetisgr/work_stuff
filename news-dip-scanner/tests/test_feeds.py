@@ -102,10 +102,30 @@ def test_canonical_link(url, expected):
         ("  Boeing &amp; Airbus:   deliveries   SLOW  ", "boeing airbus deliveries slow"),
         ("Η ΔΕΗ ανεβαίνει - Naftemporiki", "η δεη ανεβαίνει"),
         ("", ""),
+        # Only publishers go: a company or the rest of the headline stays (regression: both were stripped).
+        ("Profit warning - Continental AG", "profit warning continental ag"),
+        ("Ad hoc announcement - Siemens Energy AG", "ad hoc announcement siemens energy ag"),
+        (
+            "Chinese AI models surge in global popularity — and Washington is worried",
+            "chinese ai models surge in global popularity and washington is worried",
+        ),
+        # Google News appends its publisher to a headline that may already end in one.
+        (
+            "China may let ByteDance buy Nvidia chips – The Information - Investing.com",
+            "china may let bytedance buy nvidia chips",
+        ),
+        ("IBM raises its dividend - 24/7 Wall St.", "ibm raises its dividend"),
     ],
 )
 def test_title_key(title, expected):
     assert title_key(title) == expected
+
+
+def test_title_key_drops_the_publisher_the_feed_names():
+    assert (
+        title_key("Acme recalls its flagship widget - Acme Daily", "Acme Daily") == "acme recalls its flagship widget"
+    )
+    assert title_key("Acme recalls its flagship widget - Acme Daily") == "acme recalls its flagship widget acme daily"
 
 
 # --- strip_html ----------------------------------------------------------------------------------------------------
@@ -229,6 +249,41 @@ def test_parse_drops_a_summary_that_only_repeats_the_headline():
     assert article.title == "AMD shares slide after weak data-center guidance - Reuters"
     assert article.summary == ""
     assert article.source_name == "MarketWatch"  # plain parse_feed always credits the feed
+
+
+def test_parse_drops_translated_copies_of_a_release():
+    """Regression (live GlobeNewswire/PR Newswire): one release in 13 languages became 13 stories, all triaged, all
+    counted as corroboration."""
+    wire = Feed(key="gnw", name="GlobeNewswire", url="https://www.globenewswire.com/RssFeed/x")
+    items = rss(
+        "<item><title>YYForce reports H1 results</title><link>https://example.com/en</link>"
+        "<dc:language>en-US</dc:language></item>",
+        "<item><title>YYForce publie ses résultats</title><link>https://example.com/fr</link>"
+        "<dc:language>fr</dc:language></item>",
+        "<item><title>YYForce 公布上半年业绩</title><link>https://example.com/zh</link>"
+        "<dc:language>zh-hans</dc:language></item>",
+        "<item><title>Untagged release</title><link>https://example.com/plain</link></item>",
+        "<item><title>WSP met à jour son événement</title>"
+        "<link>https://www.globenewswire.com/news-release/2026/09/27/3369451/0/fr/mise-a-jour.html</link></item>",
+    ).replace(b'<rss version="2.0">', b'<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">')
+
+    assert [a.title for a in parse_feed(wire, items, now=NOW)] == ["YYForce reports H1 results", "Untagged release"]
+    french = Feed(key="gnw-fr", name="GlobeNewswire", url=wire.url, languages=("fr",))
+    assert [a.title for a in parse_feed(french, items, now=NOW)] == [
+        "YYForce publie ses résultats",
+        "Untagged release",
+        "WSP met à jour son événement",
+    ]
+    assert len(parse_feed(Feed(key="all", name="All", url=wire.url, languages=()), items, now=NOW)) == 5
+
+
+def test_parse_keys_an_aggregator_item_without_its_publisher():
+    item = (
+        "<item><title>Acme recalls its flagship widget - Acme Daily</title><link>https://example.com/a</link>"
+        "<source url='https://acme-daily.example.com'>Acme Daily</source></item>"
+    )
+    [article] = parse_feed(MARKETWATCH, rss(item), now=NOW)
+    assert article.title_key == "acme recalls its flagship widget"
 
 
 def test_parse_a_naive_now_is_taken_as_utc():
@@ -395,7 +450,7 @@ def test_ticker_news_merges_yahoo_and_google_newest_first_without_duplicates():
 
     assert session.urls == [
         f"{YAHOO}?s=AMD&region=US&lang=en-US",
-        f"{GOOGLE}?q=Advanced+Micro+Devices+stock&hl=en-US&gl=US&ceid=US:en",
+        f"{GOOGLE}?q=Advanced+Micro+Devices+stock+when%3A30d&hl=en-US&gl=US&ceid=US:en",
     ]
     assert [(a.source_name, a.title) for a in articles] == [
         ("Barron's", "Analysts defend AMD after selloff, see AI demand intact - Barron's"),
@@ -404,7 +459,7 @@ def test_ticker_news_merges_yahoo_and_google_newest_first_without_duplicates():
         ("Yahoo Finance", "AMD shares slide after weak data-center guidance"),
         ("CNBC", "AMD's MI400 ramp is on track, says CEO Lisa Su - CNBC"),
         ("Yahoo Finance", "AMD to present at Nasdaq investor conference"),
-        ("The Motley Fool", "AMD stock hits a record high on AI optimism - The Motley Fool"),
+        # The Motley Fool piece from March is older than MAX_CONTEXT_AGE.
     ]
     assert {a.source for a in articles} == {"ticker:AMD"}
     assert articles[2].link == "https://finance.yahoo.com/news/amd-shares-slide-weak-data-133000123.html"
@@ -412,18 +467,77 @@ def test_ticker_news_merges_yahoo_and_google_newest_first_without_duplicates():
 
 def test_ticker_news_searches_google_for_the_ticker_without_a_company_and_respects_the_limit():
     session = FakeSession({YAHOO: fixture("rss_yahoo_amd.xml"), GOOGLE: fixture("rss_google_amd.xml")})
-    articles = ticker_news(session, "SAP.DE", now=NOW, limit=2)
-    assert session.urls[0] == f"{YAHOO}?s=SAP.DE&region=US&lang=en-US"
-    assert session.urls[1].startswith(f"{GOOGLE}?q=SAP.DE+stock&")
+    articles = ticker_news(session, "amd", now=NOW, limit=2)
+    assert session.urls[0] == f"{YAHOO}?s=AMD&region=US&lang=en-US"
+    assert session.urls[1].startswith(f"{GOOGLE}?q=AMD+stock+when%3A30d&")
     assert len(articles) == 2
-    assert {a.source for a in articles} == {"ticker:SAP.DE"}
+    assert {a.source for a in articles} == {"ticker:AMD"}
+    assert {a.source_name for a in articles} == {"Yahoo Finance", "Barron's"}  # one place for each source
 
 
 def test_ticker_news_uses_whatever_source_answered():
     session = FakeSession({YAHOO: 404, GOOGLE: fixture("rss_google_amd.xml")})
     articles = ticker_news(session, "AMD", now=NOW)
-    assert len(articles) == 4
+    assert len(articles) == 3  # the fourth is from March
     assert all(a.source_name != "Google News" for a in articles)  # every item names its publisher
 
     session = FakeSession({YAHOO: requests.ConnectionError("down"), GOOGLE: requests.ReadTimeout("slow")})
     assert ticker_news(session, "AMD", now=NOW) == []
+
+
+def _item(title: str, when, summary: str = "") -> str:
+    return (
+        f"<item><title>{title}</title><link>https://example.com/{abs(hash(title))}</link>"
+        f"<pubDate>{when:%a, %d %b %Y %H:%M:%S} GMT</pubDate><description>{summary}</description></item>"
+    )
+
+
+def test_ticker_news_keeps_only_headlines_about_the_company_and_recent_ones():
+    """Regression (live NVDA): 12 of 15 context headlines were about Lululemon, Costco, SpaceX...; OPAP.AT got
+    items up to 209 days old."""
+    yahoo = rss(
+        _item("Nvidia unveils its next AI chip", NOW - timedelta(hours=1)),
+        _item("Lululemon stock sinks on weak outlook", NOW - timedelta(hours=2)),
+        _item("3 dividend stocks to buy now", NOW - timedelta(hours=3), "Costco and Coca-Cola make the list."),
+        _item("Chip stocks rally", NOW - timedelta(hours=4), "NVDA led the gains, up 4%."),
+        _item("Investors eye $NVDA ahead of earnings", NOW - timedelta(hours=5)),
+        _item("Canada Goose shares jump", NOW - timedelta(hours=6), "Not about NVDAX or nvda."),
+    )
+    google = rss(
+        _item("NVIDIA Corp. faces a new antitrust probe - Reuters", NOW - timedelta(days=2)),
+        _item("Why Nvidia stock fell in March - The Motley Fool", NOW - timedelta(days=200)),
+    )
+    session = FakeSession({YAHOO: yahoo, GOOGLE: google})
+
+    articles = ticker_news(session, "NVDA", company="NVIDIA Corporation", now=NOW)
+
+    assert [a.title for a in articles] == [
+        "Nvidia unveils its next AI chip",
+        "Chip stocks rally",
+        "Investors eye $NVDA ahead of earnings",
+        "NVIDIA Corp. faces a new antitrust probe - Reuters",
+    ]
+    assert "q=NVIDIA+stock+when%3A30d" in session.urls[1]
+
+
+def test_ticker_news_short_symbols_only_match_as_symbols():
+    yahoo = rss(
+        _item("AT&amp;T raises its dividend", NOW - timedelta(hours=1)),
+        _item("Shares of (T) slide after subscriber loss", NOW - timedelta(hours=2)),
+        _item("T stands for tomorrow in this T-shirt ad", NOW - timedelta(hours=3)),
+    )
+    session = FakeSession({YAHOO: yahoo, GOOGLE: rss()})
+    articles = ticker_news(session, "T", company="AT&T Inc.", now=NOW)
+    assert [a.title for a in articles] == ["AT&T raises its dividend", "Shares of (T) slide after subscriber loss"]
+
+
+def test_ticker_news_gives_each_source_half_the_places_unless_the_other_has_too_few():
+    yahoo = rss(*(_item(f"AMD update number {n}", NOW - timedelta(minutes=n)) for n in range(20)))
+    google = rss(*(_item(f"AMD analysis piece {n}", NOW - timedelta(days=1, hours=n)) for n in range(5)))
+    session = FakeSession({YAHOO: yahoo, GOOGLE: google})
+
+    articles = ticker_news(session, "AMD", now=NOW, limit=15)
+
+    assert len(articles) == 15
+    assert sum("analysis piece" in a.title for a in articles) == 5  # every relevant Google item made it
+    assert [a.published for a in articles] == sorted((a.published for a in articles), reverse=True)

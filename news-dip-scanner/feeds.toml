@@ -7,10 +7,15 @@
 #   category - label for reports: markets, earnings, filings, press-releases, tech, energy, health, macro,
 #              europe or greece
 #   enabled  - set to false to keep a feed listed without polling it (default true)
+#   dedup_titles - false for feeds whose headlines are formulaic and repeat for different items (SEC filings);
+#              otherwise a headline seen again within 72 hours, from any feed, is the same story (default true)
+#   languages - items tagged with another language are dropped (default ["en"]; [] keeps every language). PR
+#              Newswire and GlobeNewswire publish machine translations of each release; only feeds that tag each
+#              item with its language are affected
 #
 # The scanner polls every enabled feed each cycle (every ~5 minutes in watch mode) with conditional requests,
 # so feeds that send ETag or Last-Modified cost almost nothing when nothing changed. The same story in several
-# feeds is kept once (articles are matched by link and by normalised title).
+# feeds is kept once (articles are matched by link and by normalised title), and translated copies are dropped.
 #
 # Every feed below was checked from a cloud server on Sunday 2026-09-27 with the scanner's User-Agent.
 # "newest" is the age of the newest item at that moment, so weekend ages are longer than weekday ones.
@@ -111,6 +116,7 @@ name = "SEC EDGAR - Latest 8-K Filings"
 url = "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&count=100&output=atom"
 category = "filings"
 enabled = true
+dedup_titles = false  # "8-K - APPLE INC (0000320193) (Filer)" is the title of every Apple 8-K
 
 # PR Newswire, all news releases: company announcements straight from the source.
 # news-releases-list.rss serves the same list but answered 502/404 on 4 of 8 tries; this URL answered 14 of 14.
@@ -121,7 +127,8 @@ url = "https://www.prnewswire.com/rss/all-news-releases-list.rss"
 category = "press-releases"
 enabled = true
 
-# GlobeNewswire releases from public companies only (includes French duplicates of Canadian releases).
+# GlobeNewswire releases from public companies only (it also lists machine translations of releases; the
+# languages filter keeps the English ones).
 # verified 2026-09-27: 20 items, newest 133 min old, all with summaries, Last-Modified (-> 304)
 [feeds.globenewswire-public-companies]
 name = "GlobeNewswire - Public Companies"
@@ -212,6 +219,7 @@ enabled = true
 name = "Naftemporiki - Economy & Markets"
 url = "https://www.naftemporiki.gr/finance/feed/"
 category = "greece"
+languages = ["el", "en"]
 enabled = false
 
 # Capital.gr.
@@ -220,6 +228,7 @@ enabled = false
 name = "Capital.gr"
 url = "https://www.capital.gr/rss"
 category = "greece"
+languages = ["el", "en"]
 enabled = false
 
 # ---------------------------------------------------------------------------------------------------------------

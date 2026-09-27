@@ -7,7 +7,8 @@
 # Minutes between cycles in `dip-scanner watch` (cycles start on the boundaries: :00, :05, :10, ...).
 interval_minutes = 5
 # New articles older than this are stored but never sent to the model. This is what keeps the first cycle after
-# a fresh install from triaging days of backlog: it only triages the last day (a few hundred articles).
+# a fresh install from triaging days of backlog: it only triages the last day (a few hundred articles). Articles
+# left pending by an unavailable model are retired once they are this old, too.
 max_article_age_hours = 24
 # How far back company news counts towards a candidate (a dip can follow the news by a day or two).
 lookback_hours = 48
@@ -17,7 +18,8 @@ max_triage_attempts = 3
 # At most this many fear-vs-fundamentals analyses per cycle (bounds the LLM bill); the rest are named in the
 # report's notes and wait for the next cycle.
 max_candidates_per_cycle = 8
-# A ticker isn't re-analysed within this many hours unless new qualifying news arrives.
+# A ticker isn't re-analysed within this many hours unless qualifying news arrives that the last analysis didn't
+# see, or that analysis came before any trading on its news (weekend news) and the next session has moved.
 cooldown_hours = 24
 # Fetch per-ticker headlines (Yahoo Finance + Google News) to give the analysis more context.
 context_news = true
@@ -38,14 +40,17 @@ directions = ["negative", "mixed"]
 include_indirect = true
 
 [universe]
-# Watchlist tickers (Yahoo Finance symbols) are eligible with any news of magnitude 1 or more, direct or indirect.
+# Watchlist tickers (Yahoo Finance symbols; "BRK.B" or "NASDAQ:TSLA" are written the Yahoo way) skip the
+# magnitude and relation filters: any negative or mixed news of magnitude 1 or more, direct or indirect. They still
+# need a dip, and [dip] directions still applies.
 watchlist = []
 # watchlist = ["AMD", "NVDA", "ASML", "MSFT", "TSM"]
 # Only ever consider the watchlist.
 only_watchlist = false
 # Never consider these tickers.
 exclude = []
-# Skip penny stocks below this price (in the stock's own currency).
+# Skip penny stocks below this price, in the currency's main unit (London quotes in pence, Johannesburg in cents
+# and Tel Aviv in agorot are divided by 100 first).
 min_price = 1.0
 # Only these exchanges, by Yahoo suffix: "" is US (AMD), ".DE" Xetra, ".PA" Paris, ".AS" Amsterdam, ".L" London,
 # ".AT" Athens, ".T" Tokyo, ".HK" Hong Kong... Leave it commented out to allow every exchange.
@@ -53,6 +58,18 @@ min_price = 1.0
 
 [alerts]
 # Which new opportunities are sent as notifications (all of them are in the reports).
+# In practice min_score is the rule that binds. The potential low sits near the statistical 6-month low and the
+# target near the pre-drop high, so the score's reward_risk (upside / (upside + downside)) is usually 0.2-0.4, and a
+# score of 65 then needs a chance up of about 76-85% for "temporary fear" at high confidence (more at medium). A
+# "mixed" verdict needs 93% or more at high confidence, above the 90% the model is told not to exceed, so mixed
+# alerts effectively need a lower min_score (55 lets mixed/high at 80% alert, and the README's scoring example at
+# 58.5). min_probability only matters when the upside is over about 3.5 times the downside.
 min_score = 65
 min_probability = 60
 verdicts = ["temporary_fear", "mixed"]
+# A ticker alerted within repeat_hours isn't alerted again unless the score rose by at least min_score_change, the
+# verdict changed or the price fell by another [dip] min_drop_1d_pct (a developing story is analysed again as new
+# articles arrive, but sent once). A new analysis that undercuts an alert from the last 6 months (no longer passes
+# these rules, or 20 or more points less likely to be higher) is sent as a "thesis change".
+repeat_hours = 24
+min_score_change = 10

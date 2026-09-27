@@ -55,6 +55,9 @@ _REQUIRED = ("verdict", "probability_up_6m", *_PRICE_FIELDS, "confidence", *_TEX
 _Z_10TH_PERCENTILE = 1.2816
 _TRADING_DAYS = 252
 _HALF_YEAR = 0.5
+# sanitize caps a target above both the 52-week high and this many standard deviations of 6-month volatility above
+# the price (2: the 97.7th percentile of the 6-month price): a slipped decimal or a units mix-up, not a realistic call.
+_TARGET_SIGMAS = 2.0
 
 
 # --- the prompt ----------------------------------------------------------------------------------------------------
@@ -65,7 +68,9 @@ def price_block(stats: PriceStats) -> str:
 
     The extra lines put the last move in proportion (typical daily move from the annualised volatility) and give
     three reference prices for potential_low: the 10th and 5th percentile 6-month prices of a zero-drift lognormal
-    model, and the price after a repeat of the worst 6-month drawdown in the history.
+    model, and the price after a repeat of the worst 6-month drawdown in the history. The percentiles are of the price
+    at the 6-month mark, not of the lowest price along the way (which is below them about twice as often, by the
+    reflection principle), and the block says so.
     """
     lines = [stats.as_text()]
     daily = stats.volatility_pct / math.sqrt(_TRADING_DAYS)
@@ -79,7 +84,9 @@ def price_block(stats: PriceStats) -> str:
     repeat = stats.price * (1 + min(0.0, stats.worst_6m_drawdown_pct) / 100)
     lines.append(
         f"Anchors for potential_low ({stats.currency}): 10th-percentile 6-month price {_money(low_10)}, "
-        f"5th-percentile {_money(stats.stat_low_6m)}, after a repeat of the worst 6-month drawdown {_money(repeat)}."
+        f"5th-percentile {_money(stats.stat_low_6m)}, after a repeat of the worst 6-month drawdown {_money(repeat)}. "
+        "The percentiles are of the price at the 6-month mark; the lowest price along the way falls below each of "
+        "them about twice as often."
     )
     return "\n".join(lines)
 
@@ -280,7 +287,11 @@ def sanitize(raw: dict, stats: PriceStats) -> Analysis:
       min(stats.stat_low_6m, price * 0.97); below price * 0.3 (including zero or negative) it is raised to
       price * 0.3;
     - entry_price is clamped into [potential_low, price];
-    - target_price must be above entry_price, else it becomes entry * (1 + max(0.05, volatility_pct / 100 * 0.5));
+    - target_price must be above entry_price, else it becomes entry * (1 + step) with
+      step = max(0.05, volatility_pct / 100 * 0.5);
+    - target_price can't be above max(high_52w, price * exp(2 * volatility_pct / 100 * sqrt(0.5)), entry * (1 + step)):
+      a higher one (a slipped decimal, pence for pounds, a hallucination) is lowered to that ceiling, so it can't
+      inflate the score's reward/risk;
     - risks, catalysts and checks keep at most MAX_LIST_ITEMS non-empty strings each.
     """
     price = stats.price
@@ -317,12 +328,21 @@ def sanitize(raw: dict, stats: PriceStats) -> Analysis:
         entry = fixed
 
     target = float(raw["target_price"])
+    step = max(0.05, stats.volatility_pct / 100 * 0.5)
     if target <= entry:
-        step = max(0.05, stats.volatility_pct / 100 * 0.5)
         fixed = _round_price(entry * (1 + step))
         warnings.append(
             f"target_price {_money(target)} was not above entry_price {_money(entry)}; used {_money(fixed)} "
             f"({step * 100:.0f}% above the entry)."
+        )
+        target = fixed
+    sigma = max(0.0, stats.volatility_pct) / 100 * math.sqrt(_HALF_YEAR)
+    ceiling = max(stats.high_52w, price * math.exp(_TARGET_SIGMAS * sigma), entry * (1 + step))
+    if target > ceiling:
+        fixed = _round_price(ceiling)
+        warnings.append(
+            f"target_price {_money(target)} was implausibly high (above the 52-week high {_money(stats.high_52w)} "
+            f"and {_TARGET_SIGMAS:g} standard deviations of 6-month volatility above the price); used {_money(fixed)}."
         )
         target = fixed
 
@@ -412,7 +432,7 @@ def analyze_candidate(
         company=candidate.company,
         today=f"{now:%Y-%m-%d} ({now:%A})",
         price_block=price_block(stats),
-        fundamentals_block=fundamentals.as_text() if fundamentals is not None else NO_FUNDAMENTALS,
+        fundamentals_block=fundamentals.as_text(today=now.date()) if fundamentals is not None else NO_FUNDAMENTALS,
         news_block=news_block(candidate.impacts, extra_news),
         dip_reasons="; ".join(candidate.dip_reasons) or "manual analysis (no dip thresholds applied)",
         currency=stats.currency,
@@ -435,6 +455,7 @@ def analyze_candidate(
         headlines=_headlines(candidate.impacts),
         dip_reasons=list(candidate.dip_reasons),
         model=model.name,
+        news_after_session=candidate.news_after_session,
     )
     log.info(
         "%s: %s (%s confidence), %d%% chance up in 6 months, score %.1f.",

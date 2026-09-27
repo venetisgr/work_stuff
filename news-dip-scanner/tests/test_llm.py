@@ -16,6 +16,7 @@ from dip_scanner.llm import (
     AnthropicChatModel,
     AzureFoundryChatModel,
     LLMError,
+    LLMRequestError,
     LLMSetupError,
     LLMUnavailableError,
     OpenAIChatModel,
@@ -278,7 +279,47 @@ def test_openai_failures_map_to_input_service_or_setup_errors(response, error, m
 
 def test_throttling_and_outages_are_llm_errors_too():
     assert issubclass(LLMUnavailableError, LLMError)
+    assert issubclass(LLMRequestError, LLMError)
     assert not issubclass(LLMSetupError, LLMError)
+
+
+@pytest.mark.parametrize(
+    "response",
+    [openai_error(400, "invalid_request_error", "Bad messages"), openai_error(409, None, "Conflict here")],
+)
+def test_unexplained_refusals_are_request_errors(response):
+    """So triage can tell "every request is refused" from "this article is bad" (see triage())."""
+    with pytest.raises(LLMRequestError):
+        openai_model(Recorder(response)).complete("s", "p")
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"id": "x", "object": "chat.completion", "created": 1, "model": "m", "choices": []}, r"no reply \(no choices"),
+        ({"error": {"message": "upstream failed", "code": 502}}, "no reply: .*upstream failed"),
+        ({"choices": None}, "no reply"),
+        ({"choices": [{"index": 0, "finish_reason": "stop"}]}, "no reply"),
+    ],
+)
+def test_a_gateway_reply_without_choices_is_an_llm_error(body, message):
+    """Regression: an OpenAI-compatible gateway answering 200 with no choices raised IndexError/TypeError, which
+    escaped triage, so the same batch was retried every cycle and the run never got further."""
+    with pytest.raises(LLMError, match=message):
+        openai_model(Recorder(body)).complete("s", "p")
+
+
+def test_a_blank_base_url_in_the_environment_means_the_default(monkeypatch):
+    """Regression: `OPENAI_BASE_URL=` in .env made every request go to "" ("Couldn't connect to .")."""
+    monkeypatch.setenv("OPENAI_BASE_URL", "")
+    recorder = Recorder(completion())
+    openai_model(recorder).complete("s", "p")
+    assert str(recorder.requests[0].url) == "https://api.openai.com/v1/chat/completions"
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", " ")
+    recorder = Recorder(message())
+    anthropic_model(recorder).complete("s", "p")
+    assert str(recorder.requests[0].url) == "https://api.anthropic.com/v1/messages"
 
 
 def test_openai_keeps_a_truncated_reply_with_a_warning(caplog):
@@ -351,6 +392,24 @@ def test_foundry_without_an_api_key_signs_in_with_entra_id(monkeypatch):
     recorder = Recorder(completion())
     foundry_model(recorder, foundry_api_key=None).complete("s", "p")
     assert recorder.requests[0].headers["authorization"] == "Bearer entra-token"
+
+
+def test_a_failed_entra_id_sign_in_is_a_setup_error(monkeypatch):
+    """Regression: with no key and no az login, azure's ClientAuthenticationError escaped as a raw traceback."""
+    import azure.identity
+    from azure.core.exceptions import ClientAuthenticationError
+
+    def provider(credential, scope):
+        def token():
+            raise ClientAuthenticationError("DefaultAzureCredential failed to retrieve a token.\nDetails...")
+
+        return token
+
+    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", lambda: object())
+    monkeypatch.setattr(azure.identity, "get_bearer_token_provider", provider)
+    model = foundry_model(Recorder(completion()), foundry_api_key=None)
+    with pytest.raises(LLMSetupError, match="az login.*DefaultAzureCredential failed to retrieve a token"):
+        model.complete("s", "p")
 
 
 def test_entra_id_without_azure_identity_names_the_extra(monkeypatch):
@@ -490,7 +549,27 @@ def test_anthropic_caps_max_tokens_at_the_non_streaming_limit(caplog):
         (anthropic_error(500, "api_error"), LLMUnavailableError, "server error"),
         (anthropic_error(400, "invalid_request_error", "prompt is too long: 300000 tokens"), LLMError, "too long"),
         (anthropic_error(400, "invalid_request_error", "effort: not supported"), LLMSetupError, "LLM_REASONING"),
-        (anthropic_error(400, "invalid_request_error", "messages: bad"), LLMError, "messages: bad"),
+        (anthropic_error(400, "invalid_request_error", "messages: bad"), LLMRequestError, "messages: bad"),
+        # Regression: account-level 400s were per-input errors, so every pending article failed for good.
+        (
+            anthropic_error(400, "invalid_request_error", "You have reached your specified API usage limits."),
+            LLMSetupError,
+            "usage-limit",
+        ),
+        (
+            anthropic_error(400, "invalid_request_error", "Your credit balance is too low to access the API."),
+            LLMSetupError,
+            "billing",
+        ),
+        # Regression: a per-input context overflow mentions max_tokens but isn't a settings problem.
+        (
+            anthropic_error(
+                400, "invalid_request_error", "input length and `max_tokens` exceed context limit: 190000 + 16000"
+            ),
+            LLMError,
+            "too long for the model's context window",
+        ),
+        (message(text(""), stop_reason="model_context_window_exceeded"), LLMError, "context window"),
         (anthropic_error(413, "request_too_large"), LLMError, "too large"),
         (httpx2.ConnectError("refused"), LLMUnavailableError, "Couldn't connect"),
         (httpx2.ReadTimeout("slow"), LLMUnavailableError, "timed out"),
@@ -499,6 +578,33 @@ def test_anthropic_caps_max_tokens_at_the_non_streaming_limit(caplog):
 def test_anthropic_failures_map_to_input_service_or_setup_errors(response, error, match):
     with pytest.raises(error, match=match):
         anthropic_model(Recorder(response)).complete("s", "p")
+
+
+def test_anthropic_context_overflow_is_not_a_setup_error():
+    response = anthropic_error(400, "invalid_request_error", "input length and `max_tokens` exceed context limit")
+    with pytest.raises(LLMError) as caught:
+        anthropic_model(Recorder(response)).complete("s", "p")
+    assert not isinstance(caught.value, LLMSetupError)
+
+
+@pytest.mark.filterwarnings("ignore:The model 'claude-opus-4-0' is deprecated:DeprecationWarning")
+def test_anthropic_respects_the_sdks_non_streaming_limit_of_older_models(caplog):
+    """Regression: claude-opus-4-0 with the default 16,000 tokens raised the SDK's plain ValueError."""
+    recorder = Recorder(message())
+    anthropic_model(recorder, model="claude-opus-4-0").complete("s", "p")
+    assert recorder.body["max_tokens"] == 8192
+    assert "without streaming" in caplog.text
+
+
+def test_anthropic_streaming_refusals_are_setup_errors():
+    class Messages:
+        def create(self, **kwargs):
+            raise ValueError("Streaming is required for operations that may take longer than 10 minutes.")
+
+    client = type("Client", (), {"messages": Messages()})()
+    model = AnthropicChatModel(anthropic_settings(), "claude-future", client=client)
+    with pytest.raises(LLMSetupError, match="needs streaming"):
+        model.complete("s", "p")
 
 
 def test_anthropic_keeps_a_truncated_reply_with_a_warning(caplog):

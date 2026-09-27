@@ -11,7 +11,7 @@ import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -24,12 +24,15 @@ log = logging.getLogger(__name__)
 
 # A headline seen from any source within this window counts as the same story.
 TITLE_DEDUP_WINDOW = timedelta(hours=72)
+# Only headlines of at least this many words are matched by title: short ones ("Profit warning", "Trading update",
+# "Transaction in own shares") are formulaic, and different companies publish them.
+MIN_DEDUP_TITLE_WORDS = 5
 # A ticker without prices is re-checked after this long (it may have been listed or renamed since).
 INVALID_TICKER_TTL = timedelta(days=7)
 ARTICLE_STATUSES = ("pending", "done", "failed", "skipped")
 _MAX_PARAMS = 500  # stay well under SQLite's bound-parameter limit in IN (...) lists
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # 2: opportunities.alerted
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -78,7 +81,8 @@ CREATE TABLE IF NOT EXISTS opportunities (
     created TEXT NOT NULL,
     score REAL NOT NULL,
     data TEXT NOT NULL,
-    notified TEXT
+    notified TEXT,  -- handled: sent, or deliberately not sent (a repeat, superseded, --no-notify, read in `analyze`)
+    alerted TEXT    -- actually delivered to the user (an alert, a thesis change, or shown by `analyze`)
 );
 CREATE INDEX IF NOT EXISTS opportunities_ticker_created ON opportunities (ticker, created);
 CREATE INDEX IF NOT EXISTS opportunities_created ON opportunities (created);
@@ -130,6 +134,10 @@ class Store:
             conn.execute("PRAGMA synchronous=NORMAL")
             with conn:
                 conn.executescript(_SCHEMA)
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)")}
+                if "alerted" not in columns:  # a version 1 database: what was notified then was sent
+                    conn.execute("ALTER TABLE opportunities ADD COLUMN alerted TEXT")
+                    conn.execute("UPDATE opportunities SET alerted = notified")
                 if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.DatabaseError as exc:
@@ -211,40 +219,64 @@ class Store:
 
     # --- articles ---
 
-    def add_articles(self, articles: list[Article], *, max_age_hours: float, now: datetime) -> list[Article]:
+    def add_articles(
+        self,
+        articles: list[Article],
+        *,
+        max_age_hours: float,
+        now: datetime,
+        same_source_titles: Collection[str] = (),
+    ) -> list[Article]:
         """Insert unseen articles; return the new ones young enough to triage (older ones are stored as skipped).
 
-        An article is not new when its id is already stored, or when an article from another source with the same
-        title_key was published or fetched in the last 72 hours (the same story elsewhere); those aren't stored.
-        Within one source the id (the canonical link) decides: feeds with formulaic titles, like the SEC's
-        "8-K - APPLE INC (0000320193) (Filer)", repeat a title for every new filing of a company.
+        An article is not new when its id is already stored, or when an article with the same title_key (at least
+        MIN_DEDUP_TITLE_WORDS words) was published or fetched in the last 72 hours from any source, this one
+        included (the same story again, e.g. Google News listing one headline from several outlets); those aren't
+        stored. Stored copies too old to triage (status 'skipped') don't count. Sources in same_source_titles are
+        feeds with formulaic titles, like the SEC's "8-K - APPLE INC (0000320193) (Filer)" for every new filing of a
+        company: within such a source only the id (the canonical link) decides.
         New articles published more than max_age_hours ago are stored with status 'skipped' and not returned.
+        An article another process stores at the same moment is skipped, not an error.
         """
         now = utc(now)
         too_old = now - timedelta(hours=max_age_hours)
         window = _ts(now - TITLE_DEDUP_WINDOW)
+        exempt = set(same_source_titles)
         fresh: list[Article] = []
         with self._write() as conn:
             for article in articles:
                 if conn.execute("SELECT 1 FROM articles WHERE id = ?", (article.id,)).fetchone():
                     continue
-                if (
-                    article.title_key
-                    and conn.execute(
-                        "SELECT 1 FROM articles WHERE title_key = ? AND source != ? "
-                        "AND (published >= ? OR fetched >= ?) LIMIT 1",
-                        (article.title_key, article.source, window, window),
-                    ).fetchone()
-                ):
-                    continue
+                if article.title_key and len(article.title_key.split()) >= MIN_DEDUP_TITLE_WORDS:
+                    sql = (
+                        "SELECT 1 FROM articles WHERE title_key = ? AND status != 'skipped' "
+                        "AND (published >= ? OR fetched >= ?)"
+                    )
+                    params: tuple = (article.title_key, window, window)
+                    if article.source in exempt:
+                        sql, params = sql + " AND source != ?", (*params, article.source)
+                    if conn.execute(sql + " LIMIT 1", params).fetchone():
+                        continue
                 status = "pending" if utc(article.published) >= too_old else "skipped"
-                conn.execute(
-                    f"INSERT INTO articles ({_ARTICLE_COLUMNS}, status) VALUES ({_placeholders(10)})",
+                inserted = conn.execute(
+                    f"INSERT OR IGNORE INTO articles ({_ARTICLE_COLUMNS}, status) VALUES ({_placeholders(10)})",
                     (*_article_values(article), status),
                 )
-                if status == "pending":
+                if inserted.rowcount == 1 and status == "pending":
                     fresh.append(article)
         return fresh
+
+    def skip_stale_pending(self, before: datetime) -> int:
+        """Mark pending articles published before `before` as 'skipped' (too old to triage); returns how many.
+
+        Articles stay pending while the model is unavailable; after a long outage the backlog would otherwise be
+        triaged oldest first, long after it matters.
+        """
+        with self._write() as conn:
+            return conn.execute(
+                "UPDATE articles SET status = 'skipped' WHERE status = 'pending' AND published < ?",
+                (_ts(before),),
+            ).rowcount
 
     def pending_triage(self, limit: int, *, max_attempts: int) -> list[Article]:
         """Articles waiting for triage (status 'pending', fewer than max_attempts tries), oldest first."""
@@ -425,14 +457,26 @@ class Store:
             params.append(max(0, limit))
         return [_opportunity(row) for row in self._query(sql, params)]
 
-    def mark_notified(self, ids: list[int], *, when: datetime) -> None:
-        """Record that these opportunities were sent as notifications."""
+    def mark_notified(self, ids: list[int], *, when: datetime, sent: bool = True) -> None:
+        """Record that these opportunities were handled: sent to the user (sent=True), or deliberately not sent
+        (a repeat, superseded by a newer analysis, a --no-notify run). Either way they aren't retried."""
         with self._write() as conn:
             for chunk in _chunks(list(dict.fromkeys(ids))):
                 conn.execute(
-                    f"UPDATE opportunities SET notified = ? WHERE id IN ({_placeholders(len(chunk))})",
-                    (_ts(when), *chunk),
+                    f"UPDATE opportunities SET notified = ?, alerted = COALESCE(?, alerted) "
+                    f"WHERE id IN ({_placeholders(len(chunk))})",
+                    (_ts(when), _ts(when) if sent else None, *chunk),
                 )
+
+    def last_alerted(self, ticker: str, *, before: datetime | None = None) -> Opportunity | None:
+        """The newest opportunity of a ticker that was sent to the user (optionally only one created before)."""
+        sql = "SELECT id, data FROM opportunities WHERE ticker = ? AND alerted IS NOT NULL"
+        params: list = [ticker.strip().upper()]
+        if before is not None:
+            sql += " AND created < ?"
+            params.append(_ts(before))
+        rows = self._query(sql + " ORDER BY created DESC, id DESC LIMIT 1", params)
+        return _opportunity(rows[0]) if rows else None
 
     def unnotified(self, *, since: datetime | None = None) -> list[Opportunity]:
         """Opportunities that were never sent as notifications (optionally only those created since), newest first."""

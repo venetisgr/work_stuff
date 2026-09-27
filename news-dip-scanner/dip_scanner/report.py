@@ -28,7 +28,9 @@ log = logging.getLogger(__name__)
 DEFAULT_TITLE = "Dip opportunities"
 DISCLAIMER = (
     "Not investment advice. A language model wrote this from news headlines and price data, and it can be wrong or "
-    "out of date. Do your own checks before you buy or sell anything; the tool never places orders."
+    "out of date. Its chances and scores are uncalibrated estimates until `dip-scanner track` shows otherwise, and "
+    "the potential low is not a floor or a stop. Do your own checks before you buy or sell anything; the tool never "
+    "places orders."
 )
 VERDICT_LABELS = {
     "temporary_fear": "Temporary fear",
@@ -54,7 +56,10 @@ _DIRECTION_SECTIONS = (
     ("neutral", "Neutral mentions"),
 )
 _DIRECTION_RANK = {direction: rank for rank, (direction, _) in enumerate(_DIRECTION_SECTIONS)}
-_MD_SPECIAL = re.compile(r"([\[\]|])")
+# Backslash-escaped in Markdown text: link brackets, table pipes, emphasis and code markers, and < > so raw HTML
+# (from a feed or a prompt-injected model reply) shows as text in any viewer that renders HTML. The backslash itself
+# too, so "\<" can't undo the escape. notify.py undoes exactly these for the chat services.
+_MD_SPECIAL = re.compile(r"([\\`*_\[\]|<>])")
 
 # HTML palette (light, email-safe).
 _FONT = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif"
@@ -143,7 +148,7 @@ def safe_url(url: object) -> str | None:
 
 
 def md_escape(text: object) -> str:
-    """Text for a Markdown line or table cell: whitespace collapsed, [ ] and | escaped."""
+    """Text for a Markdown line or table cell: whitespace collapsed; \\ ` * _ [ ] | < > backslash-escaped."""
     return _MD_SPECIAL.sub(r"\\\1", " ".join(str(text).split()))
 
 
@@ -165,9 +170,11 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
     An overview table comes first, then one section per opportunity: the key figures (price and recent moves, the
     6-month probability, potential low, statistical low, the limit-buy entry and limit-sell target, upside and
     downside, verdict and confidence), the fear / fundamental impact / thesis, risks, catalysts, what to check
-    before buying, the headlines that flagged it and any numbers the sanitizer had to fix.
+    before buying, the headlines that flagged it and any numbers the sanitizer had to fix. An opportunity with a newer
+    analysis of the same ticker in the list is marked superseded, with what the newer one says.
     """
     ranked = _ranked(opps)
+    newer = superseded_by(ranked)
     lines = [f"# {md_escape(title)}", "", f"_{_count_text(len(ranked))} · generated {format_when(generated)}_"]
     if ranked:
         lines += [
@@ -186,11 +193,11 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
                 format_price(opp.price, opp.currency),
                 format_price(analysis.entry_price, opp.currency),
                 f"{format_price(analysis.target_price, opp.currency)} ({format_pct(opp.upside_pct())})",
-                verdict_label(analysis.verdict),
+                verdict_label(analysis.verdict) + (" (superseded)" if number - 1 in newer else ""),
             ]
             lines.append("| " + " | ".join(cells) + " |")
-        for opp in ranked:
-            lines += ["", *_opportunity_markdown(opp)]
+        for index, opp in enumerate(ranked):
+            lines += ["", *_opportunity_markdown(opp, newer.get(index))]
     else:
         lines += ["", "No opportunities this time."]
     if notes:
@@ -199,7 +206,7 @@ def render_markdown(opps: list[Opportunity], *, title: str, generated: datetime,
     return "\n".join(lines) + "\n"
 
 
-def _opportunity_markdown(opp: Opportunity) -> list[str]:
+def _opportunity_markdown(opp: Opportunity, newer: Opportunity | None = None) -> list[str]:
     analysis = opp.analysis
     tagline = [verdict_label(analysis.verdict), f"{analysis.confidence} confidence", *opp.dip_reasons]
     lines = [
@@ -207,6 +214,10 @@ def _opportunity_markdown(opp: Opportunity) -> list[str]:
         "",
         "_" + " · ".join(md_escape(part) for part in tagline) + "_",
         "",
+    ]
+    if newer is not None:
+        lines += [f"**{md_escape(superseded_text(newer))}**", ""]
+    lines += [
         "| Key figures | |",
         "|---|---|",
         *(f"| {label} | {md_escape(value)} |" for label, value in key_figures(opp)),
@@ -235,6 +246,7 @@ def key_figures(opp: Opportunity) -> list[tuple[str, str]]:
 
     moves = f"{format_pct(stats.change_1d_pct)} 1 day, {format_pct(stats.change_5d_pct)} 5 days"
     return [
+        ("Reported", format_when(opp.created)),
         ("Price", f"{format_price(price, currency)} ({moves})"),
         ("From 52-week high", format_pct(stats.drawdown_52w_pct)),
         ("Chance of being higher in 6 months", f"{analysis.probability_up_6m}%"),
@@ -294,10 +306,11 @@ def render_html(opps: list[Opportunity], *, title: str, generated: datetime, not
     only for http(s) URLs. Scores get a coloured badge: 80+ strong, 65-80 good, 50-65 fair, below 50 weak.
     """
     ranked = _ranked(opps)
+    newer = superseded_by(ranked)
     rows = [_html_header(title, generated, len(ranked))]
     if ranked:
-        rows.append(_html_overview(ranked))
-        rows += [_html_card(opp) for opp in ranked]
+        rows.append(_html_overview(ranked, newer))
+        rows += [_html_card(opp, newer.get(index)) for index, opp in enumerate(ranked)]
     else:
         rows.append(_row(f'<p style="margin:0;padding:16px 0;">{_e("No opportunities this time.")}</p>'))
     if notes:
@@ -370,7 +383,7 @@ def _html_header(title: str, generated: datetime, count: int) -> str:
     )
 
 
-def _html_overview(ranked: list[Opportunity]) -> str:
+def _html_overview(ranked: list[Opportunity], newer: dict[int, Opportunity]) -> str:
     cell = f"padding:6px 8px;border-bottom:1px solid {_LINE};"
     head = f"{cell}font-size:12px;color:{_MUTED};font-weight:600;"
     headers = [
@@ -387,7 +400,7 @@ def _html_overview(ranked: list[Opportunity]) -> str:
         f'style="background:{_CARD};border:1px solid {_LINE};border-radius:8px;margin:0 0 16px 0;font-size:14px;">',
         "<tr>" + "".join(f'<th align="{align}" style="{head}">{name}</th>' for name, align in headers) + "</tr>",
     ]
-    for opp in ranked:
+    for index, opp in enumerate(ranked):
         analysis = opp.analysis
         company = f'<span style="font-size:12px;color:{_MUTED};">{_e(opp.company)}</span>'
         name = f"<strong>{_e(opp.ticker)}</strong><br>{company}"
@@ -398,7 +411,7 @@ def _html_overview(ranked: list[Opportunity]) -> str:
             (_e(format_price(opp.price, opp.currency)), "right"),
             (_e(format_price(analysis.entry_price, opp.currency)), "right"),
             (_e(format_price(analysis.target_price, opp.currency)), "right"),
-            (_e(verdict_label(analysis.verdict)), "left"),
+            (_e(verdict_label(analysis.verdict) + (" (superseded)" if index in newer else "")), "left"),
         ]
         lines.append(
             "<tr>"
@@ -409,7 +422,7 @@ def _html_overview(ranked: list[Opportunity]) -> str:
     return _row("".join(lines))
 
 
-def _html_card(opp: Opportunity) -> str:
+def _html_card(opp: Opportunity, newer: Opportunity | None = None) -> str:
     analysis = opp.analysis
     colour, band = score_band(opp.score)
     tagline = " · ".join([verdict_label(analysis.verdict), f"{analysis.confidence} confidence", *opp.dip_reasons])
@@ -436,7 +449,13 @@ def _html_card(opp: Opportunity) -> str:
         f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
         f'style="margin:12px 0 4px 0;">{figure_rows}</table>'
     )
-    body = [header, figures]
+    body = [header]
+    if newer is not None:
+        body.append(
+            f'<p style="margin:12px 0 0 0;padding:8px 12px;background:{_WARN_BG};border:1px solid {_WARN_LINE};'
+            f'border-radius:6px;font-size:13px;"><strong>{_e(superseded_text(newer))}</strong></p>'
+        )
+    body.append(figures)
     for label, text in _paragraphs(opp):
         body.append(f'<p style="margin:12px 0 0 0;"><strong>{_e(label)}:</strong> {_e(text)}</p>')
     for label, items in _lists(opp):
@@ -617,6 +636,28 @@ def _write_text(path: Path, text: str) -> None:
 
 def _ranked(opps: Sequence[Opportunity]) -> list[Opportunity]:
     return sorted(opps, key=lambda opp: opp.score, reverse=True)
+
+
+def superseded_by(opps: Sequence[Opportunity]) -> dict[int, Opportunity]:
+    """{position in opps: the newest analysis of the same ticker in opps} for every opportunity that has a newer one."""
+    newest: dict[str, Opportunity] = {}
+    for opp in opps:
+        current = newest.get(opp.ticker)
+        if current is None or utc(opp.created) > utc(current.created):
+            newest[opp.ticker] = opp
+    return {
+        index: newest[opp.ticker]
+        for index, opp in enumerate(opps)
+        if utc(newest[opp.ticker].created) > utc(opp.created)
+    }
+
+
+def superseded_text(newer: Opportunity) -> str:
+    """ "Superseded: analysed again on 2026-09-27 16:30 UTC: Fundamental damage, 25% chance up in 6m, score 8.8." """
+    return (
+        f"Superseded: analysed again on {format_when(newer.created)}: {verdict_label(newer.analysis.verdict)}, "
+        f"{newer.analysis.probability_up_6m}% chance up in 6m, score {newer.score:.1f}."
+    )
 
 
 def _plural(count: int, singular: str, plural: str | None = None) -> str:

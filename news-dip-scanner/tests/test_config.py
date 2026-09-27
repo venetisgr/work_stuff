@@ -239,6 +239,21 @@ verdicts = ["temporary_fear"]
     assert config.alerts == AlertConfig(70.5, 65, ("temporary_fear",))
 
 
+def test_watchlist_and_exclude_are_written_like_triage_tickers(tmp_path):
+    """Regression: exclude = ["NASDAQ:TSLA"] or ["BRK.B"] never matched the triage's TSLA / BRK-B."""
+    text = '[universe]\nwatchlist = ["$amd", "BRK.B"]\nexclude = ["NASDAQ:TSLA", "700.HK", "SPY"]\n'
+    universe = load_scanner_config(_write(tmp_path, text)).universe
+    assert universe.watchlist == ("AMD", "BRK-B")
+    assert universe.exclude == ("TSLA", "0700.HK", "SPY")  # an ETF isn't a triage ticker, but stays excluded
+
+
+def test_the_repeat_alert_settings_are_read_and_checked(tmp_path):
+    alerts = load_scanner_config(_write(tmp_path, "[alerts]\nrepeat_hours = 6\nmin_score_change = 5\n")).alerts
+    assert (alerts.repeat_hours, alerts.min_score_change) == (6.0, 5.0)
+    with pytest.raises(ConfigError, match="alerts.repeat_hours can't be negative"):
+        load_scanner_config(_write(tmp_path, "[alerts]\nrepeat_hours = -1\n"))
+
+
 def test_a_partial_scanner_file_keeps_the_other_defaults(tmp_path):
     config = load_scanner_config(_write(tmp_path, "[dip]\nmin_drop_1d_pct = 5\n"))
     assert config.dip.min_drop_1d_pct == 5.0
@@ -352,6 +367,9 @@ name = "  "
         ('[feeds.reuters]\nurl = "https://x"\nlink = "y"\n', "Unknown setting 'link' for feed \"reuters\""),
         ('[feeds.reuters]\nurl = "https://x"\nenabled = "no"\n', 'enabled for feed "reuters" .* must be true or false'),
         ('[feeds.reuters]\nurl = "https://x"\nname = 3\n', 'name for feed "reuters" .* must be a string'),
+        ('[feeds.sec]\nurl = "https://x"\ndedup_titles = 0\n', 'dedup_titles for feed "sec" .* must be true or false'),
+        ('[feeds.pr]\nurl = "https://x"\nlanguages = "en"\n', 'languages for feed "pr" .* must be a list'),
+        ('[feeds.pr]\nurl = "https://x"\nlanguages = [""]\n', 'languages for feed "pr" .* must be a list'),
         ('[feeds."ticker:AMD"]\nurl = "https://x"\n', "can't be empty or contain"),
         ("[feeds\n", "is not valid TOML"),
     ],
@@ -359,6 +377,18 @@ name = "  "
 def test_wrong_feed_lists_are_reported(tmp_path, text, message):
     with pytest.raises(ConfigError, match=message):
         load_feeds(_write(tmp_path, text, "feeds.toml"))
+
+
+def test_feed_title_dedup_and_languages_can_be_set(tmp_path):
+    text = (
+        '[feeds.sec]\nurl = "https://sec.example.com"\ndedup_titles = false\n\n'
+        '[feeds.athens]\nurl = "https://gr.example.com"\nlanguages = ["EL", "en_US", "el"]\n\n'
+        '[feeds.any]\nurl = "https://any.example.com"\nlanguages = []\n'
+    )
+    sec, athens, anything = load_feeds(_write(tmp_path, text, "feeds.toml"))
+    assert (sec.dedup_titles, sec.languages) == (False, ("en",))
+    assert (athens.dedup_titles, athens.languages) == (True, ("el", "en-us"))
+    assert anything.languages == ()
 
 
 def test_a_missing_feed_list_is_reported(tmp_path):
@@ -371,6 +401,8 @@ def test_the_shipped_feed_list_loads():
     feeds = load_feeds(PROJECT_ROOT / "feeds.toml")
     assert len(feeds) >= 10
     assert len({feed.key for feed in feeds}) == len(feeds)
+    # Only the SEC feed repeats formulaic titles for different items.
+    assert [feed.key for feed in feeds if not feed.dedup_titles] == ["sec-8k-filings"]
 
 
 def test_the_shipped_scanner_config_spells_out_the_defaults():

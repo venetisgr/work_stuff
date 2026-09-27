@@ -73,7 +73,11 @@ def test_price_stats_text_has_the_key_numbers():
     assert "50-day average 155.20, 200-day average 140.10" in text
     assert "Volatility 48.0% a year" in text and "2.3x the 20-day average" in text
     low = 142.5 * math.exp(-1.645 * 0.48 * math.sqrt(0.5))
-    assert f"6-month low (5th percentile): {low:,.2f} ({(low / 142.5 - 1) * 100:+.1f}% from the price)" in text
+    # It is a percentile of the 6-month end price, not of the lowest price along the way; the text says so.
+    assert (
+        f"6-month low (5th percentile of the price in 6 months): {low:,.2f} ({(low / 142.5 - 1) * 100:+.1f}% from "
+        "the price; the lowest price along the way falls below it about twice as often)"
+    ) in text
     assert "Worst 6-month drawdown in the price history: -38.5%" in text
 
 

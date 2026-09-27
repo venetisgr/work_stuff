@@ -103,6 +103,10 @@ def test_safe_url(url, expected):
 
 def test_markdown_escaping_and_links():
     assert md_escape("Foo | Bar [Class A]\n  next") == "Foo \\| Bar \\[Class A\\] next"
+    # Regression: raw HTML, emphasis and code spans from a feed or a model reply went through as live markup.
+    assert md_escape("<img src=x onerror=a()> *b* `c` _d_ \\<") == (
+        "\\<img src=x onerror=a()\\> \\*b\\* \\`c\\` \\_d\\_ \\\\\\<"
+    )
     assert md_link("A [b]", "https://e.com/x y") == "A \\[b\\]"  # whitespace in the URL: not a link
     assert md_link("A", "https://e.com/x>y") == "[A](<https://e.com/x%3Ey>)"
     assert md_link("A", "javascript:alert(1)") == "A"
@@ -162,7 +166,7 @@ def test_render_markdown_ranks_by_score_and_shows_warnings_and_notes():
     assert text.index("## HIGH") < text.index("## LOW")
     assert text.index("| 1 | **HIGH**") < text.index("| 2 | **LOW**")
     assert "| 1 | **HIGH** | Advanced Micro Devices | 88.0 | 68% | €142.50 | €132.00 | €168.00 (+17.9%) |" in text
-    assert "**Numbers fixed after the analysis**\n\n- entry_price 150.00 was above the price; used 142.50." in text
+    assert "**Numbers fixed after the analysis**\n\n- entry\\_price 150.00 was above the price; used 142.50." in text
     assert "## Notes\n\n- NVDA: cooldown\n- 2 more \\[capped\\]" in text
 
 
@@ -172,6 +176,23 @@ def test_render_markdown_without_opportunities():
     assert "No opportunities this time." in text
     assert "- 3 feeds failed" in text
     assert DISCLAIMER in text
+
+
+def test_render_markdown_and_the_digest_leave_no_live_html():
+    opp = make_opportunity(
+        company="Co <b onmouseover=alert(4)>x</b>",
+        analysis=make_analysis(thesis="Thesis with <script>alert(1)</script> inside", risks=["risk *bold* `code`"]),
+    )
+    text = render_markdown([opp], title="Report", generated=NOW)
+    assert "<script" not in text.replace("\\<script", "") and "\\<script\\>alert(1)\\</script\\>" in text
+    assert "- risk \\*bold\\* \\`code\\`" in text
+    article = make_article(title="Headline")
+    digest = render_news_digest(
+        [(article, [make_impact(article_id=article.id, company="Co <b>x</b>", rationale="R <img src=x onerror=a()>")])],
+        hours=24,
+        generated=NOW,
+    )
+    assert "<b>" not in digest.replace("\\<b\\>", "") and "<img" not in digest.replace("\\<img", "")
 
 
 def test_render_markdown_escapes_model_and_feed_text():

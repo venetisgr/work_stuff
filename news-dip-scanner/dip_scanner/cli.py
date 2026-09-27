@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import sqlite3
 import sys
@@ -31,16 +32,16 @@ from .config import (
     load_settings,
 )
 from .detect import dip_reasons
-from .feeds import USER_AGENT, FeedResult, fetch_feed, user_agent_for
+from .feeds import USER_AGENT, FeedResult, fetch_feed, needs_contact_user_agent, user_agent_for
 from .fundamentals import SecFundamentals
 from .llm import LLMError, LLMSetupError, build_models
 from .models import Feed, Opportunity, utc
 from .notify import build_notifiers
-from .pipeline import Scanner
+from .pipeline import Scanner, thesis_change_line
 from .prices import PriceError, PriceFetchError, YahooPrices
 from .report import render_html, render_markdown, render_news_digest
 from .store import Store
-from .track import Outcome, evaluate, render_track_record, signal_day, summarize
+from .track import Outcome, evaluate, quote_day, render_track_record, summarize
 from .triage import normalise_ticker
 
 log = logging.getLogger("dip_scanner")
@@ -67,7 +68,9 @@ def main(argv: list[str] | None = None) -> int:
         settings = load_settings()
         if args.data_dir is not None:
             settings = replace(settings, data_dir=_folder(args.data_dir))
-        return args.handler(args, settings)
+        code = args.handler(args, settings)
+        sys.stdout.flush()  # here, so a reader that went away is handled below and not at interpreter exit
+        return code
     except ConfigError as exc:
         print(f"Configuration problem: {exc}", file=sys.stderr)
         return EXIT_CONFIG
@@ -106,7 +109,10 @@ def _parser() -> argparse.ArgumentParser:
 
     watch = command("watch", _watch, "Run scan cycles on an interval until Ctrl+C.")
     watch.add_argument(
-        "--interval", type=_positive_float, metavar="MIN", help="minutes between cycles (default: [scan] in the config)"
+        "--interval",
+        type=_positive_float(1440),
+        metavar="MIN",
+        help="minutes between cycles (default: [scan] in the config)",
     )
     watch.add_argument("--no-notify", action="store_true", help="don't send notifications")
 
@@ -114,7 +120,7 @@ def _parser() -> argparse.ArgumentParser:
     feeds.add_argument("--check", action="store_true", help="fetch every feed once now and show what came back")
 
     news = command("news", _news, "Print the news digest (Markdown) from the database.")
-    news.add_argument("--hours", type=_positive_float, default=24, help="how far back to go (default: 24)")
+    news.add_argument("--hours", type=_positive_float(24 * 36500), default=24, help="how far back to go (default: 24)")
     news.add_argument("--ticker", help="only news about this ticker")
 
     analyze = command("analyze", _analyze, "Analyse one ticker now, ignoring the dip thresholds and the cooldown.")
@@ -122,12 +128,14 @@ def _parser() -> argparse.ArgumentParser:
     analyze.add_argument("--no-save", action="store_true", help="don't store the result as an opportunity")
 
     report = command("report", _report, "Print the stored opportunities of the last days (Markdown).")
-    report.add_argument("--days", type=_positive_float, default=7, help="how far back to go (default: 7)")
+    report.add_argument("--days", type=_positive_float(36500), default=7, help="how far back to go (default: 7)")
     report.add_argument("--min-score", type=float, metavar="N", help="only opportunities scoring at least N")
     report.add_argument("--html", type=Path, metavar="PATH", help="also write the report as an HTML file")
 
     track = command("track", _track, "Show how past opportunities played out (fetches prices).")
-    track.add_argument("--days", type=_positive_float, default=365, help="opportunities from the last N days (365)")
+    track.add_argument(
+        "--days", type=_positive_float(36500), default=365, help="opportunities from the last N days (365)"
+    )
 
     prices = command("prices", _prices, "Print a ticker's price statistics (no language model needed).")
     prices.add_argument("ticker", help="Yahoo Finance symbol, e.g. AMD, SAP.DE")
@@ -165,14 +173,20 @@ def _global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
     )
 
 
-def _positive_float(value: str) -> float:
-    try:
-        number = float(value)
-    except ValueError:
-        number = 0.0
-    if not number > 0:
-        raise argparse.ArgumentTypeError(f"expected a number greater than zero, got {value!r}")
-    return number
+def _positive_float(maximum: float) -> Callable[[str], float]:
+    """An argparse type: a finite number above zero, at most maximum (a huge --days means "everything", and is
+    capped so the date arithmetic can't overflow)."""
+
+    def parse(value: str) -> float:
+        try:
+            number = float(value)
+        except ValueError:
+            number = 0.0
+        if not number > 0 or not math.isfinite(number):
+            raise argparse.ArgumentTypeError(f"expected a number greater than zero, got {value!r}")
+        return min(number, maximum)
+
+    return parse
 
 
 # --- setup ---------------------------------------------------------------------------------------------------------
@@ -231,11 +245,20 @@ def open_store(settings: Settings) -> Store:
 
 
 def _scanner_config(args: argparse.Namespace) -> ScannerConfig:
-    return load_scanner_config(args.config or default_file("scanner.toml", "SCANNER_CONFIG"))
+    """The scanner config: a file named with --config or SCANNER_CONFIG must exist (a typo must not silently mean
+    the defaults); without either, ./scanner.toml or the project's copy, and the defaults when there is none."""
+    named = args.config if args.config is not None else ((os.environ.get("SCANNER_CONFIG") or "").strip() or None)
+    if named is not None:
+        path = Path(named).expanduser()
+        if not path.is_file():
+            source = "--config" if args.config is not None else "SCANNER_CONFIG"
+            raise ConfigError(f"Scanner config not found: {path} (from {source}).")
+        return load_scanner_config(path)
+    return load_scanner_config(default_file("scanner.toml", "SCANNER_CONFIG"))
 
 
 def _feed_list(args: argparse.Namespace) -> list[Feed]:
-    return load_feeds(args.feeds or default_file("feeds.toml", "FEEDS_FILE"))
+    return load_feeds(args.feeds.expanduser() if args.feeds is not None else default_file("feeds.toml", "FEEDS_FILE"))
 
 
 @contextmanager
@@ -284,6 +307,8 @@ def _run(args: argparse.Namespace, settings: Settings) -> int:
     for opp in sorted(result.opportunities, key=lambda opp: opp.score, reverse=True):
         alert = " (alert)" if opp in result.alerts else ""
         print(f"  {opp.ticker} ({opp.company}): score {opp.score:.1f}, {opp.analysis.verdict}{alert}")
+    for previous, opp in result.thesis_changes:
+        print(f"Thesis change: {thesis_change_line(previous, opp)}")
     if result.notes:
         print("Notes:")
         for note in result.notes:
@@ -341,20 +366,29 @@ def _check_feeds(feeds: list[Feed], settings: Settings) -> int:
             )
     finally:
         feeds_logger.setLevel(level)
+    # A feed that needs a contact User-Agent nobody set is skipped by the scanner too (with a warning): not a failure.
+    skipped = {
+        feed.key for feed in feeds if needs_contact_user_agent(feed.url) and not user_agent_for(feed.url, agents)
+    }
     for result in results:
-        print(_check_line(result, now))
-    enabled = [result for result in results if result.feed.enabled]
+        print(_check_line(result, now, skipped=result.feed.key in skipped))
+    enabled = [result for result in results if result.feed.enabled and result.feed.key not in skipped]
     failed = [result.feed.key for result in enabled if result.error is not None]
     print(f"{len(enabled) - len(failed)} of {len(enabled)} enabled feeds answered.")
+    left_out = [result.feed.key for result in results if result.feed.enabled and result.feed.key in skipped]
+    if left_out:
+        print(f"Skipped until SEC_USER_AGENT is set: {', '.join(left_out)}")
     if failed:
         print(f"Failed: {', '.join(failed)}", file=sys.stderr)
     return EXIT_ERROR if failed else EXIT_OK
 
 
-def _check_line(result: FeedResult, now: datetime) -> str:
+def _check_line(result: FeedResult, now: datetime, *, skipped: bool = False) -> str:
     state = "on " if result.feed.enabled else "off"
     status = str(result.status) if result.status is not None else "---"
-    if result.error is not None:
+    if skipped:
+        detail = f"skipped: {result.error}"
+    elif result.error is not None:
         detail = f"FAILED: {result.error}"
     else:
         newest = max((utc(article.published) for article in result.articles), default=None)
@@ -422,16 +456,21 @@ def _track(args: argparse.Namespace, settings: Settings) -> int:
         by_ticker.setdefault(opp.ticker, []).append(opp)
     outcomes: list[Outcome] = []
     problems: list[str] = []
+    missing: list[tuple[str, int]] = []
     with make_session() as session:
         prices = YahooPrices(session)
-        for ticker, group in by_ticker.items():  # one download per ticker, from its oldest signal day
+        for ticker, group in by_ticker.items():  # one download per ticker, from its oldest quote day
             try:
-                bars = prices.bars_since(ticker, min(signal_day(opp) for opp in group), now=now)
-            except (PriceError, PriceFetchError) as exc:
+                bars, splits = prices.history_since(ticker, min(quote_day(opp) for opp in group), now=now)
+            except PriceError as exc:  # delisted, renamed...: named in the track record, not silently dropped
+                problems.append(f"{ticker} ({len(group)} opportunities): {exc}")
+                missing.append((ticker, len(group)))
+                continue
+            except PriceFetchError as exc:
                 problems.append(f"{ticker} ({len(group)} opportunities): {exc}")
                 continue
-            outcomes.extend(evaluate(opp, bars, now=now) for opp in group)
-    print(render_track_record(outcomes, summarize(outcomes)), end="")
+            outcomes.extend(evaluate(opp, bars, now=now, splits=splits) for opp in group)
+    print(render_track_record(outcomes, summarize(outcomes), missing=missing), end="")
     for problem in problems:
         print(f"Left out {problem}", file=sys.stderr)
     return EXIT_ERROR if problems and not outcomes else EXIT_OK
@@ -443,7 +482,7 @@ def _prices(args: argparse.Namespace, settings: Settings) -> int:
     with make_session() as session:
         stats = YahooPrices(session).stats(symbol, now=_now())
     print(stats.as_text())
-    reasons = dip_reasons(stats, config.dip)
+    reasons = dip_reasons(stats, config.dip, now=_now())
     print(f"Dip by the [dip] thresholds: {'; '.join(reasons)}" if reasons else "No dip by the [dip] thresholds.")
     return EXIT_OK
 

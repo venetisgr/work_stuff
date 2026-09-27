@@ -134,6 +134,51 @@ def test_a_bad_scanner_config_is_a_config_error(workdir, models, capsys):
     assert "Unknown setting 'interval_minute' in [scan]" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize("how", ["option", "environment"])
+def test_a_named_scanner_config_that_does_not_exist_is_a_config_error(workdir, web, capsys, monkeypatch, how):
+    """Regression: a mistyped --config or SCANNER_CONFIG silently ran with the defaults (no watchlist, default
+    thresholds and alert rules)."""
+    if how == "option":
+        argv = ["--config", "scaner.toml", "prices", "AMD"]
+    else:
+        monkeypatch.setenv("SCANNER_CONFIG", str(workdir / "nope" / "x.toml"))
+        argv = ["prices", "AMD"]
+    assert cli.main(argv) == 2
+    err = capsys.readouterr().err
+    assert "Configuration problem: Scanner config not found" in err
+    assert ("from --config" if how == "option" else "from SCANNER_CONFIG") in err
+
+
+def test_without_a_named_scanner_config_the_defaults_still_apply(workdir, web, capsys):
+    assert cli.main(["prices", "AMD"]) == 0  # no ./scanner.toml here: the project's copy (the defaults)
+    assert "Dip by the [dip] thresholds" in capsys.readouterr().out
+
+
+def test_a_folder_given_as_the_scanner_config_is_a_config_error(workdir, capsys):
+    (workdir / "configs").mkdir()
+    (workdir / "configs" / "scanner.toml").mkdir()
+    assert cli.main(["--config", "configs/scanner.toml", "prices", "AMD"]) == 2
+    assert "Configuration problem: Scanner config not found" in capsys.readouterr().err
+    assert cli.main(["--feeds", "configs", "feeds"]) == 2  # was "Error: [Errno 21] Is a directory", exit 1
+    assert "Configuration problem: Feed list can't be read" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("argv", [["news", "--hours", "inf"], ["report", "--days", "nan"], ["track", "--days", "-1"]])
+def test_non_finite_or_negative_periods_are_usage_errors(workdir, argv):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(argv)
+    assert exit_info.value.code == 2
+
+
+def test_a_huge_period_means_everything(workdir, capsys):
+    """Regression: `report --days 1000000` ended in an OverflowError traceback."""
+    with store_at(workdir) as store:
+        store.add_opportunity(make_opportunity(created=CYCLE - timedelta(days=3000)))
+    assert cli.main(["report", "--days", "1000000"]) == 0
+    assert "AMD — Advanced Micro Devices" in capsys.readouterr().out
+    assert cli.main(["news", "--hours", "1e12"]) == 0
+
+
 def test_a_closed_pipe_stops_quietly(workdir, monkeypatch, capsys):
     """Regression (live run): `dip-scanner feeds | head` printed "Error: [Errno 32] Broken pipe"."""
 
@@ -145,6 +190,22 @@ def test_a_closed_pipe_stops_quietly(workdir, monkeypatch, capsys):
             pass
 
     monkeypatch.setattr("sys.stdout", ClosedPipe())
+    assert cli.main(["feeds"]) == 1
+    assert capsys.readouterr().err == ""
+
+
+def test_a_pipe_closed_before_the_final_flush_stops_quietly(workdir, monkeypatch, capsys):
+    """Regression: with buffered stdout the output was only flushed at exit, after main() returned: Python printed
+    "Exception ignored ... BrokenPipeError" and exited with 120."""
+
+    class BufferedClosedPipe:
+        def write(self, text):
+            return len(text)  # buffered: nothing goes out yet
+
+        def flush(self):
+            raise BrokenPipeError(32, "Broken pipe")
+
+    monkeypatch.setattr("sys.stdout", BufferedClosedPipe())
     assert cli.main(["feeds"]) == 1
     assert capsys.readouterr().err == ""
 
@@ -194,13 +255,14 @@ def test_feeds_lists_every_feed_with_its_last_fetch(workdir, capsys):
 def test_feeds_check_fetches_each_feed_once(workdir, web, capsys):
     web.routes["https://off.example.com/rss"] = 500
 
-    assert cli.main(["feeds", "--check"]) == 1  # the enabled SEC feed can't be fetched without SEC_USER_AGENT
+    # Without SEC_USER_AGENT the SEC feed is skipped, as the scanner skips it: not a failure (regression: exit 1).
+    assert cli.main(["feeds", "--check"]) == 0
     captured = capsys.readouterr()
     assert "marketwatch" in captured.out and "4 items, newest" in captured.out
-    assert "FAILED: sec.gov only answers requests whose User-Agent names a contact" in captured.out
+    assert "skipped: sec.gov only answers requests whose User-Agent names a contact" in captured.out
     assert "FAILED: HTTP 500" in captured.out  # disabled feeds are checked too, but don't fail the check
-    assert "1 of 2 enabled feeds answered." in captured.out
-    assert "Failed: sec-8k" in captured.err
+    assert "1 of 1 enabled feeds answered." in captured.out
+    assert "Skipped until SEC_USER_AGENT is set: sec-8k" in captured.out and "Failed" not in captured.err
     assert not any("sec.gov" in url for url in web.urls)
     assert not (workdir / "data").exists()  # a check doesn't touch the database
 
@@ -227,7 +289,8 @@ def test_run_does_one_cycle_and_prints_the_summary(workdir, web, models, capsys)
     assert any("companyfacts" in url for url in web.urls)  # SEC fundamentals were used
     with store_at(workdir) as store:
         [opp] = store.opportunities()
-        assert opp.ticker == "AMD" and store.unnotified() == [opp]  # --no-notify
+        # --no-notify: shown here, and not pushed by a later notifying run either.
+        assert opp.ticker == "AMD" and store.unnotified() == []
 
 
 def test_run_without_an_api_key_is_a_config_error(workdir, capsys):
@@ -318,10 +381,13 @@ def test_track_evaluates_every_stored_opportunity(workdir, web, capsys):
     assert cli.main(["track"]) == 0
     captured = capsys.readouterr()
     assert captured.out.startswith("# Track record")
-    assert "AMD" in captured.out and "NOSUCH" not in captured.out
+    assert "**AMD**" in captured.out and "**NOSUCH**" not in captured.out
+    # Named in the record itself, so a delisting can't silently flatter the figures.
+    assert "Left out: 1 opportunity without prices from Yahoo Finance" in captured.out
     assert "Left out NOSUCH (1 opportunities): Yahoo Finance has no prices for NOSUCH" in captured.err
     chart_calls = [call for call in web.calls if "/v8/finance/chart/AMD" in call["url"]]
     assert [call["params"]["range"] for call in chart_calls] == ["1mo"]  # one download covering the signal day
+    assert chart_calls[0]["params"]["events"] == "split"  # with the splits, to compare old prices correctly
 
 
 def test_track_with_nothing_stored(workdir, capsys):

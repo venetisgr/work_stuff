@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from dip_scanner.models import Feed
 from dip_scanner.notify import NotifyError, WebhookNotifier
 from dip_scanner.pipeline import CycleResult, Scanner, alert_subject, seconds_until_next
 from dip_scanner.prices import PriceError, YahooPrices
+from dip_scanner.report import render_markdown
 from dip_scanner.store import Store
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -323,6 +325,106 @@ def test_poll_saves_feed_state_counts_failures_and_sends_conditional_requests(bu
     assert "off" not in health
 
 
+def test_a_failed_store_keeps_the_old_validators_so_the_next_poll_gets_the_articles(build, monkeypatch):
+    """Regression: the new ETag was saved before the articles; when storing them failed, the next poll got a 304
+    and those articles were lost."""
+
+    def marketwatch(method, url, call):
+        if call["headers"].get("If-None-Match") == '"v1"':
+            return 304
+        return FakeResponse(content=fixture("rss_marketwatch.xml"), headers={"ETag": '"v1"'})
+
+    scanner = build(session=FakeSession({MARKETWATCH_URL: marketwatch}), feeds=FEEDS[:1])
+    real_add = scanner.store.add_articles
+    attempts = []
+
+    def locked_once(*args, **kwargs):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_add(*args, **kwargs)
+
+    monkeypatch.setattr(scanner.store, "add_articles", locked_once)
+    with pytest.raises(sqlite3.OperationalError):
+        scanner.poll(CYCLE)
+    assert scanner.store.feed_state("marketwatch") is None
+
+    assert scanner.poll(CYCLE + timedelta(minutes=5)) == (1, 0, 4)
+    assert scanner.store.feed_state("marketwatch").etag == '"v1"'
+
+
+def test_the_same_story_again_in_one_feed_is_not_new_news(build):
+    """Regression: Google News listed a second copy of the same headline (another outlet, another link); it was
+    triaged again, lifted the cooldown and sent a second alert for the same news."""
+    google = Feed("google-news-stock-drops", "Google News", "https://news.example.com/rss")
+    first = ("AMD shares slide after weak guidance - Stocktwits", "https://news.example.com/a", CYCLE)
+    copy = ("AMD shares slide after weak guidance - Yahoo Finance", "https://news.example.com/b", CYCLE)
+    session = FakeSession({**routes(), google.url: rss(first)})
+    triage_model, analysis_model, notifier = FakeChatModel(triage_reply), FakeChatModel(ANALYSIS), FakeNotifier()
+    scanner = build(
+        session=session, feeds=[google], triage_model=triage_model, analysis_model=analysis_model, notifiers=[notifier]
+    )
+    assert len(scanner.run_cycle(CYCLE).opportunities) == 1
+
+    session.routes[google.url] = rss(first, copy)
+    second = scanner.run_cycle(CYCLE + timedelta(minutes=30))
+
+    assert (second.new_articles, second.triaged, second.candidates) == (0, 0, 0)
+    assert len(triage_model.calls) == len(analysis_model.calls) == len(notifier.sent) == 1
+
+
+def test_news_triaged_a_cycle_late_ends_the_cooldown(build):
+    """Regression: an article fetched with the one that was analysed, but triaged a cycle later (the model was
+    unavailable), was never "newer" than the analysis, so the ticker stayed locked for 24 hours."""
+    items = (
+        ("AMD shares slide after weak guidance", "https://example.com/a1", CYCLE - timedelta(minutes=30)),
+        ("AMD CFO resigns amid accounting probe", "https://example.com/a2", CYCLE - timedelta(minutes=10)),
+    )
+    down = {"now": True}
+
+    def triage_model_reply(system, prompt, json_mode):
+        if "CFO resigns" in prompt:
+            if down["now"]:
+                raise LLMUnavailableError("The service is overloaded (529).")
+            return {"articles": [{"id": "a1", "companies": [company("AMD", "AMD", "direct", "negative", 5)]}]}
+        return triage_reply(system, prompt, json_mode)
+
+    analysis_model = FakeChatModel(ANALYSIS)
+    scanner = build(
+        session=FakeSession({**routes(), MARKETWATCH_URL: rss(*items)}),
+        feeds=FEEDS[:1],
+        triage_model=FakeChatModel(triage_model_reply),
+        analysis_model=analysis_model,
+        config=ScannerConfig(scan=ScanConfig(triage_batch_size=1, context_news=False)),
+    )
+    first = scanner.run_cycle(CYCLE)
+    assert first.triaged == 1 and len(first.opportunities) == 1
+
+    down["now"] = False
+    second = scanner.run_cycle(CYCLE + timedelta(minutes=5))
+
+    assert (second.new_articles, second.triaged, second.candidates) == (0, 1, 1)
+    assert len(analysis_model.calls) == 2
+    assert "CFO resigns" in analysis_model.prompts[1]
+
+
+def test_articles_left_pending_by_an_outage_are_not_triaged_once_too_old(build):
+    """Regression: after a long outage the whole backlog was triaged, oldest first, long after it mattered."""
+    triage_model = FakeChatModel(LLMUnavailableError("The service is overloaded (529)."))
+    session = FakeSession(routes())
+    scanner = build(session=session, feeds=FEEDS[:1], triage_model=triage_model)
+    assert scanner.run_cycle(CYCLE).triaged == 0  # 4 articles stay pending
+
+    later = CYCLE + timedelta(hours=26)
+    session.routes[MARKETWATCH_URL] = rss(("AMD shares slide again", "https://example.com/new", later))
+    scanner.triage_model = recovered = FakeChatModel(triage_reply)
+    result = scanner.run_cycle(later)
+
+    assert result.triaged == 1
+    [(_, prompt, _)] = recovered.calls
+    assert "AMD shares slide again" in prompt and "Boeing" not in prompt and "TSMC" not in prompt
+
+
 def test_sec_feeds_are_left_out_without_a_contact_user_agent(build, caplog):
     session = FakeSession(routes())
     analysis_model = FakeChatModel(ANALYSIS)
@@ -415,12 +517,25 @@ def test_a_failed_notification_is_noted_and_retried_next_cycle(build):
     assert scanner.store.unnotified() == []
 
 
-def test_no_notify_keeps_alerts_unsent(build):
+def test_no_notify_results_are_not_pushed_by_a_later_run(build):
+    """Regression: a `run --no-notify` test run's alerts were sent by the next cron or watch cycle."""
     notifier = FakeNotifier()
     scanner = build(notifiers=[notifier], notify=False)
     result = scanner.run_cycle(CYCLE)
     assert len(result.alerts) == 1 and notifier.sent == []
-    assert scanner.store.unnotified() == result.alerts
+    assert scanner.store.unnotified() == []
+
+    scanner.notify = True
+    scanner.run_cycle(CYCLE + timedelta(minutes=5))
+    assert notifier.sent == []
+
+
+def test_cycles_without_a_channel_are_not_pushed_once_one_is_set_up(build):
+    scanner = build(notifiers=[])
+    assert len(scanner.run_cycle(CYCLE).alerts) == 1
+    scanner.notifiers = [notifier := FakeNotifier()]
+    scanner.run_cycle(CYCLE + timedelta(hours=10))
+    assert notifier.sent == []
 
 
 def test_only_opportunities_passing_the_alert_rules_are_sent(build):
@@ -446,7 +561,9 @@ def test_chat_channels_get_the_short_alert_and_email_the_full_report(build):
     [call] = hook.calls
     text = call["json"]["text"]
     assert "1 new dip opportunity" in text and "score 67.8" in text
-    assert f"Full report: {result.report_paths[1]}" in text
+    # Regression: the chat text ended with this host's absolute report path (useless on a phone, and it leaks the
+    # folder and user name to the chat service).
+    assert "Full report" not in text and str(result.report_paths[1].parent.parent) not in text
     assert "| # | Ticker |" not in text  # not the report table
     assert email_like.sent[0][1].startswith("# Dip alerts")
 
@@ -584,3 +701,167 @@ def test_cycle_summary_line():
         "Cycle 2026-09-25 20:30 UTC: 19/20 feeds ok, 1 new article, 1 triaged, 2 company impacts, 1 candidate, "
         "1 opportunity (AMD 72.4), 0 alerts; took 42 s"
     )
+
+
+# --- candidates in backoff, repeated and retried alerts, thesis changes -------------------------------------------
+
+CHART_PREFIX = "https://query1.finance.yahoo.com/v8/finance/chart/"
+QUIET = ScannerConfig(scan=ScanConfig(context_news=False))
+
+
+def seed(scanner: Scanner, ticker: str, *, magnitude: int = 3, at: datetime = CYCLE, title: str | None = None):
+    """A stored, triaged article with one negative direct impact on ticker, published half an hour before at."""
+    article = make_article(
+        title=title or f"{ticker} shares fall after a surprise warning from management",
+        published=at - timedelta(minutes=30),
+        fetched=at - timedelta(minutes=30),
+    )
+    scanner.store.add_articles([article], max_age_hours=24, now=at)
+    scanner.store.record_triage([article.id], [make_impact(article_id=article.id, ticker=ticker, magnitude=magnitude)])
+    return article
+
+
+def test_tickers_in_backoff_do_not_take_the_places_of_ready_ones(build):
+    """Regression: two failing tickers with bigger drops filled max_candidates_per_cycle = 2 and were then dropped
+    by the backoff, so the two ready dips weren't analysed for up to a day."""
+    config = ScannerConfig(scan=ScanConfig(context_news=False, max_candidates_per_cycle=2))
+    analysis_model = FakeChatModel(ANALYSIS)
+    session = FakeSession({CHART_PREFIX: fixture_json("yahoo_chart_amd.json")})
+    scanner = build(session=session, feeds=[], analysis_model=analysis_model, config=config, sec_user_agent=None)
+    for ticker, magnitude in (("FA", 5), ("FB", 5), ("OKA", 2), ("OKB", 2)):
+        seed(scanner, ticker, magnitude=magnitude)
+    for ticker in ("FA", "FB"):
+        scanner.store.record_analysis_failure(ticker, when=CYCLE - timedelta(minutes=5), error="content filter")
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert result.candidates == 2 and len(analysis_model.calls) == 2
+    assert sorted(opp.ticker for opp in result.opportunities) == ["OKA", "OKB"]
+    notes = "\n".join(result.notes)
+    assert "waiting before trying again: FA (1 failure" in notes and "FB (1 failure" in notes
+    assert "Over the limit" not in notes
+
+
+def test_a_developing_story_is_analysed_again_but_alerted_once(build):
+    """Regression: one new article per cycle re-analysed and re-alerted the same ticker every five minutes."""
+    notifier = FakeNotifier()
+    replies = {"probability": 75}
+    analysis_model = FakeChatModel(lambda *_: {**ANALYSIS, "probability_up_6m": replies["probability"]})
+    session = FakeSession(routes())
+    scanner = build(session=session, feeds=FEEDS[:1], analysis_model=analysis_model, notifiers=[notifier], config=QUIET)
+    items = []
+    for n in range(6):
+        when = CYCLE + timedelta(minutes=5 * n)
+        items.append((f"AMD shares slide as analysts react, update {n}", f"https://example.com/{n}", when))
+        session.routes[MARKETWATCH_URL] = rss(*items)
+        result = scanner.run_cycle(when)
+    assert len(analysis_model.calls) == 6 and len(notifier.sent) == 1
+    assert any("nothing material changed, not sent again: AMD (score 67.8, alerted at 67.8)" in n for n in result.notes)
+
+    # A materially better score is news: alerted again.
+    replies["probability"] = 90
+    items.append(("AMD shares slide as analysts react, update 6", "https://example.com/6", CYCLE + timedelta(hours=1)))
+    session.routes[MARKETWATCH_URL] = rss(*items)
+    scanner.run_cycle(CYCLE + timedelta(hours=1))
+    assert len(notifier.sent) == 2 and notifier.sent[1][0] == "Dip alert: AMD (score 78)"
+
+
+def test_a_retried_alert_is_replaced_by_the_newer_analysis_of_the_ticker(build):
+    """Regression: a failed alert was sent 20 hours later next to the newer analysis of the same stock, both as
+    "new", one with a stale price."""
+    broken, working = FakeNotifier(NotifyError("down")), FakeNotifier()
+    session = FakeSession(routes())
+    scanner = build(session=session, feeds=FEEDS[:1], notifiers=[broken], config=QUIET)
+    [first] = scanner.run_cycle(CYCLE).alerts
+
+    later = CYCLE + timedelta(hours=20)
+    session.routes[MARKETWATCH_URL] = rss(
+        ("AMD shares slide again on a second downgrade", "https://example.com/x", later)
+    )
+    scanner.notifiers = [working]
+    [second] = scanner.run_cycle(later).alerts
+
+    [(subject, markdown, _)] = working.sent
+    assert subject == "Dip alert: AMD (score 68)" and "_1 opportunity ·" in markdown
+    assert scanner.store.unnotified() == []
+    assert scanner.store.last_alerted("AMD").id == second.id != first.id
+
+
+def test_a_stale_alert_contradicted_by_a_newer_analysis_is_never_sent(build):
+    broken, working = FakeNotifier(NotifyError("down")), FakeNotifier()
+    verdict = {"now": ANALYSIS}
+    session = FakeSession(routes())
+    scanner = build(
+        session=session,
+        feeds=FEEDS[:1],
+        notifiers=[broken],
+        config=QUIET,
+        analysis_model=FakeChatModel(lambda *_: verdict["now"]),
+    )
+    scanner.run_cycle(CYCLE)
+
+    later = CYCLE + timedelta(hours=20)
+    session.routes[MARKETWATCH_URL] = rss(("AMD shares slide on an accounting probe", "https://example.com/p", later))
+    verdict["now"] = {**ANALYSIS, "verdict": "fundamental", "probability_up_6m": 30}
+    scanner.notifiers = [working]
+    scanner.run_cycle(later)
+
+    assert working.sent == []  # the old bullish alert was superseded; nothing had been sent, so no thesis change
+
+
+def test_a_thesis_change_after_an_alert_is_sent_once(build):
+    """Regression: an alerted idea re-analysed as "fundamental damage" sent nothing, and `report` still listed the
+    old bullish idea first."""
+    notifier = FakeNotifier()
+    verdict = {"now": ANALYSIS}
+    session = FakeSession(routes())
+    scanner = build(
+        session=session,
+        feeds=FEEDS[:1],
+        notifiers=[notifier],
+        config=QUIET,
+        analysis_model=FakeChatModel(lambda *_: verdict["now"]),
+    )
+    scanner.run_cycle(CYCLE)
+    assert len(notifier.sent) == 1
+
+    later = CYCLE + timedelta(hours=44)
+    session.routes[MARKETWATCH_URL] = rss(
+        ("AMD shares slide as the SEC opens an accounting probe", "https://e.com/p", later)
+    )
+    verdict["now"] = {**ANALYSIS, "verdict": "fundamental", "probability_up_6m": 25, "confidence": "high"}
+    result = scanner.run_cycle(later)
+    scanner.run_cycle(later + timedelta(minutes=5))
+
+    assert result.alerts == [] and len(result.thesis_changes) == 1
+    assert len(notifier.sent) == 2
+    subject, markdown, html = notifier.sent[1]
+    assert (
+        subject == "Thesis change: AMD now Fundamental damage (was Temporary fear, entry $132.00) - review open orders"
+    )
+    assert "If you placed orders on the earlier idea, review them." in markdown
+    assert scanner.store.unnotified() == []
+
+    report = render_markdown(scanner.store.opportunities(), title="Report", generated=later)
+    assert "Temporary fear (superseded)" in report
+    assert "**Superseded: analysed again on 2026-09-27 16:30 UTC: Fundamental damage, 25% chance up in 6m" in report
+
+
+def test_a_setup_error_mid_analysis_still_reports_and_alerts_what_was_found(build):
+    """Regression: insufficient_quota on the second candidate left the first one's paid-for analysis without a
+    report or an alert, and in its cooldown."""
+    session = FakeSession({**routes(), CHART_PREFIX + "BA": fixture_json("yahoo_chart_amd.json")})
+    notifier = FakeNotifier()
+    analysis_model = FakeChatModel([ANALYSIS, LLMSetupError("insufficient_quota")])
+    scanner = build(session=session, analysis_model=analysis_model, notifiers=[notifier], config=QUIET)
+
+    with pytest.raises(LLMSetupError, match="insufficient_quota"):
+        scanner.run_cycle(CYCLE)
+
+    latest = (scanner.settings.data_dir / "reports" / "latest.md").read_text(encoding="utf-8")
+    assert (
+        "## AMD" in latest
+        and "Analysis stopped, the model can't be used: insufficient\\_quota. Not analysed: BA" in latest
+    )
+    [(subject, _, _)] = notifier.sent
+    assert subject == "Dip alert: AMD (score 68)"
