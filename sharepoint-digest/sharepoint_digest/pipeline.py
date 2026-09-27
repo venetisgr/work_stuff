@@ -11,7 +11,6 @@ from typing import Protocol
 from .config import ConfigError, Folder, Settings
 from .extract import extract_text
 from .llm import ChatModel, FoundryChatModel, LLMError, LLMSetupError
-from .local import LocalFolder
 from .sharepoint import DriveFile, FolderListing, GraphClient, SharePointFolder, SkippedFile, graph_credential
 from .summarize import DocumentSummary, build_digest, summarize_document
 
@@ -74,9 +73,8 @@ class FileSource(Protocol):
     def download(self, file: DriveFile) -> bytes: ...
 
 
-def open_folder(settings: Settings, folder: Folder) -> FileSource:
-    if folder.local_path:
-        return LocalFolder(folder.local_path)
+def open_sharepoint_folder(settings: Settings, folder: Folder) -> SharePointFolder:
+    """Sign in to Microsoft Graph and find the folder's site, library and ID."""
     site_url = folder.site_url or settings.sharepoint.site_url
     if not site_url:
         raise ConfigError("Set SHAREPOINT_SITE_URL in .env (or site_url for this folder in folders.toml).")
@@ -88,22 +86,21 @@ def run_digest(
     settings: Settings,
     folder: Folder,
     date_range: DateRange,
+    source: FileSource,
     *,
     date_field: str = "modified",
     recursive: bool = True,
     workers: int = 4,
     dry_run: bool = False,
-    location: FileSource | None = None,
     model: ChatModel | None = None,
 ) -> DigestRun:
-    """List the folder's PowerPoint and Word files in the date range, summarize them and write a digest.
+    """List the PowerPoint and Word files in the date range, summarize them and write a digest.
 
-    With dry_run, stops after listing the files. `location` and `model` can be injected for testing.
+    With dry_run, stops after listing the files. `model` defaults to the Foundry deployment in settings.
     """
     run = DigestRun(folder, date_range, date_field)
-    location = location or open_folder(settings, folder)
     start, end = date_range.bounds()
-    listing = location.list_files(start, end, date_field=date_field, recursive=recursive)
+    listing = source.list_files(start, end, date_field=date_field, recursive=recursive)
     run.files, run.skipped = listing.files, list(listing.skipped)
     log.info("Found %d PowerPoint/Word file(s) %s in %s.", len(run.files), run.period, folder.label)
     if dry_run or not run.files:
@@ -112,7 +109,7 @@ def run_digest(
     model = model or FoundryChatModel(settings.foundry)
     run.model_name = model.deployment
     run.summaries, failures = _summarize_files(
-        model, location, run.files, folder_label=folder.label, max_input_chars=settings.max_input_chars, workers=workers
+        model, source, run.files, folder_label=folder.label, max_input_chars=settings.max_input_chars, workers=workers
     )
     run.skipped.extend(failures)
     if not run.summaries:
@@ -136,7 +133,7 @@ def run_digest(
 
 def _summarize_files(
     model: ChatModel,
-    location: FileSource,
+    source: FileSource,
     files: list[DriveFile],
     *,
     folder_label: str,
@@ -144,7 +141,7 @@ def _summarize_files(
     workers: int,
 ) -> tuple[list[DocumentSummary], list[SkippedFile]]:
     def summarize(file: DriveFile) -> DocumentSummary:
-        text = extract_text(location.download(file), file.extension)
+        text = extract_text(source.download(file), file.extension)
         return summarize_document(model, file, text, folder_label=folder_label, max_input_chars=max_input_chars)
 
     summaries: list[DocumentSummary] = []

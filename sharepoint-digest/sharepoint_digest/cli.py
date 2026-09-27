@@ -1,11 +1,14 @@
-"""Command line entry point: python -m sharepoint_digest --help"""
+"""The two command-line versions of the digest.
+
+- local_digest.py (digest-local): reads a folder on this computer, e.g. a OneDrive-synced SharePoint folder.
+- online_digest.py (digest-online): reads a SharePoint folder directly, through Microsoft Graph.
+"""
 
 from __future__ import annotations
 
 import argparse
 import logging
 import sys
-from dataclasses import replace
 from datetime import date, timedelta
 from pathlib import Path
 
@@ -14,7 +17,8 @@ from dotenv import load_dotenv
 
 from .config import PROJECT_ROOT, ConfigError, Folder, default_folders_file, find_folder, load_folders, load_settings
 from .llm import LLMSetupError
-from .pipeline import DateRange, DigestRun, run_digest
+from .local import LocalFolder
+from .pipeline import DateRange, DigestRun, FileSource, open_sharepoint_folder, run_digest
 from .report import write_report
 from .sharepoint import GraphError
 from .summarize import day
@@ -24,8 +28,18 @@ log = logging.getLogger("sharepoint_digest")
 DEFAULT_DAYS = 7
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
+def main_local(argv: list[str] | None = None) -> int:
+    """Version 1: a folder on this computer."""
+    return _main(argv, local=True)
+
+
+def main_online(argv: list[str] | None = None) -> int:
+    """Version 2: a SharePoint folder, read through Microsoft Graph."""
+    return _main(argv, local=False)
+
+
+def _main(argv: list[str] | None, *, local: bool) -> int:
+    args = _parser(local).parse_args(argv)
     _setup_logging(args.verbose)
     # Trust the operating system's certificates, so corporate TLS inspection proxies work out of the box.
     truststore.inject_into_ssl()
@@ -33,18 +47,25 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(PROJECT_ROOT / ".env")  # doesn't override anything already set
 
     try:
+        folders_file = args.folders_file or default_folders_file()
         if args.list_folders:
-            for number, folder in enumerate(load_folders(args.folders_file or default_folders_file()), start=1):
-                where = f"local: {folder.local_path}" if folder.local_path else f"path: /{folder.path}"
-                print(f"{number}. {folder.label}  (--folder {folder.key}, {where})")
+            _print_folders(load_folders(folders_file), local=local)
             return 0
-        folder = _choose_folder(args)
+        settings = load_settings()
         date_range = _date_range(args)
+        if local:
+            folder = _choose_local_folder(args.folder, folders_file)
+            source: FileSource = LocalFolder(folder.local_path)
+        else:
+            folders = load_folders(folders_file)
+            folder = find_folder(folders, args.folder) if args.folder else _ask_for_folder(folders)
+            source = open_sharepoint_folder(settings, folder)
         run = run_digest(
-            load_settings(),
+            settings,
             folder,
             date_range,
-            date_field=args.date_field,
+            source,
+            date_field="modified" if local else args.date_field,
             recursive=not args.no_subfolders,
             workers=args.workers,
             dry_run=args.dry_run,
@@ -70,33 +91,36 @@ def main(argv: list[str] | None = None) -> int:
     return 0 if run.digest else 1
 
 
-def _parser() -> argparse.ArgumentParser:
+def _parser(local: bool) -> argparse.ArgumentParser:
+    if local:
+        prog = "local_digest.py"
+        where = "a folder on this computer (such as a SharePoint folder synced with OneDrive)"
+        folder_help = "a folder path, or a folder from folders.toml that has a local_path (asks if omitted)"
+    else:
+        prog = "online_digest.py"
+        where = "a SharePoint folder"
+        folder_help = "folder key, label or number from folders.toml (asks if omitted)"
     parser = argparse.ArgumentParser(
-        prog="sharepoint-digest",
+        prog=prog,
         description=(
-            "Summarize the PowerPoint and Word files in a SharePoint folder that changed in a date range, "
+            f"Summarize the PowerPoint and Word files in {where} that changed in a date range, "
             "then combine the summaries into one digest, using a GPT model in Azure AI Foundry."
         ),
     )
-    parser.add_argument("--folder", help="folder key, label or number from folders.toml (asks if omitted)")
+    parser.add_argument("--folder", help=folder_help)
     when = parser.add_mutually_exclusive_group()
     when.add_argument("--start", type=_iso_date, metavar="YYYY-MM-DD", help="first day of the range")
     when.add_argument(
         "--days", type=_positive_int, metavar="N", help=f"the last N days up to --end (default: {DEFAULT_DAYS})"
     )
     parser.add_argument("--end", type=_iso_date, metavar="YYYY-MM-DD", help="last day of the range (default: today)")
-    parser.add_argument(
-        "--date-field",
-        choices=("modified", "created"),
-        default="modified",
-        help="which file date the range applies to (default: modified)",
-    )
-    parser.add_argument(
-        "--local-dir",
-        type=Path,
-        metavar="PATH",
-        help="read the files from this folder on your computer (e.g. a OneDrive-synced copy) instead of SharePoint",
-    )
+    if not local:  # synced and downloaded copies don't keep SharePoint's creation dates
+        parser.add_argument(
+            "--date-field",
+            choices=("modified", "created"),
+            default="modified",
+            help="which file date the range applies to (default: modified)",
+        )
     parser.add_argument("--no-subfolders", action="store_true", help="don't look inside subfolders")
     parser.add_argument("--workers", type=_positive_int, default=4, help="files summarized in parallel (default: 4)")
     parser.add_argument(
@@ -131,13 +155,35 @@ def _date_range(args: argparse.Namespace) -> DateRange:
     return DateRange(end - timedelta(days=(args.days or DEFAULT_DAYS) - 1), end)
 
 
-def _choose_folder(args: argparse.Namespace) -> Folder:
-    if args.local_dir and not args.folder:  # an ad-hoc local folder; folders.toml isn't needed
-        name = args.local_dir.expanduser().resolve().name or "local"
-        return Folder(key=name, label=name, path="", local_path=str(args.local_dir))
-    folders = load_folders(args.folders_file or default_folders_file())
-    folder = find_folder(folders, args.folder) if args.folder else _ask_for_folder(folders)
-    return replace(folder, local_path=str(args.local_dir)) if args.local_dir else folder
+def _choose_local_folder(choice: str | None, folders_file: Path) -> Folder:
+    """A folder given as a path, or one from folders.toml that has a local_path."""
+    if choice and _looks_like_path(choice):
+        path = Path(choice).expanduser()
+        name = path.resolve().name or "local"
+        return Folder(key=name, label=name, path="", local_path=str(path))
+
+    folders = load_folders(folders_file)
+    if choice:
+        folder = find_folder(folders, choice)
+        if not folder.local_path:
+            raise ConfigError(
+                f'"{folder.label}" has no local_path in folders.toml. Add the path of its synced copy, '
+                "or pass the folder's path with --folder."
+            )
+        return folder
+    synced = [folder for folder in folders if folder.local_path]
+    if not synced:
+        raise ConfigError("Pass the folder's path with --folder, or add local_path to the folders in folders.toml.")
+    return _ask_for_folder(synced)
+
+
+def _looks_like_path(value: str) -> bool:
+    return (
+        Path(value).expanduser().exists()
+        or any(mark in value for mark in ("/", "\\"))
+        or value.startswith("~")
+        or value[1:2] == ":"  # a Windows drive, e.g. C:
+    )
 
 
 def _ask_for_folder(folders: list[Folder]) -> Folder:
@@ -152,6 +198,15 @@ def _ask_for_folder(folders: list[Folder]) -> Folder:
             return find_folder(folders, answer)
         except ConfigError:
             print("Please enter one of the numbers above.")
+
+
+def _print_folders(folders: list[Folder], *, local: bool) -> None:
+    for number, folder in enumerate(folders, start=1):
+        if local:
+            where = f"local: {folder.local_path}" if folder.local_path else "no local_path set"
+        else:
+            where = f"path: /{folder.path}"
+        print(f"{number}. {folder.label}  (--folder {folder.key}, {where})")
 
 
 def _print_listing(run: DigestRun) -> None:

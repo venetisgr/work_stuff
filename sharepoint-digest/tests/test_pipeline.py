@@ -18,6 +18,7 @@ from conftest import (
 
 from sharepoint_digest.config import ConfigError, Folder
 from sharepoint_digest.llm import LLMError, LLMSetupError
+from sharepoint_digest.local import LocalFolder
 from sharepoint_digest.pipeline import DateRange, run_digest
 from sharepoint_digest.report import write_report
 from sharepoint_digest.sharepoint import SharePointFolder
@@ -53,7 +54,7 @@ def sample_location() -> SharePointFolder:
 def test_run_summarizes_each_file_then_writes_the_digest(tmp_path):
     model = FakeModel()
 
-    run = run_digest(make_settings(), FOLDER, SEPTEMBER, location=sample_location(), model=model, workers=2)
+    run = run_digest(make_settings(), FOLDER, SEPTEMBER, sample_location(), model=model, workers=2)
 
     assert [s.file.name for s in run.summaries] == ["Alpha status.docx", "Q3 plan.pptx"]  # oldest first
     assert {s.file.name: s.reason.split(";")[0] for s in run.skipped} == {
@@ -92,7 +93,7 @@ def test_a_folder_with_a_local_path_is_read_from_disk(tmp_path):
     folder = Folder("synced", "Synced copy", "", local_path=str(tmp_path))
     model = FakeModel()
 
-    run = run_digest(make_settings(), folder, SEPTEMBER, model=model)
+    run = run_digest(make_settings(), folder, SEPTEMBER, LocalFolder(tmp_path), model=model)
 
     assert [s.file.path for s in run.summaries] == ["Minutes/Alpha status.docx", "Q3 plan.pptx"]
     assert run.digest.startswith("## Highlights")
@@ -102,7 +103,7 @@ def test_a_folder_with_a_local_path_is_read_from_disk(tmp_path):
 def test_nothing_in_range_means_no_model_calls():
     model = FakeModel()
     run = run_digest(
-        make_settings(), FOLDER, DateRange(date(2025, 1, 1), date(2025, 1, 31)), location=sample_location(), model=model
+        make_settings(), FOLDER, DateRange(date(2025, 1, 1), date(2025, 1, 31)), sample_location(), model=model
     )
     assert run.files == [] and run.digest is None
     assert model.prompts == []
@@ -110,7 +111,7 @@ def test_nothing_in_range_means_no_model_calls():
 
 def test_dry_run_lists_files_without_summarizing():
     model = FakeModel()
-    run = run_digest(make_settings(), FOLDER, SEPTEMBER, location=sample_location(), model=model, dry_run=True)
+    run = run_digest(make_settings(), FOLDER, SEPTEMBER, sample_location(), model=model, dry_run=True)
     assert [f.name for f in run.files] == ["Alpha status.docx", "Locked.docx", "Q3 plan.pptx"]
     assert model.prompts == []
 
@@ -129,14 +130,12 @@ class BrokenModel(FakeModel):
 
 def test_setup_errors_stop_the_run():
     with pytest.raises(LLMSetupError):
-        run_digest(
-            make_settings(), FOLDER, SEPTEMBER, location=sample_location(), model=BrokenModel(LLMSetupError("bad key"))
-        )
+        run_digest(make_settings(), FOLDER, SEPTEMBER, sample_location(), model=BrokenModel(LLMSetupError("bad key")))
 
 
 def test_a_failed_digest_keeps_the_individual_summaries(tmp_path):
     model = BrokenModel(LLMError("content filter"), fail_on_digest_only=True)
-    run = run_digest(make_settings(), FOLDER, SEPTEMBER, location=sample_location(), model=model)
+    run = run_digest(make_settings(), FOLDER, SEPTEMBER, sample_location(), model=model)
 
     assert len(run.summaries) == 2
     assert run.digest is None and run.digest_error == "content filter"

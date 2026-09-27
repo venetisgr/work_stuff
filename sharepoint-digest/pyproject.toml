@@ -22,7 +22,8 @@ dependencies = [
 dev = ["pytest>=8"]
 
 [project.scripts]
-sharepoint-digest = "sharepoint_digest.cli:main"
+digest-local = "sharepoint_digest.cli:main_local"
+digest-online = "sharepoint_digest.cli:main_online"
 
 [tool.setuptools]
 packages = ["sharepoint_digest"]
