@@ -38,7 +38,8 @@ from ..track import STATUS_LABELS, Outcome, signal_day
 from . import auth, pages
 from .app import api_error, paginate
 from .context import AppContext
-from .jobs import BURST_WINDOW, JobLimitError
+from .control import member_view
+from .jobs import BURST_WINDOW, JobLimitError, shown_error
 from .pages import (
     DAY_CHOICES,
     DEFAULT_DAYS,
@@ -247,17 +248,18 @@ def _name(model: str | None, names: dict[str, str]) -> str | None:
     return names.get(model) or model_display_name(model)
 
 
-def debate_view(opp: Opportunity) -> dict[str, Any] | None:
+def debate_view(opp: Opportunity, *, admin: bool = False) -> dict[str, Any] | None:
     """DebateView: the stored debate with the texts of the Fly idea page's Debate card (pages.debate_view), so both
-    sites word it the same way."""
+    sites word it the same way. The raw reason (the provider's error) is for admins only: members get null, and
+    reason_label in plain words."""
     debate = shown_debate(opp)
-    card = pages.debate_view(opp) if debate is not None else None
+    card = pages.debate_view(opp, admin=admin) if debate is not None else None
     if debate is None or card is None:
         return None
     names = debater_names(debate)
     return {
         "mode": debate.mode,
-        "reason": debate.reason,
+        "reason": debate.reason if admin else None,
         "reason_label": card.reason,
         "rounds": max(0, int(debate.rounds)),
         "title": card.title,
@@ -403,11 +405,14 @@ def ideas(request: Request, session: SignedIn, ctx: auth.Ctx) -> dict[str, Any]:
     }
 
 
-def raw_opportunity(opp: Opportunity) -> dict[str, Any]:
-    """Opportunity.to_dict(), except that a debate the contract can't describe (shown_debate) is left out."""
+def raw_opportunity(opp: Opportunity, *, admin: bool = False) -> dict[str, Any]:
+    """Opportunity.to_dict(), except that a debate the contract can't describe (shown_debate) is left out, and that a
+    member doesn't get the debate's raw reason (the provider's error, for admins; see debate_view)."""
     data = opp.to_dict()
     if shown_debate(opp) is None:
         data["debate"] = None
+    elif not admin and isinstance(data.get("debate"), dict):
+        data["debate"] = {**data["debate"], "reason": pages.member_reason(opp.debate.reason if opp.debate else None)}
     return data
 
 
@@ -543,7 +548,7 @@ def idea(opportunity_id: int, session: SignedIn, ctx: auth.Ctx) -> dict[str, Any
             newest=newest,
             watchlist=watchlist_of(user, ctx.config),
         ),
-        "opportunity": raw_opportunity(opp),
+        "opportunity": raw_opportunity(opp, admin=user.is_admin),
         "levels": levels_view(view),
         "fx_note": fx_note(view, currency),
         "chart": chart,
@@ -552,7 +557,7 @@ def idea(opportunity_id: int, session: SignedIn, ctx: auth.Ctx) -> dict[str, Any
         "outcome_notes": list(prices.notes),
         "history": [history_item(item, newest=newest, current=opp.id) for item in history],
         "rule_misses": rule_misses(opp, user, ctx.config),
-        "debate": debate_view(opp),
+        "debate": debate_view(opp, admin=user.is_admin),
     }
 
 
@@ -562,7 +567,7 @@ def idea(opportunity_id: int, session: SignedIn, ctx: auth.Ctx) -> dict[str, Any
 def _limit_retry(ctx: AppContext, user: User, limit: int, now: datetime) -> int:
     """Seconds until the oldest of the user's analyses that count against the daily limit is 24 hours old."""
     jobs = ctx.accounts.list_jobs(user_id=user.id, limit=limit + 100)
-    recent = sorted(job.created for job in jobs if job.created > now - DAY)
+    recent = sorted(job.created for job in jobs if job.created > now - DAY and job.counts)
     if len(recent) < limit or limit <= 0:
         return 60
     frees = recent[len(recent) - limit] + DAY
@@ -578,7 +583,7 @@ def reanalyse(opportunity_id: int, session: SignedPost, ctx: auth.Ctx) -> JSONRe
     if opp is None:
         raise ApiError(404, message=NO_IDEA)
     if not ctx.jobs.available:
-        raise ApiError(503, "unavailable", ctx.jobs.unavailable or "Manual analyses aren't available on this server.")
+        raise ApiError(503, "unavailable", pages.unavailable_note(ctx, user))
     try:
         job = ctx.jobs.submit(user, opp.ticker)
     except JobLimitError as exc:
@@ -616,7 +621,7 @@ def job(job_id: int, session: SignedIn, ctx: auth.Ctx) -> dict[str, Any]:
         "created": _iso(found.created),
         "finished": _iso(found.finished),
         "opportunity_id": found.opportunity_id,
-        "error": found.error,
+        "error": shown_error(found, user),
         "ahead": ahead,
         "remaining": ctx.jobs.remaining(user),
     }
@@ -664,6 +669,8 @@ def status(session: SignedIn, ctx: auth.Ctx) -> dict[str, Any]:
     """Status: the scanner's status strip, with the model's use since 00:00 UTC."""
     now = ctx.now()
     found = ctx.control.status(now=now)
+    if not session.user.is_admin:
+        found = member_view(found)
     last = found.last_cycle
     feeds = None
     if last is not None and "feeds_ok" in last.stats:

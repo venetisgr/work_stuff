@@ -374,7 +374,7 @@ main.container {
   }
 }
 
-@media (max-width: 374.98px) {
+@media (max-width: 419.98px) { /* an admin's five links need it up to a 6.1" iPhone (390-393 px) */
   .nav a {
     padding: 0 5px;
     font-size: 0.8125rem;

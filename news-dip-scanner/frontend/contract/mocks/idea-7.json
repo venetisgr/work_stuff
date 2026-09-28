@@ -1133,7 +1133,7 @@
     "favoured": "openai:gpt-5",
     "favoured_label": "GPT-5",
     "ruling_title": "The ruling by Claude Sonnet 5",
-    "judge_note": "It found GPT-5's case stronger. It saw the two only as Analyst A and Analyst B, so it couldn't tell which one was its own model.",
+    "judge_note": "It found GPT-5's case stronger. It saw the two labelled Analyst A and Analyst B, in an order that doesn't say which model wrote which.",
     "line": "GPT-5 70% · Claude 62% → 66% (medium agreement)"
   }
 }

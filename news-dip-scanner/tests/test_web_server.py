@@ -11,6 +11,7 @@ import threading
 from datetime import UTC, datetime, timedelta
 
 import pytest
+import requests
 from conftest import FakeSession, make_opportunity
 from fastapi.testclient import TestClient
 
@@ -18,6 +19,7 @@ from dip_scanner import accounts as accounts_module
 from dip_scanner.config import DATABASE_NAME, ConfigError, NotifySettings, ScannerConfig, Settings, WebSettings
 from dip_scanner.fx import FxRates
 from dip_scanner.llm import LLMSetupError
+from dip_scanner.netguard import refused_by_guard
 from dip_scanner.notices import stopped_lines
 from dip_scanner.prices import YahooPrices
 from dip_scanner.store import Store
@@ -102,8 +104,8 @@ def build(tmp_path, scanner=None, *, error: Exception | None = None, enabled=Tru
     """make_server_app with a factory that returns scanner (or raises error); returns (app, the factory's calls)."""
     calls: list[dict] = []
 
-    def factory(settings, config, feeds, *, store, session, clock, resolver):
-        calls.append({"store": store, "session": session, "feeds": feeds})
+    def factory(settings, config, feeds, *, store, session, clock, resolver, webhook_session):
+        calls.append({"store": store, "session": session, "feeds": feeds, "webhook_session": webhook_session})
         if error is not None:
             raise error
         return scanner
@@ -330,3 +332,27 @@ def test_the_serve_stop_notice_text():
     lines = stopped_lines("serve", "Configuration problem: x", NOW)
     assert lines[0] == "dip-scanner serve stopped at 2026-09-25 15:00 UTC: Configuration problem: x"
     assert 'clicks "Start again" on the admin page or the website restarts' in lines[1]
+
+
+def test_members_webhooks_go_through_a_session_pinned_to_public_addresses(tmp_path):
+    seen = []
+
+    def factory(settings, config, feeds, *, store, session, clock, resolver, webhook_session):
+        seen.append((session, webhook_session))
+        return FakeScanner()
+
+    app = server.make_server_app(
+        settings_for(tmp_path),
+        ScannerConfig(),
+        [],
+        scanner_factory=factory,
+        resolver=lambda host, port: ["10.0.0.8"],  # the name now points inside the network
+        job_executor=InlineExecutor(),
+    )
+    [(shared, hooks)] = seen
+    ctx = app.state.ctx
+    assert ctx.webhook_http is hooks and hooks is not shared and ctx.http is shared
+    with pytest.raises(requests.ConnectionError) as error:
+        hooks.post("https://hooks.example.com/abc", json={}, timeout=1)
+    assert refused_by_guard(error.value)
+    ctx.store.close()

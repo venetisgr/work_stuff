@@ -9,36 +9,45 @@ The protocol for one candidate (debate_candidate):
    up are more than [debate] max_probability_gap points apart, their potential lows are more than max_low_gap_pct of
    the price apart, or one of them passes somebody's alert rules (min_score, min_probability, verdicts: any
    recipient's) and the other doesn't. With [debate] when = "disagree" and no disagreement the openings are merged
-   (merge) and nothing else runs: mode "agreed".
+   (merge) and nothing else runs: mode "agreed". The merge takes the lower low and confidence with the mean chance,
+   so it can score below both openings: when the merged analysis would pass somebody's alert rules that both openings
+   fail, or fail rules that both pass (merge_disagreements), the openings are debated after all.
 3. Rebuttals, [debate] rounds of them (1 by default; both debaters at the same time): each sees its own position and
-   the other's, called "the other analyst" (never a provider or model name), and replies with its full final
-   analysis plus critique, concessions and changed_mind (prompts.DEBATE_REBUTTAL_*).
+   the other's, called "the other analyst" (never a provider or model name: the debaters' model names are replaced
+   by "the analyst" in the positions, whole words only and not when the case itself mentions them, since news about
+   a model such as GPT-5 names it as a product), and replies with its full final analysis plus critique, concessions
+   and changed_mind (prompts.DEBATE_REBUTTAL_*).
 4. The judge (prompts.DEBATE_JUDGE_*) reads the case and both final positions with their critiques and concessions,
    labelled "Analyst A" and "Analyst B", and replies with the final analysis plus debate_summary, agreement and
-   favoured. Which debater is A is fixed per ticker and day by a hash (analyst_order), so the judge can't tell which
+   favoured. Which debater is A is fixed per ticker and day by a hash (analyst_order), so the labels don't say which
    one is its own model. LLM_DEBATE_JUDGE=alternate (the default) picks the judge from the two debaters by another
    hash of ticker and day (judge_index), so neither side always judges; that debater is also the "primary" one whose
    texts a merge keeps.
 5. Guardrails on the judge's ruling (guard_ruling), each noted in Analysis.warnings like sanitize's fixes: the
    chance up is kept within 5 points of the debaters' final range, the potential low within 5% of the price of
-   theirs, the confidence is capped at "low" when their final verdicts are opposite (temporary_fear against
-   fundamental) and at "medium" when they merely differ; then analyze.sanitize's rules.
+   theirs; the confidence is capped at "low" when the final verdicts and the ruling's include opposite ones
+   (temporary_fear against fundamental) and at "medium" when they merely differ (the analysts' from each other, or
+   the ruling's from both of theirs), and it is never higher than the higher of the analysts' final confidences; then
+   analyze.sanitize's rules. The stored agreement is the lower of the judge's and the one worked out from the final
+   positions (agreement_of), so "high agreement" can't stand over opposite verdicts.
 6. Failures. One debater failing its opening (any error, including LLMSetupError for its provider only) leaves the
    other's analysis standing alone: mode "single", with the reason, and the Scanner sends a system notice (at most
-   one per provider every 12 hours). A failed rebuttal keeps that debater's previous position. A failed judge
-   leaves the two final positions merged by rule (merge), with the reason. Both openings failing raises like a single
-   analysis would: LLMSetupError when both were setup errors, LLMUnavailableError when either was unreachable, else
-   LLMError (ConfigError when both were).
+   one per provider every 12 hours). A failed rebuttal keeps that debater's previous position, and the debate's
+   reason says so. A failed judge leaves the two final positions merged by rule (merge), with the reason; a judge
+   that can't be used at all (LLMSetupError, ConfigError) gets a system notice too. Both openings failing raises like
+   a single analysis would: LLMSetupError when both were setup errors, LLMUnavailableError when either was
+   unreachable, else LLMError (ConfigError when both were).
 7. Metering: every call goes through meter(model, step) with the steps STEP_OPENING, STEP_REBUTTAL and STEP_JUDGE
    ("analysis:opening", ...), so Store.model_usage totals them per model, and [scan] max_analyses_per_day still
    counts one analysis per candidate (Store.analyses_since).
 
-merge (for "agreed", and when the judge fails): the verdict is the shared one (when they differ, the more cautious
-of the two, by analyze.VERDICT_FACTORS); the chance up the mean, rounded half up; the potential low the lower one;
-the entry the lower one, kept between the low and the price; the target the mean (it stays above the entry); the
-confidence the lower one (capped as in step 5 when the verdicts differ); fear, fundamental impact, thesis and
-catalysts the primary debater's; risks and checks the primary's followed by the other's that aren't repeats (at most
-6 each).
+merge (for "agreed", and when the judge fails): the verdict is the shared one (when they differ, "unclear" for
+opposite ones, temporary_fear against fundamental, else the more cautious of the two by analyze.VERDICT_FACTORS); the
+chance up the mean, rounded half up; the potential low the lower one; the entry the lower one, kept between the low
+and the price; the target the mean (it stays above the entry); the confidence the lower one (capped as in step 5 when
+the verdicts differ); fear, fundamental impact, thesis and catalysts the primary debater's, or the other's when only
+its verdict is the merged one; risks and checks those followed by the other side's that aren't repeats (at most 6
+each). A merge after a failed judge has nothing left to escalate to, so it isn't checked against the alert rules.
 """
 
 from __future__ import annotations
@@ -97,6 +106,8 @@ LABELS = ("A", "B")
 Meter = Callable[[ChatModel, str], ChatModel]  # (model, step) -> the model to call, e.g. a pipeline.MeteredModel
 
 _CONFIDENCE_RANK = {name: rank for rank, name in enumerate(CONFIDENCES)}  # low 0, medium 1, high 2
+_AGREEMENT_RANK = {"low": 0, "medium": 1, "high": 2}
+_DASHES = "\\-\u2010-\u2015"  # for a regex character class: the hyphen-minus and Unicode's hyphens and dashes
 _FAVOURED = {"a": "A", "analyst a": "A", "b": "B", "analyst b": "B"}
 _NEITHER = {"neither", "none", "both", "tie", "equal", "n/a", ""}
 _TRUE_WORDS = {"true", "yes", "1"}
@@ -251,8 +262,11 @@ def merge(primary: Analysis, other: Analysis, stats: PriceStats) -> Analysis:
     """The two positions merged by rule (see the module docstring), checked by analyze.sanitize."""
     price = stats.price
     verdict = primary.verdict
-    if other.verdict != primary.verdict:  # only when a judge failed: the more cautious reading
+    if {primary.verdict, other.verdict} == OPPOSITE_VERDICTS:  # only when a judge failed: nobody settled it
+        verdict = "unclear"
+    elif other.verdict != primary.verdict:  # only when a judge failed: the more cautious reading
         verdict = min((primary.verdict, other.verdict), key=lambda value: VERDICT_FACTORS.get(value, 0.0))
+    texts, extra = (other, primary) if other.verdict == verdict != primary.verdict else (primary, other)
     low = min(primary.potential_low, other.potential_low)
     entry = min(price, max(low, min(primary.entry_price, other.entry_price)))
     confidence = _lower_confidence(primary.confidence, other.confidence)
@@ -266,14 +280,39 @@ def merge(primary: Analysis, other: Analysis, stats: PriceStats) -> Analysis:
         "entry_price": entry,
         "target_price": (primary.target_price + other.target_price) / 2,
         "confidence": confidence,
-        "fear": primary.fear,
-        "fundamental_impact": primary.fundamental_impact,
-        "thesis": primary.thesis,
-        "risks": _union(primary.risks, other.risks),
-        "catalysts": list(primary.catalysts),
-        "checks": _union(primary.checks, other.checks),
+        "fear": texts.fear,
+        "fundamental_impact": texts.fundamental_impact,
+        "thesis": texts.thesis,
+        "risks": _union(texts.risks, extra.risks),
+        "catalysts": list(texts.catalysts),
+        "checks": _union(texts.checks, extra.checks),
     }
     return sanitize(raw, stats)
+
+
+def merge_disagreements(
+    merged: Analysis, first: Analysis, second: Analysis, *, price: float, rules: Sequence[AlertConfig]
+) -> list[str]:
+    """Why a merge of two agreeing openings can't stand for them, in words; empty when it can. The openings pass or
+    fail each set of rules alike (disagreements), and the merge must too: with the lower low and confidence and the
+    mean chance it can score below both of them (or, rarely, pass where neither does)."""
+    seen: set[tuple] = set()
+    for rule in rules:
+        key = (rule.min_score, rule.min_probability, tuple(rule.verdicts))
+        if key in seen:
+            continue
+        seen.add(key)
+        both = passes(first, rule, price) and passes(second, rule, price)
+        either = passes(first, rule, price) or passes(second, rule, price)
+        merged_passes = passes(merged, rule, price)
+        if merged_passes != both or (merged_passes and not either):
+            return [
+                f"their merged analysis {'passes' if merged_passes else 'fails'} alert rules that both openings "
+                f"{'fail' if merged_passes else 'pass'} (score {score(merged, price):.1f} against "
+                f"{score(first, price):.1f} and {score(second, price):.1f}; minimum score {rule.min_score:g}, chance "
+                f"{rule.min_probability}%)"
+            ]
+    return []
 
 
 def _union(first: Sequence[str], second: Sequence[str]) -> list[str]:
@@ -315,14 +354,31 @@ def guard_ruling(raw: dict, finals: Sequence[Analysis], stats: PriceStats) -> An
             f"the analysts' ({' and '.join(plain_price(value) for value in lows)}); used {plain_price(fixed)}."
         )
         raw["potential_low"] = fixed
-    cap = confidence_cap([final.verdict for final in finals])
+    verdicts = [final.verdict for final in finals]
+    cap = confidence_cap([*verdicts, raw["verdict"]])
     if cap is not None and _CONFIDENCE_RANK[raw["confidence"]] > _CONFIDENCE_RANK[cap]:
-        why = "opposite" if cap == "low" else "different"
-        warnings.append(
-            f"The judge's confidence {raw['confidence']} was capped at {cap}: the analysts' final verdicts were {why} "
-            f"({' and '.join(verdict_label(final.verdict) for final in finals)})."
-        )
+        if raw["verdict"] in verdicts:
+            why = "opposite" if cap == "low" else "different"
+            because = f"the analysts' final verdicts were {why} ({' and '.join(map(verdict_label, verdicts))})"
+        elif len(set(verdicts)) == 1:
+            because = (
+                f"its verdict ({verdict_label(raw['verdict'])}) differs from both analysts' final verdict "
+                f"({verdict_label(verdicts[0])})"
+            )
+        else:
+            because = (
+                f"its verdict ({verdict_label(raw['verdict'])}) differs from both analysts' final verdicts "
+                f"({' and '.join(map(verdict_label, verdicts))})"
+            )
+        warnings.append(f"The judge's confidence {raw['confidence']} was capped at {cap}: {because}.")
         raw["confidence"] = cap
+    ceiling = max((final.confidence for final in finals), key=lambda value: _CONFIDENCE_RANK.get(value, 0))
+    if _CONFIDENCE_RANK[raw["confidence"]] > _CONFIDENCE_RANK[ceiling]:
+        warnings.append(
+            f"The judge's confidence {raw['confidence']} was lowered to {ceiling}: neither analyst's final confidence "
+            "was higher."
+        )
+        raw["confidence"] = ceiling
     analysis = sanitize(raw, stats)
     return replace(analysis, warnings=[*warnings, *analysis.warnings])
 
@@ -419,7 +475,8 @@ def position_text(
 ) -> str:
     """An analysis (and its critique and concessions) as plain text for a rebuttal or the judge's prompt. Angle
     brackets become ‹ › so the text can't close its <analysis> element, and the names in hide (the debaters' models)
-    are replaced by "the analyst", so no position gives away which model wrote it."""
+    are replaced by "the analyst" (whole words, whatever the dashes and spaces: see name_pattern), so no position
+    gives away which model wrote it."""
     lines = [
         f"Verdict: {analysis.verdict} (confidence: {analysis.confidence})",
         f"probability_up_6m: {analysis.probability_up_6m}",
@@ -441,8 +498,16 @@ def position_text(
             lines += [f"- {item}" for item in items]
     text = "\n".join(lines).replace("<", "‹").replace(">", "›")
     for name in sorted({name for name in hide if name}, key=len, reverse=True):
-        text = re.sub(re.escape(name), "the analyst", text, flags=re.IGNORECASE)
+        text = name_pattern(name).sub("the analyst", text)
     return text
+
+
+def name_pattern(name: str) -> re.Pattern[str]:
+    """A model name as a whole word, case ignored, with any dash, a space or nothing between its parts ("gpt-5"
+    matches "GPT-5", "GPT 5" and "GPT\u20115", but not "gpt-5.1", "GPT-5-mini" or "ChatGPT-5")."""
+    parts = [re.escape(part) for part in re.split(rf"[{_DASHES}\s]+", name) if part]
+    body = rf"[{_DASHES}\s]?".join(parts)
+    return re.compile(rf"(?<![\w.{_DASHES}]){body}(?![\w{_DASHES}]|\.\d)", re.IGNORECASE)
 
 
 # --- the debate ------------------------------------------------------------------------------------------------------
@@ -486,6 +551,8 @@ def debate_candidate(
 
     # 1. The openings, both at once.
     prompt = prompts.ANALYSIS_PROMPT.format(**fields)
+    # A model the case itself mentions (news about GPT-5) is the subject there, not a sign of who wrote a position.
+    hide = [name for name in dict.fromkeys(hide) if name and not name_pattern(name).search(prompt)]
     jobs = []
     for debater in debaters:
         model = call(debater, STEP_OPENING)
@@ -526,6 +593,8 @@ def debate_candidate(
     found = disagreements(sides[0].opening, sides[1].opening, price=stats.price, config=config, rules=rules)
     if config.when == "disagree" and not found:
         analysis = merge(primary.opening, secondary.opening, stats)
+        found = merge_disagreements(analysis, sides[0].opening, sides[1].opening, price=stats.price, rules=rules)
+    if config.when == "disagree" and not found:
         summary = (
             f"Both analysts called it {verdict_label(analysis.verdict)} with close numbers (chances up of "
             f"{sides[0].opening.probability_up_6m}% and {sides[1].opening.probability_up_6m}%), so their analyses "
@@ -541,6 +610,7 @@ def debate_candidate(
 
     # 3. The rebuttals.
     rounds = 0
+    notes: list[str] = []  # rebuttals that failed, for the debate's reason
     for number in range(1, config.rounds + 1):
         rounds = number
         jobs = []
@@ -570,6 +640,10 @@ def debate_candidate(
             if error is not None:
                 failures.append(DebaterFailure(side.debater.label, "rebuttal", error))
                 _log_failure(candidate.ticker, side.debater.label, f"rebuttal {number}", error)
+                notes.append(
+                    f"{side.debater.label}'s rebuttal{f' in round {number}' if config.rounds > 1 else ''} failed, so "
+                    f"its earlier position stands: {_one_line(error)}"
+                )
                 continue
             assert reply is not None
             final = sanitize(reply, stats)
@@ -610,7 +684,7 @@ def debate_candidate(
             rounds=rounds,
             summary=summary,
             agreement=agreement,
-            reason=f"The judge {judge.label} failed: {_one_line(error)}",
+            reason="; ".join([f"The judge {judge.label} failed: {_one_line(error)}", *notes]),
         )
         model = f"debate: {names}, merged without a judge"
         return DebateResult(to_opportunity(candidate, analysis, now=now, model=model, debate=debate), failures)
@@ -620,14 +694,17 @@ def debate_candidate(
     for warning in analysis.warnings:
         log.info("%s: fixed the ruling: %s", candidate.ticker, warning)
     favoured = by_label[ruling["favoured"]].debater.label if ruling["favoured"] else None
+    worked_out = agreement_of(finals[0], finals[1], price=stats.price, config=config)
+    agreement = min(ruling["agreement"], worked_out, key=lambda value: _AGREEMENT_RANK.get(value, 0))
     debate = _record(
         "debate",
         sides,
         rounds=rounds,
         summary=ruling["debate_summary"],
-        agreement=ruling["agreement"],
+        agreement=agreement,
         judge=judge.label,
         favoured=favoured,
+        reason="; ".join(notes) or None,
     )
     model = f"debate: {names}, judged by {judge.model_name}"
     return DebateResult(to_opportunity(candidate, analysis, now=now, model=model, debate=debate), failures)

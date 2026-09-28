@@ -43,13 +43,14 @@ class FakePrices:
 class FakeStore:
     """The part of Store that select_candidates uses."""
 
-    def __init__(self, last=None, valid=None):
-        self.last = dict(last or {})
+    def __init__(self, last=None, valid=None, *, scanners=None):
+        self.last = dict(last or {})  # the newest analysis of any kind
+        self.scanners = dict(last or {}) if scanners is None else dict(scanners)  # the newest of the scanner's own
         self.valid = dict(valid or {})
         self.marked: list[tuple[str, bool, object]] = []
 
-    def last_opportunity(self, ticker):
-        return self.last.get(ticker)
+    def last_opportunity(self, ticker, *, include_manual=True):
+        return (self.last if include_manual else self.scanners).get(ticker)
 
     def ticker_valid(self, ticker, *, now=None):
         return self.valid.get(ticker)

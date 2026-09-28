@@ -7,7 +7,8 @@ each recipient's alert state (sent, not sent, repeats, thesis changes) apart in 
 
 Website users' channels use the server's settings: email goes through the server's SMTP settings to the user's own
 address, Telegram through the server's bot to the user's chat id, and a webhook to the user's URL, which is checked
-again (netguard) before every message and never followed through a redirect.
+again (netguard) before every message, sent through a session that connects only to the public address it checked
+(netguard.public_https_session), never followed through a redirect, and given USER_WEBHOOK_DEADLINE seconds at most.
 """
 
 from __future__ import annotations
@@ -19,8 +20,16 @@ from datetime import UTC, datetime, tzinfo
 
 from .accounts import Accounts, User, UserSettings, email_ready, telegram_ready
 from .config import AlertConfig, ConfigError, ScannerConfig, Settings, display_zone
-from .netguard import Resolver, check_public_url
-from .notify import EmailNotifier, Notifier, TelegramNotifier, WebhookNotifier
+from .models import from_iso, utc
+from .netguard import Resolver, check_public_url, public_https_session
+from .notify import (
+    MAX_REPLY_BYTES,
+    USER_WEBHOOK_DEADLINE,
+    EmailNotifier,
+    Notifier,
+    TelegramNotifier,
+    WebhookNotifier,
+)
 from .store import DEFAULT_RECIPIENT, Store
 
 log = logging.getLogger(__name__)
@@ -82,10 +91,21 @@ def default_recipient(settings: Settings, config: ScannerConfig, notifiers: Sequ
     )
 
 
-def user_notifiers(user: User, settings: Settings, *, session=None, resolver: Resolver | None = None) -> list[Notifier]:
+def user_notifiers(
+    user: User,
+    settings: Settings,
+    *,
+    session=None,
+    webhook_session=None,
+    resolver: Resolver | None = None,
+) -> list[Notifier]:
     """The channels a user set up that the server can serve: email (with the server's SMTP settings, to the user's
-    address), Telegram (with the server's bot) and a webhook (checked with netguard before every message)."""
+    address), Telegram (with the server's bot, through session) and a webhook (checked with netguard before every
+    message, through webhook_session: by default session when one is given, else a netguard.public_https_session;
+    the website passes a public_https_session of its own)."""
     chosen = user.settings
+    if webhook_session is None:
+        webhook_session = session if session is not None else public_https_session(resolver)
     notifiers: list[Notifier] = []
     if chosen.email_alerts and email_ready(settings):
         notifiers.append(EmailNotifier(replace(settings.notify, email_to=[user.email])))
@@ -98,11 +118,13 @@ def user_notifiers(user: User, settings: Settings, *, session=None, resolver: Re
                 WebhookNotifier(
                     chosen.webhook_url,
                     chosen.webhook_format,
-                    session=session,
+                    session=webhook_session,
                     check_url=lambda url: check_public_url(url, resolver=resolver),
                     follow_redirects=False,
                     show_replies=False,
                     hints=_USER_WEBHOOK_HINTS,
+                    deadline=USER_WEBHOOK_DEADLINE,
+                    max_reply_bytes=MAX_REPLY_BYTES,
                 )
             )
         except ConfigError as exc:  # a stored URL that isn't http(s) any more: the others still work
@@ -116,9 +138,11 @@ def user_recipient(
     config: ScannerConfig,
     *,
     session=None,
+    webhook_session=None,
     resolver: Resolver | None = None,
 ) -> Recipient:
-    """A website user as a recipient (notifiers may be empty when they set up no channel the server can serve)."""
+    """A website user as a recipient (notifiers may be empty when they set up no channel the server can serve);
+    session, webhook_session and resolver as for user_notifiers."""
     chosen = user.settings
     try:
         tz = display_zone(chosen.timezone)
@@ -135,7 +159,7 @@ def user_recipient(
         ),
         watchlist=preferred_symbols(chosen.watchlist, config),
         only_watchlist=chosen.only_watchlist,
-        notifiers=user_notifiers(user, settings, session=session, resolver=resolver),
+        notifiers=user_notifiers(user, settings, session=session, webhook_session=webhook_session, resolver=resolver),
         currency=chosen.currency,
         tz=tz,
         thesis_changes=chosen.thesis_changes,
@@ -150,13 +174,16 @@ def build_user_recipients(
     config: ScannerConfig,
     session=None,
     *,
+    webhook_session=None,
     resolver: Resolver | None = None,
 ) -> list[Recipient]:
     """A recipient for every active user (enabled, with a password) with at least one working channel."""
     accounts = Accounts(store, defaults=UserSettings.defaults(config, settings))
     recipients = []
     for user in accounts.active_users():
-        recipient = user_recipient(user, settings, config, session=session, resolver=resolver)
+        recipient = user_recipient(
+            user, settings, config, session=session, webhook_session=webhook_session, resolver=resolver
+        )
         if recipient.notifiers:
             recipients.append(recipient)
     return recipients
@@ -188,6 +215,7 @@ def service_hooks(
     session=None,
     *,
     default_notifiers: Sequence[Notifier] = (),
+    webhook_session=None,
     resolver: Resolver | None = None,
 ) -> dict[str, Callable[[datetime], object]]:
     """The Scanner's recipients, watchlist and currencies arguments for the website: `Scanner(...,
@@ -195,11 +223,19 @@ def service_hooks(
 
     Each is asked at every cycle, so changed settings apply at once. The recipients are "default" (the .env channels)
     when default_notifiers isn't empty, then every user with a working channel. store must be the scanner's own.
+    Members' webhooks go through webhook_session (see user_notifiers).
     """
 
     def recipients(now: datetime) -> list[Recipient]:
-        found = [default_recipient(settings, config, default_notifiers)] if default_notifiers else []
-        return found + build_user_recipients(store, settings, config, session, resolver=resolver)
+        found = []
+        if default_notifiers:
+            since = default_since(store, now)
+            found.append(replace(default_recipient(settings, config, default_notifiers), since=since))
+        else:
+            store.set_state(DEFAULT_SINCE, None)  # the .env channels are gone: a later one starts afresh
+        return found + build_user_recipients(
+            store, settings, config, session, webhook_session=webhook_session, resolver=resolver
+        )
 
     def watchlist(now: datetime) -> tuple[str, ...]:
         return active_watchlist(store, config)
@@ -210,10 +246,27 @@ def service_hooks(
     return {"recipients": recipients, "watchlist": watchlist, "currencies": currencies}
 
 
+DEFAULT_SINCE = "default_alerts_since"  # app_state: since when the .env channels have been set up on the website
+
+
+def default_since(store: Store, now: datetime) -> datetime:
+    """Since when the website's "default" recipient (the .env channels) gets alerts: when they were first seen set up
+    (remembered in app_state), so channels added later don't get a burst of the day's old ideas."""
+    stored = store.get_state(DEFAULT_SINCE)
+    if stored:
+        try:
+            return from_iso(stored)
+        except ValueError:
+            pass
+    store.set_state(DEFAULT_SINCE, utc(now).isoformat())
+    return utc(now)
+
+
 def mark_manual_analysis(store: Store, opportunity_ids: Iterable[int], *, viewer: str | None, when: datetime) -> None:
     """Record a manual analysis ("Analyse now" on the website) the way `dip-scanner analyze` does: it is never sent to
-    anybody as an alert, and it counts as alerted to the viewer (a recipient key such as "user:3"), so their repeats
-    and thesis changes compare with what they read."""
+    anybody as an alert by itself (for others it can take the place of an older alert still waiting for them, see
+    Scanner._send_alerts_to), and it counts as alerted to the viewer (a recipient key such as "user:3"), so their
+    repeats and thesis changes compare with what they read."""
     ids = list(opportunity_ids)
     store.mark_notified(ids, when=when, sent=False)
     if viewer:

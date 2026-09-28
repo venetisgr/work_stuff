@@ -38,6 +38,9 @@ from .notices import (
     debater_notice_kind,
     debater_notice_lines,
     debater_notice_subject,
+    judge_notice_kind,
+    judge_notice_lines,
+    judge_notice_subject,
     one_line,
     scrub,
     secrets_of,
@@ -139,10 +142,20 @@ class MeteredModel:
     arrives, also one that turns out unusable, which is billed all the same) or when it returned a reply (models
     without last_usage, like the tests' fakes). Calls that never reached the service (connection errors, throttling,
     bad credentials) aren't stored, so an outage doesn't use up [scan] max_analyses_per_day. answered counts the
-    calls stored; when is the cycle's time, so all calls of one analysis share it.
+    calls stored; when is the cycle's time, so all calls of one analysis share it; manual marks the calls of a manual
+    analysis, which [scan] max_analyses_per_day doesn't count.
     """
 
-    def __init__(self, model: ChatModel, store: Store, *, step: str, when: datetime, ticker: str | None = None) -> None:
+    def __init__(
+        self,
+        model: ChatModel,
+        store: Store,
+        *,
+        step: str,
+        when: datetime,
+        ticker: str | None = None,
+        manual: bool = False,
+    ) -> None:
         self.model = model
         self.name = model.name
         self.answered = 0
@@ -150,6 +163,7 @@ class MeteredModel:
         self._step = step
         self._when = when
         self._ticker = ticker
+        self._manual = manual
 
     def complete(self, system: str, prompt: str, *, json_mode: bool = False) -> str:
         """The wrapped model's reply; the call is recorded whether or not the reply is usable."""
@@ -173,6 +187,7 @@ class MeteredModel:
                 ticker=self._ticker,
                 input_tokens=usage.input_tokens,
                 output_tokens=usage.output_tokens,
+                manual=self._manual,
             )
         except sqlite3.Error as exc:  # bookkeeping must not cost the reply
             log.warning("Couldn't record a call to %s: %s", self.name, exc)
@@ -372,6 +387,11 @@ class Scanner:
 
         fatal: Exception | None = None
         for index, candidate in enumerate(candidates):
+            if self._stopping.is_set():  # the website is shutting down: report what was found, no new model calls
+                left = ", ".join(c.ticker for c in candidates[index:])
+                result.notes.append(f"Stopping: left for the next cycle: {left}")
+                log.info("%s", result.notes[-1])
+                break
             try:
                 opportunity = self._analyze(candidate, now, result=result, currencies=currencies, recipients=recipients)
             except LLMUnavailableError as exc:
@@ -501,12 +521,13 @@ class Scanner:
         )
 
     def _daily_limit(self, candidates: list[Candidate], now: datetime, result: CycleResult) -> list[Candidate]:
-        """The candidates that fit under [scan] max_analyses_per_day (analyses the model answered in the last 24
-        hours, `dip-scanner analyze` included); the rest are noted and stay candidates for a later cycle."""
+        """The candidates that fit under [scan] max_analyses_per_day (the scanner's own analyses the model answered in
+        the last 24 hours: manual ones have limits of their own, and mustn't keep the scanner from the day's dips);
+        the rest are noted and stay candidates for a later cycle."""
         limit = self.config.scan.max_analyses_per_day
         if limit <= 0 or not candidates:
             return candidates
-        done = self.store.analyses_since(now - DAY)
+        done = self.store.analyses_since(now - DAY, include_manual=False)
         room = max(0, limit - done)
         if len(candidates) <= room:
             return candidates
@@ -639,7 +660,14 @@ class Scanner:
                 recipients=recipients,
             )
         else:
-            model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
+            model = MeteredModel(
+                self.analysis_model,
+                self.store,
+                step="analysis",
+                when=now,
+                ticker=candidate.ticker,
+                manual=result is None,
+            )
             try:
                 opportunity = analyze_candidate(
                     model, candidate, fundamentals=fundamentals, extra_news=extra, now=now, sec_ticker=sec_ticker
@@ -671,7 +699,9 @@ class Scanner:
         meters: list[MeteredModel] = []
 
         def meter(model: ChatModel, step: str) -> ChatModel:
-            metered = MeteredModel(model, self.store, step=step, when=now, ticker=candidate.ticker)
+            metered = MeteredModel(
+                model, self.store, step=step, when=now, ticker=candidate.ticker, manual=result is None
+            )
             meters.append(metered)
             return metered
 
@@ -693,7 +723,9 @@ class Scanner:
         for failure in outcome.failures:
             if result is not None:
                 result.notes.append(_failure_note(candidate.ticker, failure))
-            if failure.stage == "opening":
+            if failure.stage == "opening" or (
+                failure.stage == "judge" and isinstance(failure.error, LLMSetupError | ConfigError)
+            ):
                 self._debater_notice(failure, candidate.ticker, now, recipients)
         return outcome.opportunity
 
@@ -710,13 +742,22 @@ class Scanner:
     def _debater_notice(
         self, failure: DebaterFailure, ticker: str, now: datetime, recipients: list[Recipient] | None
     ) -> None:
-        """Tell the recipients that get system notices that a debater failed and the other analyses alone (at most once
-        per provider every 12 hours, notices.send_notice). Never raises."""
+        """Tell the recipients that get system notices that a debater failed and the other analyses alone, or that the
+        judge can't be used (at most once per provider and kind every 12 hours, notices.send_notice). Never raises."""
         if recipients is None:
             notifiers = self.notifiers
         else:
             notifiers = [notifier for r in recipients if r.gets_notices for notifier in r.notifiers]
         try:
+            if failure.stage == "judge":
+                self._notice(
+                    judge_notice_kind(failure.provider),
+                    now,
+                    notifiers,
+                    subject=judge_notice_subject(failure.label),
+                    lines=judge_notice_lines(failure.label, ticker, str(failure.error), now),
+                )
+                return
             self._notice(
                 debater_notice_kind(failure.provider),
                 now,
@@ -783,11 +824,15 @@ class Scanner:
         (only those from recipient.since on), with its own alert state in the database.
 
         Only the newest analysis of a ticker counts: an older unsent one is superseded (never sent, even when the
-        newer analysis isn't an alert). An alert for a ticker already alerted to the recipient within its
-        repeat_hours is only sent when something material changed (see _material); otherwise it is noted and
-        dropped. A new analysis of a ticker alerted to it within THESIS_WINDOW that no longer passes its rules (or
-        whose chance of being higher fell by THESIS_DROP_POINTS) is sent as a "thesis change", so open orders on the
-        earlier idea get reviewed (unless the recipient turned those off).
+        newer analysis isn't an alert). A newer manual analysis ("Analyse now" on the website) is never sent by
+        itself: to a recipient who hasn't had it, it takes the pending alert's place and is judged like one (so a
+        member's click neither loses the others' alert nor sends them a stale verdict); its viewer read it already.
+        An alert for a ticker already alerted to the recipient within its repeat_hours is only sent when something
+        material changed (see _material); otherwise it is noted and dropped. A new analysis of a ticker alerted to it
+        within THESIS_WINDOW that fails a rule the earlier alert passed (or whose chance of being higher fell by
+        THESIS_DROP_POINTS) is sent as a "thesis change", so open orders on the earlier idea get reviewed (unless the
+        recipient turned those off). An alert the scanner sent counts as such even when the recipient's rules got
+        stricter since; a manual analysis they read only when it passes their rules.
 
         Email and generic webhooks get the full report; Slack, Discord and Telegram get the compact short_alert text,
         with amounts in the recipient's currency. Messages count as sent to the recipient when at least one of its
@@ -801,29 +846,34 @@ class Scanner:
         handled: list[Opportunity] = []  # decided not to send: superseded or a repeat
         repeats: list[str] = []
         seen: set[str] = set()
-        for opp in self.store.unnotified(since=since, recipient=recipient.key):  # newest first
-            latest = self.store.last_opportunity(opp.ticker)
-            if opp.ticker in seen or (latest is not None and latest.id != opp.id):
-                handled.append(opp)  # a newer analysis of this ticker exists
+        for pending in self.store.unnotified(since=since, recipient=recipient.key):  # newest first
+            if pending.ticker in seen:
+                handled.append(pending)  # a newer analysis of this ticker was decided on above
                 continue
-            seen.add(opp.ticker)
+            seen.add(pending.ticker)
+            opp, superseded = pending, None
+            latest = self.store.last_opportunity(pending.ticker)
+            if latest is not None and latest.id != pending.id:
+                manual = latest.id is not None and self.store.is_manual(latest.id)
+                if not (manual and self.store.waiting_for(latest.id, recipient=recipient.key)):
+                    handled.append(pending)  # a newer analysis of this ticker was sent or skipped
+                    continue
+                opp, superseded = latest, pending  # a manual analysis this recipient hasn't had takes its place
             previous = self.store.last_alerted(opp.ticker, before=opp.created, recipient=recipient.key)
             if previous is not None and utc(previous.created) < now - THESIS_WINDOW:
                 previous = None
-            if (
-                recipient.thesis_changes
-                and previous is not None
-                and self._passes(previous, recipient)
-                and self._weakened(previous, opp, recipient)
-            ):
+            counts = previous is not None and self._counts_as_alerted(previous, recipient)
+            if recipient.thesis_changes and counts and self._weakened(previous, opp, recipient):
                 changes.append((previous, opp))
             elif self.is_alert(opp, recipient):
                 recent = previous is not None and utc(previous.created) >= now - _repeat_window(recipient)
-                if recent and self._passes(previous, recipient) and not self._material(opp, previous, recipient):
+                if recent and counts and not self._material(opp, previous, recipient):
                     handled.append(opp)
                     repeats.append(f"{opp.ticker} (score {opp.score:.1f}, alerted at {previous.score:.1f})")
                 else:
                     alerts.append(opp)
+            if superseded is not None and opp not in alerts and all(opp is not new for _, new in changes):
+                handled.append(superseded)  # nothing goes out in its place: done (a send waits for the next cycle)
         if repeats:
             result.notes.append(
                 f"Alerted within the last {recipient.alerts.repeat_hours:g}h and nothing material changed, not "
@@ -918,11 +968,19 @@ class Scanner:
             or (previous.stats.currency == opp.stats.currency and further_drop)
         )
 
+    def _counts_as_alerted(self, previous: Opportunity, recipient: Recipient) -> bool:
+        """Whether an earlier analysis the recipient got is an idea they may have acted on: an alert the scanner sent
+        them (whatever their rules say now), or a manual analysis they read that passes their rules."""
+        if previous.id is not None and previous.id in self.store.sent_as_alert([previous.id], recipient=recipient.key):
+            return True
+        return self._passes(previous, recipient)
+
     def _weakened(self, previous: Opportunity, opp: Opportunity, recipient: Recipient) -> bool:
-        """Whether a new analysis undercuts an earlier alert: it doesn't pass the recipient's rules any more, or its
-        chance of being higher in 6 months is THESIS_DROP_POINTS or more lower."""
+        """Whether a new analysis undercuts an earlier alert: it fails one of the recipient's rules that the earlier
+        one passed (score, chance or verdict; rules made stricter since don't count by themselves), or its chance of
+        being higher in 6 months is THESIS_DROP_POINTS or more lower."""
         drop = previous.analysis.probability_up_6m - opp.analysis.probability_up_6m
-        return not self._passes(opp, recipient) or drop >= THESIS_DROP_POINTS
+        return drop >= THESIS_DROP_POINTS or bool(failed_rules(opp, recipient) - failed_rules(previous, recipient))
 
     def _prune(self, now: datetime) -> None:
         if self._last_prune is not None and now - self._last_prune < PRUNE_EVERY:
@@ -1087,6 +1145,19 @@ class Scanner:
 
 
 _NOT_ADVICE = "Not investment advice; check before placing or cancelling any order."
+
+
+def failed_rules(opp: Opportunity, recipient: Recipient) -> set[str]:
+    """The recipient's alert rules an opportunity fails: "score", "probability" and/or "verdict"."""
+    alerts = recipient.alerts
+    failed = set()
+    if opp.score < alerts.min_score:
+        failed.add("score")
+    if opp.analysis.probability_up_6m < alerts.min_probability:
+        failed.add("probability")
+    if opp.analysis.verdict not in alerts.verdicts:
+        failed.add("verdict")
+    return failed
 
 
 def thesis_subject(changes: list[tuple[Opportunity, Opportunity]]) -> str:

@@ -17,7 +17,7 @@ import logging
 import sqlite3
 import threading
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -33,8 +33,17 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 STATES = ("running", "paused", "stopped", "disabled", "stalled")
+# What members read instead of an operator's reason (which names keys, settings and commands they can't change).
+MEMBER_REASONS = {
+    "stopped": "The scanner is stopped for now. The site's admin can see why on the admin page.",
+    "disabled": "The scanner isn't running on this server right now.",
+}
 STALLED_AFTER_INTERVALS = 3
-STOP_TIMEOUT = 10.0  # seconds shutdown() waits for a running cycle; the daemon thread is left behind after that
+# Seconds the website's shutdown waits, all together, for the scanner's cycle and a running manual analysis to finish
+# (a cycle stops between candidates; a debate that has started can take a few minutes of model calls). Only then are
+# the databases closed: work cut off under them would be paid for and lost. Behind the thread is left after that.
+SHUTDOWN_BUDGET = 150.0
+STOP_TIMEOUT = SHUTDOWN_BUDGET  # what shutdown() waits by default
 
 
 def _now() -> datetime:
@@ -73,6 +82,14 @@ class ScannerStatus:
         if self.last_cycle is None:
             return None
         return self.last_cycle.finished or self.last_cycle.started
+
+
+def member_view(status: ScannerStatus) -> ScannerStatus:
+    """The status as a member sees it: a stopped or disabled scanner's reason in plain words (the operator's reason,
+    e.g. "fly secrets set ANTHROPIC_API_KEY=...", is for admins: the admin page shows it)."""
+    if status.state in MEMBER_REASONS:
+        return replace(status, reason=MEMBER_REASONS[status.state])
+    return status
 
 
 class ScannerControl:
@@ -171,12 +188,17 @@ class ScannerControl:
     def _clean(self, text: str) -> str:
         return one_line(scrub(str(text), self._secrets))
 
-    def shutdown(self, timeout: float = STOP_TIMEOUT) -> None:
-        """Ask the loop to stop and wait up to timeout seconds for a running cycle (the website is shutting down)."""
-        thread = self._thread
+    def begin_shutdown(self) -> None:
+        """Ask the loop to stop (the website is shutting down): a cycle that is running stops before its next
+        candidate, reports what it found and ends; no cycle starts after it."""
         self._shutting_down = True
         if self.scanner is not None:
             self.scanner.stop()
+
+    def shutdown(self, timeout: float = STOP_TIMEOUT) -> None:
+        """begin_shutdown() and wait up to timeout seconds for a running cycle."""
+        thread = self._thread
+        self.begin_shutdown()
         if thread is not None and thread.is_alive():
             thread.join(timeout)
             if thread.is_alive():

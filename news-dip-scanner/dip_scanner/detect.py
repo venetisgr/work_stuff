@@ -327,7 +327,9 @@ def _evaluate(
 
     stats: PriceStats | Resolution | None = None
     wanted = scan.cooldown_hours > 0 or scan.reanalyse_same_session_hours > 0
-    last = store.last_opportunity(ticker) if wanted else None
+    # The scanner's own last analysis: a manual one ("Analyse now") neither starts the cooldown nor the same-session
+    # wait, so a member's click can't keep the dip from being analysed and alerted to everybody.
+    last = store.last_opportunity(ticker, include_manual=False) if wanted else None
     if (cooldown := _cooldown(ticker, qualifying, last, scan.cooldown_hours, now)) is not None:
         reacted = False
         if last is not None and last.news_after_session:  # analysed before its news could move the price

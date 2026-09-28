@@ -133,9 +133,9 @@ The settings you are most likely to change in `scanner.toml`:
 |---|---|---|
 | `[scan] interval_minutes` | 5 | Minutes between cycles in `watch`. |
 | `[scan] max_candidates_per_cycle` | 8 | Analyses per cycle; the rest wait for the next cycle (bounds the LLM bill). |
-| `[scan] cooldown_hours` | 24 | A ticker isn't analysed again within this time unless news arrives that the last analysis didn't see, or that analysis came before any trading on its news (weekend news) and the next session moved. |
+| `[scan] cooldown_hours` | 24 | A ticker isn't analysed again within this time unless news arrives that the last analysis didn't see, or that analysis came before any trading on its news (weekend news) and the next session moved. Only the scanner's own analyses count: a manual one ("Analyse now", `analyze`) starts neither this nor the same-session wait, so the scanner still analyses the dip and alerts it to everybody. |
 | `[scan] reanalyse_same_session_hours` | 12 | Until a new session has traded since a ticker's last analysis (news in the evening, at the weekend or later the same day), new news analyses it again at most this often; the rest waits for the next session, and the same news on the same prices is never analysed twice. A further fall of `min_drop_1d_pct` lifts the wait. 0 turns it off. |
-| `[scan] max_analyses_per_day` | 40 | Analyses in any 24 hours, all tickers together; candidates over it are named in the notes and wait for room (0 = no limit). |
+| `[scan] max_analyses_per_day` | 40 | The scanner's analyses in any 24 hours, all tickers together; candidates over it are named in the notes and wait for room (0 = no limit). Manual analyses have limits of their own (`ANALYZE_LIMIT_PER_USER`) and don't count here, so members' clicks can't keep the scanner from the day's dips. |
 | `[dip] min_drop_1d_pct` / `min_drop_5d_pct` / `min_drawdown_20d_pct` | 3 / 6 / 10 | What counts as a dip (any one is enough). |
 | `[dip] min_magnitude`, `directions`, `include_indirect` | 2, negative + mixed, true | Which news can make a company a candidate. |
 | `[universe] watchlist` | none | Tickers that skip the magnitude and relation filters (any negative or mixed news of magnitude 1 or more, direct or indirect). They still need a dip. |
@@ -319,6 +319,7 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 | `dip-scanner users list` | The website's accounts (role, status, last login, alert channels) and unused invites. | no |
 | `dip-scanner users disable EMAIL` / `enable EMAIL` | Disables an account (signed out at once, can't sign in) or enables it again. | no |
 | `dip-scanner users reset-link EMAIL` | Prints a one-time link to choose a new password, valid for 48 hours. | no |
+| `dip-scanner users unlock EMAIL` | Forgets an email address's failed sign-ins (see Limits under Security model), so it can sign in again at once. | no |
 | `dip-scanner backup [--keep 7]` | A consistent copy of the database in `DATA_DIR/backups/scanner-YYYYmmdd-HHMMSS.sqlite3` (UTC), taken while the scanner runs; only the newest copies are kept. | no |
 
 Options for every command: `-v` (debug logging), `--env-file PATH`, `--config PATH`, `--feeds PATH` and
@@ -356,9 +357,11 @@ get one line per opportunity (and a second one for its [debate](#debate), if it 
   older unsent alert is dropped, also when the newer analysis is no longer an alert.
 - **No repeats**: a busy story means a new analysis for every new article, but a ticker alerted within
   `[alerts] repeat_hours` is only alerted again when something material changed (see the table above).
-- **Thesis changes**: when a ticker alerted in the last 6 months is analysed again and no longer passes `[alerts]`,
-  or its chance of being higher fell by 20 points or more, you get a "Thesis change: ... review open orders" notice
-  saying what changed. In `report` and `track`, an older analysis with a newer one is marked superseded.
+- **Thesis changes**: when a ticker alerted in the last 6 months is analysed again and fails a rule of `[alerts]`
+  that the alert passed, or its chance of being higher fell by 20 points or more, you get a "Thesis change: ... review
+  open orders" notice saying what changed. An alert you got counts even when you made your rules stricter since (you
+  may have orders on it); stricter rules alone are no thesis change. In `report` and `track`, an older analysis with a
+  newer one is marked superseded.
 - **Nothing is queued silently**: results of `run --no-notify` or `watch --no-notify`, of cycles run before any
   channel was set up, and of `dip-scanner analyze` (you've just read it) are never sent later.
 - **Each on their own**: on the website every user's alerts follow their own rules, and repeats, retries and thesis
@@ -442,30 +445,40 @@ How one dip is debated (`dip_scanner/debate.py`):
    wouldn't (anyone's score, chance and verdict rules: `[alerts]`, and on the website each user's own). With `when =
    "disagree"` (the default) two analyses that agree are merged and nothing else runs: the shared verdict, the
    average chance (rounded) and target, the lower potential low, entry and confidence, one model's texts, and both
-   models' risks and checks.
+   models' risks and checks. That mix can score below both analyses (the lower low and confidence with the average
+   chance), so when the merged numbers would alert somebody differently from both analyses, they are debated after
+   all.
 3. **Rebuttal** (`rounds`, 1 by default; 0 to 3). Each model sees its own analysis and the other's, which it only
    knows as "the other analyst", and answers with its final analysis, a critique (up to 5 points where the other is
-   wrong, unsupported by the news and data given, or uses figures that aren't in them), its concessions and whether it
+   wrong, unsupported by the news and data given, or uses facts that aren't in them; the other's own levels and
+   chance are estimates, judged against the price data rather than called invented), its concessions and whether it
    changed its mind. It is told to argue from the input only, not to defer to the other or to a consensus, not to split
    the difference, and to change its position only for evidence it had missed.
 4. **Judge.** One model reads the case and the two final analyses with their critiques, and rules: the final
    analysis, a summary of 2-4 sentences (how far they agreed, the crux, how it was settled), the agreement (high,
-   medium or low) and whose case held up better. It sees the two as "Analyst A" and "Analyst B", in an order fixed
-   per stock and day by a hash, so it can't tell which one is its own model. It is told to decide on the evidence and
-   the reasoning, not on confidence, length or majority, to give invented figures no weight, and to lower its
-   confidence and prefer "mixed" or "unclear" when the input can't settle the question. With `LLM_DEBATE_JUDGE`
+   medium or low) and whose case held up better. It sees the two labelled "Analyst A" and "Analyst B", in an order
+   fixed per stock and day by a hash that doesn't say which model wrote which; the models' names are replaced by "the
+   analyst" in both positions (whole words, not when the news itself is about that model, as with a GPT-5 launch),
+   and every model is told not to name itself or guess who wrote the other analysis. It is told to decide on the
+   evidence and the reasoning, not on confidence, length or majority, to give invented facts no weight, and to lower
+   its confidence and prefer "mixed" or "unclear" when the input can't settle the question. With `LLM_DEBATE_JUDGE`
    `alternate` (the default) the two models take turns as judge, by another hash of stock and day, so neither side
    always judges; `openai`, `anthropic` or any `provider:model` fixes the judge.
 5. **Guardrails** on the ruling, listed in the report like other fixed numbers: its chance stays within 5 points of
-   the two models' final chances, its potential low within 5% of the price of theirs, its confidence is at most "low"
-   when their final verdicts are opposite (temporary fear against fundamental damage) and at most "medium" when they
-   otherwise differ, and then the usual checks of [Scoring](#scoring) apply.
+   the two models' final chances, its potential low within 5% of the price of theirs; its confidence is at most "low"
+   when opposite verdicts are involved (temporary fear against fundamental damage, the ruling's own included), at
+   most "medium" when the two final verdicts differ or the ruling's verdict differs from both, and never higher than
+   the more confident of the two; then the usual checks of [Scoring](#scoring) apply. The agreement shown is the
+   lower of the judge's and the one the fixed rules give for the two final analyses, so opposite verdicts never read
+   as "high agreement".
 
 **When a model fails.** When one of the two can't give its first analysis (a refused key, no credit, an outage, an
 unusable reply), the other's analysis stands alone, the report says so, and a notice such as "dip-scanner: Anthropic
 unavailable, analysing with OpenAI only" goes to the alert channels, at most once every 12 hours per provider: the
-scanner keeps running. A failed rebuttal keeps that model's earlier analysis, and a failed judge leaves the two final
-analyses merged by the rule above. Only when both models fail does the analysis fail, as a single model's would.
+scanner keeps running. A failed rebuttal keeps that model's earlier analysis (the idea page and report say so), and
+a failed judge leaves the two final analyses merged by the rule above, except that opposite verdicts merge to
+"unclear" rather than to the more cautious one; a judge that can't be used at all (a wrong `LLM_DEBATE_JUDGE`, a
+refused key) also sends a notice, at most once every 12 hours. Only when both models fail does the analysis fail, as a single model's would.
 
 **Settings.** In `.env` (on Fly.io, `fly.toml`'s `[env]`):
 
@@ -475,8 +488,9 @@ analyses merged by the rule above. Only when both models fail does the analysis 
 | `LLM_DEBATERS` | `openai:gpt-5,anthropic:claude-sonnet-5` | The two models as `provider:model` (`azure:<deployment>` for Azure AI Foundry). Each needs its provider's key: a missing one stops the scanner with a message naming it. |
 | `LLM_DEBATE_JUDGE` | `alternate` | Who rules: `alternate`, `openai` or `anthropic` (that debater's model), or any `provider:model`. |
 
-and `[debate]` in `scanner.toml` (see [Configuration](#configuration)). The debaters and the judge use
-`LLM_ANALYSIS_REASONING_EFFORT` like a single analysis model.
+and `[debate]` in `scanner.toml` (see [Configuration](#configuration)). OpenAI and Azure debaters (and judges) use
+`LLM_ANALYSIS_REASONING_EFFORT` like a single analysis model; Claude runs at its default effort, since the two
+providers' levels differ (`low` to save on GPT-5 would starve Claude, and Claude's `max` is an error for GPT-5).
 
 **Use `when = "disagree"`.** When the two first analyses agree, a rebuttal and a ruling mostly restate them, and they
 cost three more calls. The debate earns its cost on the dips where the models read the news differently, which are
@@ -565,7 +579,8 @@ for itself on an account that size. To keep the bill down:
 - Set `LLM_TRIAGE_REASONING_EFFORT=low`: triage only maps headlines to companies, all day long. If a triage reply
   takes about 1,800 output tokens at the model's default effort instead of 500, the typical month costs about $17
   more. `LLM_ANALYSIS_REASONING_EFFORT=low` makes the analysis cheaper too, at some cost in quality (`medium` only
-  helps with Claude, whose default is high; gpt-5's default is already medium).
+  helps with Claude, whose default is high; gpt-5's default is already medium). In the debate it applies to the
+  OpenAI side only.
 - Use a longer `[scan] interval_minutes` (15 minutes: about 96 triage requests a day) and a lower
   `[scan] max_analyses_per_day`.
 - With the debate, keep `[debate] when = "disagree"` and `rounds = 1`, or go back to `LLM_ANALYSIS_MODE=single`: it
@@ -696,12 +711,12 @@ page of the Fly app; the two halves share one look.
 
 | Page | What it shows |
 |---|---|
-| Ideas (`/`) | The newest analysis of every stock in the last 1, 3, 7 or 30 days, best score first, with filters for the score, the verdict, your watchlist and your alert rules (★ marks your watchlist, ✓ what passes your rules). The scanner's status, a ticker lookup, and "thesis changes": newer analyses that undercut an idea that passed your rules, so you can review open orders. |
+| Ideas (`/`) | The newest analysis of every stock in the last 1, 3, 7 or 30 days, best score first, with filters for the score, the verdict, your watchlist and your alert rules (★ marks your watchlist, ✓ what passes your rules). The scanner's status, a ticker lookup, and "thesis changes" under the filters: newer analyses that undercut an idea you were alerted about (even if your rules changed since) or that passed your rules after you joined, so you can review open orders; none when you turned thesis changes off. |
 | An idea (`/ideas/N`) | What the report shows: verdict, confidence, chance up, score, the levels (target, price, entry, potential and statistical low) in the trading currency and about yours, a 6-month price chart with those levels (a table of the closes under it), the [debate](#debate) when there was one (each model's first and final position with what changed, its critique of the other and what it accepted, and the judge's ruling), the analysis, what to check, risks and catalysts, the headlines, the outcome so far (as in `track`), and every analysis of the stock. "Analyse again now" and the watchlist button. |
 | A stock (`/tickers/AMD`) | Price statistics and whether they count as a dip, a 6-month chart with the newest idea's levels, its ideas and 30 days of its news. Add it to your watchlist, or analyse it now. |
 | News (`/news`) | The news digest ("newsletter") of the last 6, 24 or 72 hours: the companies in the news, most worrying first, then every article with the companies the model linked to it and why. |
 | Track record (`/track`) | `dip-scanner track` for the last 30 days to 2 years, with the returns also in your currency, and the debate's model scoreboard once there were debates. Prices are downloaded at most once an hour. |
-| Settings (`/settings`) | Your alert rules, watchlist, channels, currency, time zone and name; a test alert; your password and your other signed-in devices. |
+| Settings (`/settings`) | Your alert rules, watchlist, channels, currency, time zone and name; "Save and send a test alert" (it saves what is on the screen, then tries each channel and says how each went at the top of the page); your password and your other signed-in devices. A Slack or Discord webhook address gets its service's format whatever the menu says. |
 | Admin (`/admin`) | For admins: the scanner (pause, resume, run a cycle now, start again after a setup problem), the recent cycles with their notes, the model's use today and in the last 7 days with its estimated cost (at the list prices under [Costs](#costs)), and the health of every feed. Users: roles, disabling, password links. Invites: create, revoke, see who used them. |
 
 Behind the [Vercel front door](#the-vercel-front-door) the ideas and an idea's page are its React versions, with the
@@ -710,7 +725,12 @@ same content (the ideas as a table on a wide screen); every other page is the Fl
 "Analyse now" asks the model about one stock at once, whatever its price did, like `dip-scanner analyze`. Analyses
 run one at a time in the background; the page says how it is going and opens the idea when it is ready. A member can
 start `ANALYZE_LIMIT_PER_USER` (5) in 24 hours and an admin as many as they like, everybody at most 10 in 10 minutes.
-Each one costs an analysis on the model bill.
+Each one costs an analysis on the model bill; one that fails before the model is asked (no prices for the symbol,
+Yahoo unreachable, a setup problem, a restart of the website) doesn't count, and a stock without prices offers no
+"Analyse now" at all (its page names the symbol the scanner found instead, when there is one). A manual analysis isn't
+sent to anybody by itself, and it doesn't hold the scanner back: a dip is still analysed and alerted as usual. When
+it is newer than an alert still waiting for someone (a channel that failed, or a cycle that is still running), it
+takes that alert's place for them, judged by their rules, so nobody is sent the older analysis or nothing at all.
 
 **Roles.** There is no sign-up page. People come in through invite links: single use, valid for 7 days, made on the
 admin page or with `dip-scanner users invite`, and optionally only for one email address. A **member** uses the pages
@@ -727,7 +747,7 @@ the database keeps only a fingerprint of it. With `SMTP_*` set, the site can ema
   `scanner.toml`'s for everybody.
 - Channels: email to the account's address through the server's `SMTP_*` settings, Telegram to their own chat id
   through the server's `TELEGRAM_BOT_TOKEN` (each offered only when the server has it), and their own Slack, Discord
-  or generic webhook. "Send a test alert" tries each one and says how it went.
+  or generic webhook. "Save and send a test alert" tries each one and says how it went.
 - Repeats, retries and thesis changes are counted per user, as described under [Output](#output): one user's channel
   being down never marks another's alert as sent. A user's alerts start when they set up their first channel; ideas
   from before are never sent late.
@@ -785,11 +805,13 @@ of it. The site also works on Fly alone, without Vercel.
       Settings page after signing in; the server needs no email or Telegram settings.
 - [ ] **GitHub:** a `main` branch made the default branch (and protected), and the `FLY_API_TOKEN` repository secret
       (`fly tokens create deploy`): every push to `main` then deploys Fly, and Vercel deploys `main` too.
-- [ ] **Fly secrets:** `SECRET_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `SEC_USER_AGENT`; then, for the front
-      door, `PROXY_SECRET`, `BASE_URL` (the Vercel address) and optionally `TRUSTED_ORIGINS` (preview deployments).
+- [ ] **Fly secrets:** `SECRET_KEY`, `BASE_URL` (`https://<your-app>.fly.dev` to begin with: the admin command
+      below needs it for its link), `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `SEC_USER_AGENT`; then, for the front
+      door, `PROXY_SECRET`, `BASE_URL` changed to the Vercel address, and optionally `TRUSTED_ORIGINS` (preview
+      deployments).
 - [ ] **Vercel project:** Root Directory `news-dip-scanner/frontend`, production branch `main`, and the environment
       variables `DIP_API_ORIGIN` (`https://<your-app>.fly.dev`) and `DIP_PROXY_SECRET` (the same value as
-      `PROXY_SECRET`) for Production and Preview, marked Sensitive.
+      `PROXY_SECRET`, marked Sensitive) for Production and Preview.
 - [ ] **Your admin account:** `fly ssh console -C "dip-scanner users add-admin you@example.com"`, the printed link to
       set your password, and then invites for your friends from the admin page.
 
@@ -863,7 +885,11 @@ sends messages to addresses users give it and can spend the model budget, so:
   The database keeps only its SHA-256 hash; it lasts 30 days from the last visit. Signing out, a new password and
   disabling an account end sessions at once, and a disabled user is signed out on their next request.
 - **Links.** Invite (7 days) and setup or reset links (48 hours) work once and are random 32-byte tokens, stored only
-  as hashes and never written to the log; the link pages keep the token out of the `Referer` header.
+  as hashes and never written to the log; the link pages keep the token out of the `Referer` header. A link made by
+  an admin only works while its maker is an enabled admin: disabling an admin, or making them a member, revokes the
+  unused invites and password links they made (so a rogue admin can't keep a reset link for the owner's account).
+  The Users page lists the password links that still work, and revokes any of them; the Invites page does the same
+  for invites.
 - **Forms.** Every change is a POST carrying a token (the session's, or before signing in a signed double-submit
   token; the JSON API's "Analyse again" sends the session's in an `X-CSRF-Token` header), and a POST from another
   site (by its `Origin` or `Referer` header, compared with `BASE_URL` and `TRUSTED_ORIGINS`) is refused. `next=`
@@ -885,9 +911,14 @@ sends messages to addresses users give it and can spend the model budget, so:
   for the browser, which keeps the `SameSite=Lax` session cookie out of posts from another one, and every change also
   needs the session's token, which another site can't read. List exact addresses (a branch's
   `…-git-main-…vercel.app`) when that is enough, and protect previews with Vercel's Deployment Protection.
-- **Limits.** 10 failed sign-ins in 15 minutes lock that email address and that network address for 15 minutes;
-  invite and password link pages, test alerts (5 in 15 minutes), "Analyse now" and "Run a cycle now" have limits of
-  their own.
+- **Limits.** 10 failed sign-ins in 15 minutes from one network address (an IPv6 address counts by its /64) lock that
+  address for 15 minutes. Failures only lock an email address for the address they came from, so somebody who knows
+  your email can't keep you out by sending wrong passwords from elsewhere; a ceiling of 100 failures an hour per
+  email address from anywhere still stops guessing spread over many addresses. Signing in, or using a password or
+  invite link, forgets that email's failures; `dip-scanner users unlock EMAIL` does too. Changing your password on
+  the settings page counts wrong current passwords per account. Invite and password link pages, test alerts (5 in 15
+  minutes), stock pages (40 in 15 minutes for a member: each new symbol asks Yahoo Finance from the scanner's own
+  address), "Analyse now" and "Run a cycle now" have limits of their own.
 - **Pages.** A strict Content-Security-Policy (`script-src 'self'`, no inline scripts, styles or event handlers),
   HSTS over https, no framing, `nosniff`, `Referrer-Policy: same-origin`, and error pages without technical details.
   Headlines, article summaries, the model's text and user names are always escaped; links go only to `http` and
@@ -895,8 +926,12 @@ sends messages to addresses users give it and can spend the model budget, so:
 - **Webhooks.** A user's webhook must be `https://`, without a user name or password in it, and its host must resolve
   only to public addresses: loopback, private, link-local (169.254.169.254, the cloud metadata address), shared
   (100.64.0.0/10), `fc00::/7`, Fly's private `fdaa::/16` and internal names are refused. It is checked when saved and
-  again before every message (so a DNS change can't point it inside later), redirects aren't followed, and a failed
-  delivery's error doesn't repeat the service's reply.
+  again before every message, and each connection looks the host up once and goes to the public address it checked
+  (so a name that answers a public address to the check and a private one a moment later, DNS rebinding, still can't
+  reach inside). Redirects aren't followed, and a failed delivery's error names neither the service's reply nor the
+  connection error's details (they go to the log). A whole send gets 30 seconds, of which only the first 64 KB of a
+  reply are read; a webhook that is still stuck on the previous message is skipped until it lets go, so a server that
+  answers a byte at a time can't hold up the scanner or anybody else's alerts.
 - **Secrets.** Keys live in `.env` or the environment (on Fly, `fly secrets`); `.dockerignore` keeps `.env` out of the
   image, and the notices, cycle records and error messages leave keys, passwords and tokens out.
 - **Behind Fly.io's proxy**, the server trusts `X-Forwarded-Proto` and `X-Forwarded-For` from any address, which is

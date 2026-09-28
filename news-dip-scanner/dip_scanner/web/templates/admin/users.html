@@ -72,10 +72,40 @@
 {{ ui.empty_state("No accounts", "Invite someone to create the first one.", "/admin/invites", "Invite someone") }}
 {% endif %}
 
+{% if password_links %}
+<section class="card card-flush" aria-labelledby="links-title" id="password-links">
+  <div class="card-header"><h2 id="links-title" class="section-title">Password links that still work</h2></div>
+  <div class="table-wrap">
+    <table class="table table-stack">
+      <thead>
+        <tr>
+          <th scope="col">For</th>
+          <th scope="col">Kind</th>
+          <th scope="col">Made by</th>
+          <th scope="col">Expires</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in password_links %}
+        <tr>
+          <td class="primary"><strong>{{ row.link.user.email }}</strong></td>
+          <td data-label="Kind">{{ "Setup" if row.link.purpose == "setup" else "Reset" }}</td>
+          <td data-label="Made by">{{ row.created_by or "the command line" }}</td>
+          <td data-label="Expires">{{ ui.time(row.link.expires) }}</td>
+          <td class="actions" data-label="">{{ ui.post_button("/admin/users/password-links/revoke", "Revoke", css="btn btn-small btn-danger", confirm="Revoke this link for " ~ row.link.user.email ~ "? It stops working at once.", fields={"link": row.link.token_hash}) }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endif %}
+
 <div class="card stack-sm admin-help small">
   <h2 class="section-title">What these do</h2>
   <p><strong>Reset link</strong> (or <strong>Setup link</strong> for an account without a password): a link to choose a password, valid once for 48 hours. It is shown to you once, to send to the person yourself; using it signs them out everywhere.</p>
-  <p><strong>Disable</strong>: signs the person out at once; they can't sign in and get no alerts until the account is enabled again. Nothing of theirs is deleted.</p>
-  <p><strong>Make admin</strong>: admins see these pages, invite people and control the scanner. The last admin who can sign in can't be made a member or disabled.</p>
+  <p><strong>Disable</strong>: signs the person out at once; they can't sign in and get no alerts until the account is enabled again, and the unused invite and password links they made stop working for good. Nothing of theirs is deleted.</p>
+  <p><strong>Make admin</strong>: admins see these pages, invite people and control the scanner. The last admin who can sign in can't be made a member or disabled. An admin made a member loses the unused links they made, too.</p>
 </div>
 {% endblock %}

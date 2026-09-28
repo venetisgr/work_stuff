@@ -68,6 +68,8 @@ from .account import change_watchlist
 from .app import paginate, redirect, render
 from .charts import Level, PriceChart, day_text, price_chart
 from .context import AppContext
+from .control import member_view
+from .jobs import MEMBER_UNAVAILABLE
 
 log = logging.getLogger(__name__)
 
@@ -81,8 +83,12 @@ DEFAULT_DAYS = 7
 SCORE_CHOICES = (50, 65, 80)  # the report's score bands
 SORTS = {"score": "Best score first", "new": "Newest first"}
 PAGE_SIZE = 25
+# Stock pages a member may open in TICKER_WINDOW (admins: no limit). Each new symbol costs two Yahoo requests from
+# the scanner's own address: a script running through made-up symbols would get it throttled for everybody.
+TICKER_LIMIT = 40
+TICKER_WINDOW = timedelta(minutes=15)
 THESIS_DAYS = 7  # thesis changes of this many days are shown on the dashboard
-THESIS_SHOWN = 5
+THESIS_SHOWN = 2  # of them in full; the rest behind "Show all"
 # The news
 NEWS_HOURS = (6, 24, 72)
 DEFAULT_NEWS_HOURS = 24
@@ -217,12 +223,19 @@ def newest_per_ticker(opps: Sequence[Opportunity]) -> tuple[list[Opportunity], d
     return ordered, counts
 
 
+def unavailable_note(ctx: AppContext, user: User) -> str:
+    """Why "Analyse now" doesn't work here: the operator's reason for admins, plain words for members."""
+    if user.is_admin:
+        return ctx.jobs.unavailable or "Manual analyses aren't available on this server."
+    return MEMBER_UNAVAILABLE
+
+
 def _analyse_info(ctx: AppContext, user: User) -> dict[str, Any]:
     """What the "Analyse now" buttons need: whether analyses run here, and how many the user has left."""
     remaining = ctx.jobs.remaining(user)
     note = None
     if not ctx.jobs.available:
-        note = ctx.jobs.unavailable or "Manual analyses aren't available on this server."
+        note = unavailable_note(ctx, user)
     elif remaining == 0:
         limit = ctx.jobs.limit_for(user)
         note = (
@@ -516,6 +529,39 @@ def readable_reason(text: str | None) -> str | None:
     return text if text.endswith((".", "!", "?")) else text + "."
 
 
+_MEMBER_REASONS = (
+    (
+        re.compile(r"^(?P<a>\S+) failed, so (?P<b>\S+) analysed it alone\b"),
+        "{a} was unavailable, so {b} analysed it alone.",
+    ),
+    (
+        re.compile(r"^The judge (?P<a>\S+) failed\b"),
+        "The judge {a} was unavailable, so the two final positions were merged by rule.",
+    ),
+    (
+        re.compile(r"^(?P<a>\S+)'s rebuttal(?: in round \d+)? failed\b"),
+        "{a}'s rebuttal didn't come, so its earlier position stands.",
+    ),
+)
+
+
+def member_reason(text: str | None) -> str | None:
+    """A debate's reason for members: what happened, in the models' names, without the operator's detail (the
+    provider's error and hints such as "Check ANTHROPIC_API_KEY", which only an admin can act on)."""
+    parts = [" ".join(part.split()) for part in (text or "").split("; ") if part.strip()]
+    sentences = []
+    for part in parts:
+        for pattern, wording in _MEMBER_REASONS:
+            match = pattern.match(part)
+            if match:
+                names = {key: model_display_name(value) for key, value in match.groupdict().items()}
+                sentences.append(wording.format(**names))
+                break
+        else:
+            sentences.append("One of the models was unavailable.")
+    return " ".join(dict.fromkeys(sentences)) or None
+
+
 def _how(debate: Debate, names: list[str], judge: str | None) -> str | None:
     """How the debate went, in a sentence (None for a lone model: its callout says what happened)."""
     both = " and ".join(names)
@@ -532,8 +578,10 @@ def _how(debate: Debate, names: list[str], judge: str | None) -> str | None:
     return f"{both} analysed it separately, and {judge} ruled on their analyses without a rebuttal."
 
 
-def debate_view(opp: Opportunity) -> DebateView | None:
-    """The idea page's debate card, or None for a single model's analysis (and records from before debates)."""
+def debate_view(opp: Opportunity, *, admin: bool = False) -> DebateView | None:
+    """The idea page's debate card, or None for a single model's analysis (and records from before debates). Its
+    reason has the provider's error for admins (readable_reason), what happened in plain words for members
+    (member_reason)."""
     debate = opp.debate
     if debate is None or not debate.participants:
         return None
@@ -563,17 +611,14 @@ def debate_view(opp: Opportunity) -> DebateView | None:
     elif debate.mode == "debate":
         ruling_title = f"The ruling by {judge}"
         favoured = names.get(debate.favoured, model_display_name(debate.favoured)) if debate.favoured else None
-        own = debate.judge in names
-        judge_note = (
-            (f"It found {favoured}'s case stronger. " if favoured else "It favoured neither side. ")
-            + "It saw the two only as Analyst A and Analyst B"
-            + (", so it couldn't tell which one was its own model." if own else ", without their names.")
+        judge_note = (f"It found {favoured}'s case stronger. " if favoured else "It favoured neither side. ") + (
+            "It saw the two labelled Analyst A and Analyst B, in an order that doesn't say which model wrote which."
         )
     return DebateView(
         debate=debate,
         title="The models" if debate.mode == "single" else "The debate",
         how=_how(debate, [names[side.model] for side in debate.participants], judge),
-        reason=readable_reason(debate.reason),
+        reason=readable_reason(debate.reason) if admin else member_reason(debate.reason),
         line=debate_line(opp),
         sides=sides,
         ruling_title=ruling_title,
@@ -605,10 +650,18 @@ class ThesisChange:
 
 
 def thesis_changes(ctx: AppContext, user: User, *, now: datetime, days: int = THESIS_DAYS) -> list[ThesisChange]:
-    """The tickers analysed in the last days whose newest analysis undercuts an earlier one (within 6 months) that
-    passed the user's rules: it no longer passes them, or its chance of being higher fell by THESIS_DROP_POINTS or
-    more. Newest first. The same test as the scanner's "thesis change" notices, whether or not the user has alerts."""
+    """The tickers analysed in the last days whose newest analysis undercuts an earlier idea (within 6 months) that
+    the user may have acted on: it fails one of their rules the earlier idea passed, or its chance of being higher fell
+    by THESIS_DROP_POINTS or more. Newest first; [] when the user turned thesis changes off.
+
+    An earlier idea counts when the scanner sent it to them as an alert (whatever their rules say now), or when it
+    passes their rules and they saw it: it reached them (a manual analysis they read), or it came after they joined
+    (members without an alert channel follow the ideas here). Ideas from before somebody joined that nobody sent them
+    never do: a new member isn't told to review orders they can't have placed."""
+    if not user.settings.thesis_changes:
+        return []
     recent, _ = newest_per_ticker(ctx.store.opportunities(since=now - timedelta(days=days)))
+    joined = utc(user.created)
     changes = []
     for current in recent:
         earlier = [
@@ -616,11 +669,21 @@ def thesis_changes(ctx: AppContext, user: User, *, now: datetime, days: int = TH
             for opp in ctx.store.opportunities(ticker=current.ticker, since=now - THESIS_WINDOW, limit=IDEA_HISTORY)
             if (utc(opp.created), opp.id or 0) < (utc(current.created), current.id or 0)
         ]
-        previous = next((opp for opp in earlier if _passes(opp, user)), None)
+        ids = [opp.id for opp in earlier if opp.id is not None]
+        sent = ctx.store.sent_as_alert(ids, recipient=user.recipient_key)
+        reached = ctx.store.alerted_ids(ids, recipient=user.recipient_key)
+        previous = next(
+            (
+                opp
+                for opp in earlier
+                if opp.id in sent or ((opp.id in reached or utc(opp.created) >= joined) and _passes(opp, user))
+            ),
+            None,
+        )
         if previous is None:
             continue
         drop = previous.analysis.probability_up_6m - current.analysis.probability_up_6m
-        if not _passes(current, user):
+        if _failed_rules(current, user) - _failed_rules(previous, user):
             reason = "no longer passes your alert rules"
         elif drop >= THESIS_DROP_POINTS:
             reason = f"its chance of being higher fell by {drop} points"
@@ -628,6 +691,19 @@ def thesis_changes(ctx: AppContext, user: User, *, now: datetime, days: int = TH
             continue
         changes.append(ThesisChange(previous=previous, current=current, reason=reason))
     return changes
+
+
+def _failed_rules(opp: Opportunity, user: User) -> set[str]:
+    """The user's alert rules an idea fails: "score", "probability" and/or "verdict"."""
+    chosen = user.settings
+    failed = set()
+    if opp.score < chosen.min_score:
+        failed.add("score")
+    if opp.analysis.probability_up_6m < chosen.min_probability:
+        failed.add("probability")
+    if opp.analysis.verdict not in chosen.verdicts:
+        failed.add("verdict")
+    return failed
 
 
 # --- the dashboard -------------------------------------------------------------------------------------------------
@@ -638,6 +714,7 @@ def dashboard(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Response:
     """The ideas: the newest analysis of every stock analysed in the last days, filtered and ranked, with the
     scanner's status and recent thesis changes."""
     now = ctx.now()
+    status = ctx.control.status(now=now)
     query = request.query_params
     days = _choice(query.get("days"), DAY_CHOICES, DEFAULT_DAYS)
     min_score = _choice(query.get("score"), SCORE_CHOICES, None)
@@ -667,7 +744,7 @@ def dashboard(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Response:
         request,
         "pages/dashboard.html",
         {
-            "status": ctx.control.status(now=now),
+            "status": status if user.is_admin else member_view(status),
             "calls_today": sum(row.calls for row in ctx.store.model_usage(since=_utc_midnight(now))),
             "ideas": [opp.in_currency(currency) for opp in shown],
             "debate_lines": debate_lines(shown),
@@ -677,7 +754,13 @@ def dashboard(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Response:
             "shown": len(ideas),
             "watchlist": watchlist,
             "matching": {opp.id for opp in ideas if matches_rules(opp, user, ctx.config)},
-            "changes": thesis_changes(ctx, user, now=now)[:THESIS_SHOWN],
+            "changes": [
+                replace(
+                    change, previous=change.previous.in_currency(currency), current=change.current.in_currency(currency)
+                )
+                for change in thesis_changes(ctx, user, now=now)
+            ],
+            "changes_shown": THESIS_SHOWN,
             "filters": {
                 "days": days,
                 "score": min_score,
@@ -722,7 +805,7 @@ def idea(request: Request, opportunity_id: int, user: auth.SignedIn, ctx: auth.C
             "newer": newest if newest.id != opp.id else None,
             "history": [item.in_currency(currency) for item in history],
             "debate_lines": debate_lines(history),
-            "debate": debate_view(view),
+            "debate": debate_view(view, admin=user.is_admin),
             "ladder": ladder(opp),
             "prices": prices,
             "outcome": prices.outcome,
@@ -730,7 +813,7 @@ def idea(request: Request, opportunity_id: int, user: auth.SignedIn, ctx: auth.C
             "status_badges": STATUS_BADGES,
             "index_name": index_name(prices.outcome.benchmark if prices.outcome else None),
             "misses": rule_misses(opp, user, ctx.config),
-            "on_watchlist": opp.ticker in user.settings.watchlist,
+            "on_watchlist": opp.ticker in watchlist_of(user, ctx.config),
             "analyse": _analyse_info(ctx, user),
             "nav": "ideas",
             "page_title": f"{opp.ticker}: {verdict_label(opp.analysis.verdict)}",
@@ -774,15 +857,32 @@ def ticker(request: Request, symbol: str, user: auth.SignedIn, ctx: auth.Ctx) ->
     wanted = _symbol_or_404(symbol)
     if wanted != symbol:
         return redirect(request, ticker_path(wanted))
+    if not user.is_admin and ctx.accounts.rate_limited(f"tickers:{user.id}", limit=TICKER_LIMIT, window=TICKER_WINDOW):
+        raise HTTPException(
+            status_code=429,
+            detail=f"You opened {TICKER_LIMIT} stock pages in the last 15 minutes. Wait a little and try again.",
+            headers={"Retry-After": str(int(TICKER_WINDOW.total_seconds()))},
+        )
     now = ctx.now()
     preferred = ctx.config.universe.preferred_listings
     stats: PriceStats | None = None
     price_problem = None
+    no_prices = False
     try:
         stats = ctx.prices.stats(wanted, now=now)
+    except PriceError as exc:  # not a Yahoo outage: this symbol has none (delisted, renamed, mistyped)
+        price_problem = _problem(exc, f"the prices of {wanted}")
+        no_prices = True
     except Exception as exc:
         price_problem = _problem(exc, f"the prices of {wanted}")
     dip = dip_reasons(stats, ctx.config.dip, now=now) if stats is not None else []
+    analyse = _analyse_info(ctx, user)
+    replacement = None
+    if no_prices:
+        found = ctx.store.resolved_symbol(wanted, now=now)
+        replacement = found[0] if found is not None and found[0] != wanted else None
+        # An analysis would fail at once (and a member's retries would only cost them); say so instead.
+        analyse = {**analyse, "available": False, "note": f"{wanted} can't be analysed without prices."}
     ideas = ctx.store.opportunities(ticker=wanted, limit=TICKER_IDEAS_SHOWN)
     news = ctx.store.news(
         now - timedelta(days=TICKER_NEWS_DAYS), wanted, also=symbol_aliases(ctx.store, wanted, preferred, now=now)
@@ -841,8 +941,10 @@ def ticker(request: Request, symbol: str, user: auth.SignedIn, ctx: auth.Ctx) ->
             "news": news,
             "news_days": TICKER_NEWS_DAYS,
             "preferred": preferred.get(wanted),
-            "on_watchlist": wanted in user.settings.watchlist,
-            "analyse": _analyse_info(ctx, user),
+            "replacement": replacement,
+            "no_prices": no_prices,
+            "on_watchlist": preferred.get(wanted, wanted) in watchlist_of(user, ctx.config),
+            "analyse": analyse,
             "nav": "ideas",
             "page_title": wanted,
         },

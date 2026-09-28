@@ -8,7 +8,9 @@ log. Three kinds of notice go to every configured channel:
 - MODEL_UNAVAILABLE: the model couldn't be used for [alerts] notice_after_cycles cycles in a row;
 - FEEDS_FAILING: every feed failed for that many cycles in a row;
 - DEBATER_UNAVAILABLE (one kind per provider, debater_notice_kind): with LLM_ANALYSIS_MODE=debate, one of the two
-  models failed and the other analysed a dip alone (debate.py), so the scanner goes on without the debate.
+  models failed and the other analysed a dip alone (debate.py), so the scanner goes on without the debate;
+- JUDGE_UNAVAILABLE (one kind per provider, judge_notice_kind): the debate's judge can't be used at all (a wrong
+  LLM_DEBATE_JUDGE model, a rejected key, no credit), so every disagreement is merged by rule instead of judged.
 
 Each kind goes out at most once every NOTICE_REPEAT (12 hours). The times are kept in the database, so cron runs (a
 new process every 5 minutes) don't repeat a notice either; one that no channel took is tried again after
@@ -40,6 +42,7 @@ STOPPED = "stopped"
 MODEL_UNAVAILABLE = "model_unavailable"
 FEEDS_FAILING = "feeds_failing"
 DEBATER_UNAVAILABLE = "debater_unavailable"
+JUDGE_UNAVAILABLE = "judge_unavailable"
 NOTICE_REPEAT = timedelta(hours=12)
 NOTICE_RETRY = timedelta(hours=1)  # after an attempt no channel took
 FOOTER = "A notice of this kind is sent at most once every 12 hours. Set [alerts] system_notices = false to stop them."
@@ -158,6 +161,26 @@ def debater_notice_lines(failed: str, other: str | None, ticker: str, reason: st
         "The scanner keeps running: each dip is still analysed, by one model instead of two, until the other answers "
         "again (the reports say so for every analysis concerned). Check that provider's status page, its API key and "
         "its credit or spend limit.",
+    ]
+
+
+def judge_notice_kind(provider: str) -> str:
+    """The notice kind for a judge of a provider that can't be used: rate-limited per provider."""
+    return f"{JUDGE_UNAVAILABLE}:{provider}"
+
+
+def judge_notice_subject(judge: str) -> str:
+    """ "dip-scanner: the debate's judge (Anthropic) can't be used" (judge is "provider:model")."""
+    return f"dip-scanner: the debate's judge ({provider_name(judge)}) can't be used"
+
+
+def judge_notice_lines(judge: str, ticker: str, reason: str, now: datetime) -> list[str]:
+    """The body of a JUDGE_UNAVAILABLE notice."""
+    return [
+        f"The debate's judge {judge} couldn't be used for {ticker} at {format_when(now)} ({one_line(reason)}), so the "
+        "two analysts' final positions were merged by rule instead of judged.",
+        "Every disagreement is merged that way until the judge works again. Check LLM_DEBATE_JUDGE (the model's "
+        "name), that provider's API key and its credit or spend limit.",
     ]
 
 

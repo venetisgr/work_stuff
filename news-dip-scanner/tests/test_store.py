@@ -479,7 +479,7 @@ def test_a_version_1_database_gets_the_alerted_column(tmp_path):
 
     with Store(path) as store:
         assert store.last_alerted("AMD") is not None
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
 
 
 def test_a_version_4_database_forgets_its_symbol_lookups(tmp_path):
@@ -593,7 +593,7 @@ def test_a_version_5_database_is_upgraded_and_keeps_its_alert_state(tmp_path):
     conn.close()
 
     with Store(path) as store:
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
         tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
         assert {
             "alert_deliveries", "users", "invites", "sessions", "password_tokens", "login_attempts", "jobs",
@@ -722,7 +722,7 @@ def test_prune_clears_old_website_records_but_keeps_sent_alerts(store):
         conn.execute(
             "INSERT INTO invites (token_hash, role, created, expires) VALUES ('i', 'member', ?, ?)", (_t(old), _t(old))
         )
-        conn.execute("INSERT INTO password_tokens VALUES ('p', 1, 'reset', ?, ?, NULL)", (_t(old), _t(old)))
+        conn.execute("INSERT INTO password_tokens VALUES ('p', 1, 'reset', ?, ?, NULL, NULL)", (_t(old), _t(old)))
 
     store.prune(older_than=NOW - timedelta(days=30))
 
@@ -736,3 +736,67 @@ def test_prune_clears_old_website_records_but_keeps_sent_alerts(store):
 
 def _t(dt):
     return dt.isoformat(timespec="microseconds")
+
+
+# --- version 7: manual analyses, why jobs failed, who made a password link --------------------------------------------
+
+
+def version_6_database(path):
+    """A version 6 database as the Store of then made it: a manual analysis (made by job 1), the scanner's own, and
+    an unused password link."""
+    with Store(path) as store:
+        manual = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=2)))
+        own = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=1)))
+        with store.transaction() as conn:
+            conn.execute(
+                "INSERT INTO jobs (user_id, kind, ticker, status, created, opportunity_id) "
+                "VALUES (1, 'analyze', 'AMD', 'done', ?, ?)",
+                (_t(NOW), manual.id),
+            )
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        "ALTER TABLE opportunities DROP COLUMN manual; ALTER TABLE jobs DROP COLUMN failure; "
+        "ALTER TABLE password_tokens DROP COLUMN created_by; PRAGMA user_version = 6;"
+    )
+    conn.execute(
+        "INSERT INTO password_tokens VALUES ('p', 1, 'reset', ?, ?, NULL)", (_t(NOW), _t(NOW + timedelta(hours=48)))
+    )
+    conn.commit()
+    conn.close()
+    return manual, own
+
+
+def test_a_version_6_database_learns_which_analyses_were_manual(tmp_path):
+    path = tmp_path / "v6.sqlite3"
+    manual, own = version_6_database(path)
+    with Store(path) as store:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 7
+        assert store.is_manual(manual.id) and not store.is_manual(own.id)
+        assert {row[1] for row in store.query("PRAGMA table_info(jobs)")} >= {"failure"}
+        # An unused link of before: nobody knows who made it, so it no longer works.
+        [token] = store.query("SELECT used_at, created_by FROM password_tokens")
+        assert token["used_at"] is not None and token["created_by"] is None
+
+
+def test_manual_analyses_are_marked_and_the_scanner_can_look_past_them(store):
+    own = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=3)))
+    manual = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=1)), manual=True)
+    assert store.is_manual(manual.id) and not store.is_manual(own.id)
+    assert store.last_opportunity("AMD") == manual
+    assert store.last_opportunity("amd", include_manual=False) == own
+    assert store.last_opportunity("NVDA", include_manual=False) is None
+
+
+def test_which_alerts_the_scanner_sent_and_who_is_still_waiting(store):
+    sent = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=3)))
+    read = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=2)), manual=True)
+    store.record_deliveries("user:1", [sent.id], "alert", when=NOW, sent=True)
+    store.mark_notified([read.id], when=NOW, sent=False)
+    store.record_deliveries("user:1", [read.id], "alert", when=NOW, sent=True)  # read on the website
+    assert store.sent_as_alert([sent.id, read.id], recipient="user:1") == {sent.id}
+    assert store.sent_as_alert([sent.id], recipient="user:2") == set()
+    assert not store.waiting_for(sent.id, recipient="user:1") and store.waiting_for(sent.id, recipient="user:2")
+    store.record_deliveries("user:2", [sent.id], "alert", when=NOW, sent=False, detail="down")
+    assert store.waiting_for(sent.id, recipient="user:2")  # a failed attempt still waits
+    store.record_deliveries("user:2", [sent.id], "handled", when=NOW, sent=False)
+    assert not store.waiting_for(sent.id, recipient="user:2")

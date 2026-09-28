@@ -212,8 +212,9 @@ fly ssh console -C "dip-scanner users invite friend@example.com"
 ```
 
 There is no sign-up page. Each person then sets up their watchlist, alert rules, currency, time zone and alert
-channels under Settings, and "Send test alert" checks the channels. The Users page disables accounts, changes roles
-and makes password links for people who forgot theirs.
+channels under Settings, and "Save and send a test alert" checks the channels. The Users page disables accounts,
+changes roles, makes password links for people who forgot theirs and lists the links that still work (to revoke one).
+Disabling an admin, or making them a member, also revokes the unused invite and password links they made.
 
 **Alerts on the phone through Slack or Discord.** The usual channel is a webhook of one's own, which posts into a
 Slack or Discord channel; the Slack or Discord app on the phone then shows each alert as a notification. Each person
@@ -228,10 +229,10 @@ reading, so its labels are as guides quoting it give them):
   **Integrations**, **Webhooks**, **New Webhook** (or **Create Webhook**), and **Copy Webhook URL**. It starts with
   `https://discord.com/api/webhooks/`.
 
-On the website: Settings, the webhook channel, paste the URL, choose Slack or Discord as the format, save, then "Send
-test alert". The URL is a secret (anyone who has it can post to that channel): the site stores it for that person
-only, and never shows it in a notice or a log. Admins get the "dip-scanner stopped" and "unavailable" notices through
-their own channels the same way.
+On the website: Settings, the webhook channel, paste the URL, choose Slack or Discord as the format (a Slack or
+Discord address gets its format anyway), then "Save and send a test alert". The URL is a secret (anyone who has it
+can post to that channel): the site stores it for that person only, and never shows it in a notice or a log. Admins
+get the "dip-scanner stopped" and "unavailable" notices through their own channels the same way.
 
 ## 9. Your own domain (optional)
 
@@ -259,14 +260,16 @@ single-name certificates of an organisation are free, then $0.10 a month each.
 
 ## 10. Deploy from GitHub Actions
 
-The workflow in `.github/workflows/news-dip-scanner.yml` checks every pull request and push that touches
-`news-dip-scanner/`, each part on the changes that concern it: ruff and the Python tests when the Python app (or the
-API contract in `frontend/contract/`, which its tests check the API against) changed, and the Next.js front end's
-lint, type check, tests and build when `frontend/` changed. After the Python checks pass it deploys the `main`
-branch:
+The workflow in `.github/workflows/news-dip-scanner.yml` runs on every pull request and every push that touches
+`news-dip-scanner/`, and checks each part on the changes that concern it (the others are skipped): ruff and the Python
+tests when anything outside `frontend/` changed (or the API contract in `frontend/contract/`, which the tests check
+the API against), and the Next.js front end's lint, type check, tests and build when `frontend/` changed. After the
+Python checks pass it deploys the `main` branch:
 
-- on every push to `main` that changed the Python app (a change to the front end alone is Vercel's to deploy, see
-  [VERCEL.md](VERCEL.md), and never restarts the scanner),
+- on every push to `main` that changed what goes into the image: the Python code, `pyproject.toml`, `README.md`,
+  `scanner.toml`, `feeds.toml`, `fly.toml`, the `Dockerfile` or `.dockerignore` (a change to the front end alone is
+  Vercel's to deploy, see [VERCEL.md](VERCEL.md), and a change to the docs or the tests alone deploys nothing: neither
+  restarts the scanner),
 - or when you start it by hand on `main`: Actions, news-dip-scanner, "Run workflow", branch `main` (on any other
   branch it only runs the checks).
 
@@ -280,9 +283,13 @@ git push -u origin main
 ```
 
 Then, in the repository on GitHub, Settings, General, "Default branch": switch it to `main`, so that pull requests
-target it. A branch protection rule (Settings, Branches) that requires the workflow's "Lint and test" and "Front end
-(Next.js)" checks before merging keeps a failing change from reaching the site (a check that didn't need to run
-counts as passed).
+target it. A branch protection rule for `main` (Settings, Branches) that requires the "Checks" status check keeps a
+failing change from reaching the site. That job runs on every pull request, whatever it touches, and passes when every
+part that needed checking passed; don't require "Lint and test" or "Front end (Next.js)" themselves, since a pull
+request that doesn't concern them skips them.
+
+Pushes to `main` are checked and deployed one after another, in the order they were pushed (none is dropped while
+another runs). If a deploy still missed something, "Run workflow" on `main` checks and deploys everything.
 
 It needs a deploy token, which can manage this one app and nothing else in your account:
 
@@ -396,24 +403,37 @@ The image carries `scanner.toml` and `feeds.toml` (in `/app`). There are two way
 - **On the volume**, without a deploy: a `scanner.toml` or `feeds.toml` in `/data` is used instead of the image's
   copy, until you delete it.
 
+  flyctl's `sftp` never overwrites a file, on either side, so each step makes room first. The first time, download
+  the image's copy (`/app/scanner.toml`); after that, the copy in use (`/data/scanner.toml`), or you would start again
+  from the image's and lose your earlier change. The download goes to a new name: `scanner.toml` in this folder is
+  the repository's own.
+
   ```bash
-  fly ssh sftp get /app/scanner.toml scanner.toml           # the current file, to edit
-  fly ssh sftp put scanner.toml /data/scanner.toml          # upload the edited file
-  fly ssh console -C "dip-scanner --config /data/scanner.toml news --hours 1"   # check it
+  rm -f scanner-fly.toml                                    # sftp doesn't overwrite a local file
+  fly ssh sftp get /app/scanner.toml scanner-fly.toml       # the first time; later: /data/scanner.toml
+  # edit scanner-fly.toml, then:
+  fly ssh console -C "rm -f /data/scanner-new.toml"         # nor a file on the Machine
+  fly ssh sftp put scanner-fly.toml /data/scanner-new.toml  # upload it under a new name
+  fly ssh console -C "dip-scanner --config /data/scanner-new.toml news --hours 1"   # check it
+  fly ssh console -C "mv /data/scanner-new.toml /data/scanner.toml"                 # put it in place
   fly apps restart my-dip-scanner                           # use it
   ```
 
-  For the feed list, the same with `feeds.toml`, checked with `dip-scanner --feeds /data/feeds.toml feeds`. Always
-  check before restarting: the website reads the files when it starts, and a mistake in one (a misspelled key is an
-  error, never ignored) stops it from starting; see [Troubleshooting](#troubleshooting) if that happened. To go
-  back to the image's copy: `fly ssh console -C "rm /data/scanner.toml"` and restart. Remember that the next change
-  to the file in the repository won't be used while a copy is on the volume.
+  For the feed list, the same with `feeds.toml` (`feeds-fly.toml` here, `/data/feeds-new.toml` there, checked with
+  `dip-scanner --feeds /data/feeds-new.toml feeds`). Always check before moving the file into place and restarting:
+  the website reads the files when it starts, and a mistake in one (a misspelled key is an error, never ignored) stops
+  it from starting; see [Troubleshooting](#troubleshooting) if that happened. `*-fly.toml` is in `.gitignore`, so the
+  downloaded copies aren't committed by mistake. To go back to the image's copy: `fly ssh console -C "rm
+  /data/scanner.toml"` and restart. Remember that the next change to the file in the repository won't be used while a
+  copy is on the volume.
 
 ## 15. Updating
 
 Merge or push to `main` (GitHub Actions deploys after the tests pass), or run `fly deploy --ha=false` here. The
-Machine stops (the scanner finishes or abandons its cycle within about 10 seconds), the new version starts, and
-database changes are applied automatically when it opens the database. `fly version upgrade` updates flyctl itself.
+Machine stops (the scanner ends its cycle before its next stock, and a member's running "Analyse now" gets to finish;
+up to 150 seconds together, within `kill_timeout`), the new version starts, and database changes are applied
+automatically when it opens the database. An analysis cut off anyway is marked as interrupted, and doesn't count
+toward that member's limit. `fly version upgrade` updates flyctl itself.
 
 Memory and the other Machine settings come from `[[vm]]` in `fly.toml` on every deploy: a `fly scale memory 1024`
 without changing `fly.toml` lasts until the next deploy.
@@ -526,7 +546,8 @@ stopping the process.
 | `Out of memory: Killed process` in the log | Set `memory = "1gb"` under `[[vm]]` in `fly.toml` and deploy. |
 | `fly ssh console` says the app has no started VMs | `fly machine list`, then `fly machine start <machine id>`. |
 | Times on the site or in alerts are in the wrong zone | Each user chooses theirs under Settings; `DISPLAY_TZ` in `[env]` is the default and the log's. |
-| No alerts arrive | Settings, "Send test alert", shows each channel's answer. Email and Telegram need the server's `SMTP_*` or `TELEGRAM_BOT_TOKEN` secrets. |
+| No alerts arrive | Settings, "Save and send a test alert", shows each channel's answer. Email and Telegram need the server's `SMTP_*` or `TELEGRAM_BOT_TOKEN` secrets. |
+| Signing in says "Too many failed sign-ins" although the password is right | Wait 15 minutes (an hour when somebody tried more than 100 wrong passwords for the address), or `fly ssh console -C "dip-scanner users unlock you@example.com"`; `dip-scanner users reset-link` works too. |
 
 ## Security on Fly
 

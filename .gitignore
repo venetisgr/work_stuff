@@ -11,4 +11,6 @@ output/
 
 # news-dip-scanner: database, reports and cache (DATA_DIR defaults to ./data)
 data/
+# news-dip-scanner: settings downloaded from the Fly Machine (docs/DEPLOY.md step 14)
+*-fly.toml
 .ruff_cache/

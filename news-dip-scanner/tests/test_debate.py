@@ -7,7 +7,7 @@ from dataclasses import asdict, replace
 from datetime import date, timedelta
 
 import pytest
-from conftest import NOW, FakeChatModel, make_analysis, make_candidate, make_stats
+from conftest import NOW, FakeChatModel, make_analysis, make_article, make_candidate, make_impact, make_stats
 
 from dip_scanner import prompts
 from dip_scanner.analyze import sanitize, score
@@ -25,6 +25,9 @@ from dip_scanner.debate import (
     guard_ruling,
     judge_index,
     merge,
+    merge_disagreements,
+    name_pattern,
+    passes,
     position_text,
     validate_rebuttal,
     validate_ruling,
@@ -168,11 +171,20 @@ def test_merge_takes_the_mean_chance_and_target_and_the_cautious_rest():
     assert merged.checks == ["Read the call", "Check orders"]
     assert merged.warnings == []
 
-    # When a judge failed, the verdicts may differ: the more cautious one, with the confidence capped.
+    # When a judge failed, the verdicts may differ. Opposite ones: nobody settled it, so "unclear" (not "fundamental
+    # damage" next to a mean chance above the base rate), with the confidence capped.
     opposite = merge(primary, replace(other, verdict="fundamental", confidence="high"), stats)
-    assert (opposite.verdict, opposite.confidence) == ("fundamental", "low")
+    assert (opposite.verdict, opposite.confidence) == ("unclear", "low")
+    # Otherwise the more cautious one, with its texts.
     different = merge(replace(primary, verdict="mixed"), replace(other, confidence="high"), stats)
-    assert (different.verdict, different.confidence) == ("mixed", "medium")
+    assert (different.verdict, different.confidence, different.fear) == ("mixed", "medium", "Primary's fear")
+    cautious_other = merge(primary, replace(other, verdict="mixed"), stats)
+    assert (cautious_other.verdict, cautious_other.fear, cautious_other.catalysts) == (
+        "mixed",
+        "Other's fear",
+        ["A buyback"],
+    )
+    assert cautious_other.risks == ["capex cuts.", "Export rules", "Rates"]  # sanitize tidies the spaces
     # An entry above the price is kept at the price.
     high_entries = merge(replace(primary, entry_price=150.0), replace(other, entry_price=149.0), stats)
     assert high_entries.entry_price == PRICE
@@ -226,7 +238,46 @@ def test_the_ruling_confidence_is_capped_when_the_final_verdicts_differ():
     ]
     assert guard_ruling(reply(confidence="high"), [tf, mixed], stats).confidence == "medium"
     assert guard_ruling(reply(confidence="low"), [tf, mixed], stats).warnings == []  # already below the cap
-    assert guard_ruling(reply(confidence="high"), [tf, tf], stats).confidence == "high"
+    sure = replace(tf, confidence="high")
+    assert guard_ruling(reply(confidence="high"), [sure, sure], stats).confidence == "high"
+
+
+def test_a_judge_that_overturns_both_analysts_gets_a_capped_confidence():
+    """Both finals said mixed (neither passing the alert rules); a confident temporary-fear ruling inside the chance
+    clamp must not turn that into an alert that neither analysis supports."""
+    stats = make_stats(price=225.07)
+    finals = [
+        make_analysis(verdict="mixed", confidence="medium", probability_up_6m=chance, potential_low=190.0,
+                      entry_price=212.0, target_price=252.0)
+        for chance in (68, 70)
+    ]  # fmt: skip
+    for final in finals:
+        assert not passes(final, AlertConfig(), stats.price)
+    raw = reply(verdict="temporary_fear", confidence="high", probability_up_6m=73, potential_low=190.0,
+                entry_price=212.0, target_price=252.0)  # fmt: skip
+    ruled = guard_ruling(raw, finals, stats)
+    assert (ruled.verdict, ruled.confidence) == ("temporary_fear", "medium")
+    assert ruled.warnings == [
+        "The judge's confidence high was capped at medium: its verdict (Temporary fear) differs from both analysts' "
+        "final verdict (Mixed)."
+    ]
+    assert score(ruled, stats.price) < 65
+    # Opposite to both: capped at low.
+    damage = [replace(final, verdict="fundamental") for final in finals]
+    assert guard_ruling(raw, damage, stats).confidence == "low"
+    # A ruling that sides with the analysts' shared verdict isn't capped.
+    agreeing = guard_ruling({**raw, "verdict": "mixed", "confidence": "medium"}, finals, stats)
+    assert (agreeing.confidence, agreeing.warnings) == ("medium", [])
+
+
+def test_the_ruling_is_never_more_confident_than_both_analysts():
+    stats = make_stats()
+    finals = [make_analysis(verdict="mixed", confidence="low"), make_analysis(verdict="mixed", confidence="low")]
+    ruled = guard_ruling(reply(verdict="mixed", confidence="high"), finals, stats)
+    assert ruled.confidence == "low"
+    assert ruled.warnings == [
+        "The judge's confidence high was lowered to low: neither analyst's final confidence was higher."
+    ]
 
 
 def test_the_ruling_still_gets_sanitizes_checks_after_the_guardrails():
@@ -584,6 +635,10 @@ def test_a_failed_rebuttal_keeps_the_earlier_position():
     assert gpt_side.final.verdict == "mixed"
     assert [(failure.label, failure.stage) for failure in result.failures] == [(CLAUDE, "rebuttal")]
     assert result.opportunity.debate.judge == judge_label()  # the judge still ruled
+    # The stored debate says so (the idea page and the report show it), not just the log.
+    assert result.opportunity.debate.reason == (
+        f"{CLAUDE}'s rebuttal failed, so its earlier position stands: Anthropic had a server error (529)"
+    )
 
 
 def test_the_debate_keeps_its_stats_and_news_like_a_single_analysis():
@@ -614,3 +669,149 @@ def test_sanitize_fixes_rebuttal_numbers_too():
 
 def test_the_day_decides_the_order_not_the_time():
     assert analyst_order("AMD", date(2026, 9, 25)) == analyst_order("AMD", NOW.date())
+
+
+# --- a merge must alert like the openings it stands for --------------------------------------------------------------
+
+NVDA = 225.07
+
+
+def nvda_openings():
+    """Two temporary-fear openings on NVDA that agree by the fixed rules and both pass the default alert rules."""
+    gpt = reply(
+        probability_up_6m=72,
+        confidence="high",
+        potential_low=round(0.90 * NVDA, 2),
+        entry_price=round(0.97 * NVDA, 2),
+        target_price=round(1.15 * NVDA, 2),
+        fear="GPT's fear",
+    )
+    claude = reply(
+        probability_up_6m=80,
+        confidence="medium",
+        potential_low=round(0.86 * NVDA, 2),
+        entry_price=round(0.95 * NVDA, 2),
+        target_price=round(1.18 * NVDA, 2),
+        fear="Claude's fear",
+    )
+    return gpt, claude  # fmt: skip
+
+
+def test_openings_whose_merge_would_not_alert_like_them_are_debated():
+    stats = make_stats(price=NVDA)
+    gpt_reply, claude_reply = nvda_openings()
+    first, second = sanitize(gpt_reply, stats), sanitize(claude_reply, stats)
+    rule = AlertConfig()
+    assert disagreements(first, second, price=NVDA, config=DebateConfig(), rules=[rule]) == []
+    assert passes(first, rule, NVDA) and passes(second, rule, NVDA)
+    merged = merge(first, second, stats)
+    assert not passes(merged, rule, NVDA)  # 64.6: the lower low and confidence with the mean chance
+    [why] = merge_disagreements(merged, first, second, price=NVDA, rules=[rule])
+    assert why == (
+        "their merged analysis fails alert rules that both openings pass (score 64.6 against 68.4 and 67.8; minimum "
+        "score 65, chance 60%)"
+    )
+
+    gpt = model(gpt_reply, rebuttal(**gpt_reply), ruling(**gpt_reply, agreement="high"), name="gpt-5")
+    claude = model(
+        claude_reply, rebuttal(**claude_reply), ruling(**gpt_reply, agreement="high"), name="claude-sonnet-5"
+    )
+    result = run(panel(gpt, claude), candidate=make_candidate(stats=stats), alert_rules=[rule])
+    assert result.opportunity.debate.mode == "debate"
+    assert len(gpt.calls) + len(claude.calls) == 5  # two openings, two rebuttals, one ruling
+    assert passes(result.opportunity.analysis, rule, NVDA)
+
+
+@pytest.mark.parametrize("confidences", [("high", "medium"), ("medium", "low"), ("high", "high")])
+def test_an_agreed_merge_passes_exactly_the_rules_its_openings_pass(confidences):
+    """Every pair the fixed rules call agreed, over a grid of chances and lows: the merge that stands for them passes
+    or fails each rule as they both do."""
+    stats = make_stats(price=100.0)
+    config = DebateConfig()
+    rules = [AlertConfig(), AlertConfig(min_score=55, min_probability=55), AlertConfig(min_score=70)]
+    checked = 0
+    for chance_a in range(56, 86, 3):
+        for chance_b in range(chance_a, min(chance_a + 16, 90), 4):
+            for low_a, low_b in ((88.0, 90.0), (84.0, 92.0), (80.0, 89.0)):
+                first = sanitize(
+                    reply(
+                        probability_up_6m=chance_a,
+                        confidence=confidences[0],
+                        potential_low=low_a,
+                        entry_price=96.0,
+                        target_price=116.0,
+                    ),
+                    stats,
+                )
+                second = sanitize(reply(probability_up_6m=chance_b, confidence=confidences[1], potential_low=low_b,
+                                        entry_price=95.0, target_price=120.0), stats)  # fmt: skip
+                if disagreements(first, second, price=100.0, config=config, rules=rules):
+                    continue
+                merged = merge(first, second, stats)
+                if merge_disagreements(merged, first, second, price=100.0, rules=rules):
+                    continue  # debated instead
+                checked += 1
+                for rule in rules:
+                    assert passes(merged, rule, 100.0) == passes(first, rule, 100.0) == passes(second, rule, 100.0)
+    assert checked > 10
+
+
+# --- the stored agreement ------------------------------------------------------------------------------------------
+
+
+def test_the_judge_cannot_call_opposite_final_verdicts_high_agreement():
+    gpt = model(
+        reply(probability_up_6m=72),
+        rebuttal(probability_up_6m=70),
+        ruling(agreement="high", verdict="mixed", probability_up_6m=58),
+        name="gpt-5",
+    )
+    claude = model(
+        reply(verdict="fundamental", probability_up_6m=40, potential_low=105.0, entry_price=120.0),
+        rebuttal(verdict="fundamental", probability_up_6m=42, potential_low=105.0, entry_price=120.0),
+        ruling(agreement="high", verdict="mixed", probability_up_6m=58),
+        name="claude-sonnet-5",
+    )
+    debate = run(panel(gpt, claude)).opportunity.debate
+    assert [side.final.verdict for side in debate.participants] == ["temporary_fear", "fundamental"]
+    assert debate.agreement == "low"
+
+
+# --- who wrote what ------------------------------------------------------------------------------------------------
+
+
+def test_news_about_a_model_is_not_mistaken_for_its_author():
+    """For an AI-sector dip, "GPT-5" is the product in the news: the analysts' arguments about it reach the judge
+    intact (not "the the analyst launch worry"), while a debater naming itself is still hidden."""
+    article = make_article(title="OpenAI's GPT-5 launch disappoints; Microsoft shares slide")
+    candidate = make_candidate(
+        ticker="MSFT", company="Microsoft", impacts=[(make_impact(ticker="MSFT", article_id=article.id), article)]
+    )
+    gpt = model(
+        reply(thesis="The GPT-5 launch worry is overdone.", fear="GPT-5 adoption is slower than hoped."),
+        rebuttal(thesis="The GPT-5 launch worry is overdone.", critique=["As claude-sonnet-5 I think it's wrong"]),
+        ruling(),
+        name="gpt-5",
+    )
+    claude = model(
+        reply(verdict="fundamental", probability_up_6m=40, potential_low=105.0, thesis="GPT-5 underwhelmed."),
+        rebuttal(verdict="fundamental", probability_up_6m=42, potential_low=105.0, thesis="GPT-5 underwhelmed."),
+        ruling(),
+        name="claude-sonnet-5",
+    )
+    run(panel(gpt, claude), candidate=candidate)
+    judge = (gpt, claude)[judge_index("MSFT", DAY)]
+    prompt = judge.calls[-1][1]
+    sections = prompt.split("## Analyst A")[1]
+    assert "The GPT-5 launch worry is overdone." in sections and "GPT-5 underwhelmed." in sections
+    assert "the analyst launch" not in sections and "the the analyst" not in sections
+    assert "claude-sonnet-5" not in sections.lower() and "As the analyst I think" in sections
+
+
+def test_model_names_are_hidden_as_whole_words_whatever_the_dashes():
+    hide = [GPT, "gpt-5", CLAUDE, "claude-sonnet-5"]
+    thesis = "GPT\u20115 (GPT 5), Claude Sonnet 5 and gpt5 said so; gpt-5.1, GPT-5-mini and ChatGPT-5 are products."
+    text = position_text(make_analysis(thesis=thesis), "USD", hide=hide)
+    assert "Thesis: the analyst (the analyst), the analyst and the analyst said so;" in text
+    assert "gpt-5.1, GPT-5-mini and ChatGPT-5 are products." in text
+    assert name_pattern(GPT).search("as openai:gpt-5 would say") and not name_pattern("gpt-5").search("gpt-50")

@@ -7,6 +7,10 @@ Telegram), split into messages that fit their size limits. A generic webhook get
 build_notifiers makes one notifier per channel whose settings are complete, and logs a warning naming the missing
 setting for a channel that is only half set up. Failures raise NotifyError; its message never contains the webhook
 URL or the bot token, because both are secrets.
+
+A website member's webhook is an address anybody could have typed, so its sends are bounded (recipients.py passes
+deadline=USER_WEBHOOK_DEADLINE and max_reply_bytes=MAX_REPLY_BYTES): requests' timeout only limits each read, and a
+server that trickles its answer a byte at a time would otherwise hold the scanner's thread for as long as it likes.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ import logging
 import re
 import smtplib
 import ssl
+import threading
 import time
 from collections.abc import Callable, Iterable
 from datetime import datetime
@@ -27,6 +32,7 @@ import requests
 
 from .config import WEBHOOK_FORMATS, ConfigError, NotifySettings
 from .models import Opportunity, utc
+from .netguard import PRIVATE_TARGET, refused_by_guard
 from .report import debate_line, format_money, format_pct, format_price, format_when, safe_url, verdict_label
 
 log = logging.getLogger(__name__)
@@ -37,6 +43,11 @@ TELEGRAM_LIMIT = 4000  # Telegram allows 4,096
 MAX_MESSAGES = 10  # chat messages per send; beyond that the text is cut with TRUNCATED_NOTE
 TRUNCATED_NOTE = "… (cut short: the full report is in the reports folder)"
 MAX_RETRY_WAIT = 10.0  # seconds; a 429 is retried once after the wait the service asks for (capped at this)
+# Seconds a website member's webhook gets for a whole send (every message, a 429's retry included); more than
+# MAX_RETRY_WAIT, so one retry fits. An abandoned send finishes in the background; while it does, the next send to
+# that address fails at once instead of starting another one.
+USER_WEBHOOK_DEADLINE = 30.0
+MAX_REPLY_BYTES = 64 * 1024  # of a member's webhook's reply that are read (the rest is dropped unread)
 ALERT_FOOTER = (
     "Chances and scores are a language model's uncalibrated estimate (see `dip-scanner track`); the potential low "
     "is not a floor or a stop. Not investment advice; check before placing any order."
@@ -197,9 +208,12 @@ class WebhookNotifier:
     - generic: one POST of {"subject", "markdown", "html"}.
 
     For a URL a website user typed (recipients.py): check_url is called with the URL before every message and raises
-    (netguard.check_public_url) when the address no longer resolves to a public one; follow_redirects=False treats a
-    redirect as a failure instead of following it somewhere else; show_replies=False keeps the service's reply out
-    of error messages (only its status code is named); hints replace the .env-worded hints per status code.
+    (netguard.check_public_url) when the address no longer resolves to a public one (the session should be
+    netguard.public_https_session, which pins each connection to a checked address); follow_redirects=False treats a
+    redirect as a failure instead of following it somewhere else; show_replies=False keeps the service's reply and
+    the connection error's details out of error messages (only a status code, or "couldn't reach", is named; the
+    details go to the log); hints replace the .env-worded hints per status code; deadline bounds a whole send in
+    seconds of wall-clock time (see USER_WEBHOOK_DEADLINE); max_reply_bytes caps how much of a reply is read.
     """
 
     name = "webhook"
@@ -216,6 +230,8 @@ class WebhookNotifier:
         follow_redirects: bool = True,
         show_replies: bool = True,
         hints: dict[int, str] | None = None,
+        deadline: float | None = None,
+        max_reply_bytes: int | None = None,
     ) -> None:
         if not safe_url(url):
             raise ConfigError("WEBHOOK_URL must be an http(s) URL.")
@@ -232,6 +248,8 @@ class WebhookNotifier:
         self._follow_redirects = follow_redirects
         self._show_replies = show_replies
         self._hints = _WEBHOOK_HINTS if hints is None else hints
+        self._deadline = deadline
+        self._max_reply_bytes = max_reply_bytes
         parts = urlsplit(self.url)
         self._label = f"the {fmt} webhook at {parts.hostname}"
         # The path and query of a webhook URL are its secret; long path segments are the token itself.
@@ -253,27 +271,79 @@ class WebhookNotifier:
         return [{"subject": _one_line(subject), "markdown": markdown, "html": html}]
 
     def send(self, subject: str, markdown: str, html: str) -> None:
-        """Post the report (split into several messages where the service has a size limit)."""
+        """Post the report (split into several messages where the service has a size limit), within the deadline
+        when there is one."""
         payloads = self.payloads(subject, markdown, html)
-        for payload in payloads:
-            if self._check_url is not None:
-                try:
-                    self._check_url(self.url)
-                except ValueError as exc:  # netguard.UnsafeURLError: its message names no part of the URL
-                    raise NotifyError(f"{self._label[:1].upper()}{self._label[1:]} isn't allowed: {exc}") from exc
-            _post(
-                self._session,
-                self.url,
-                payload,
-                label=self._label,
-                secrets=self._secrets,
-                hints=self._hints,
-                timeout=self._timeout,
-                sleep=self._sleep,
-                follow_redirects=self._follow_redirects,
-                show_replies=self._show_replies,
-            )
+
+        def post_all() -> None:
+            for payload in payloads:
+                if self._check_url is not None:
+                    try:
+                        self._check_url(self.url)
+                    except ValueError as exc:  # netguard.UnsafeURLError: its message names no part of the URL
+                        raise NotifyError(f"{_capital(self._label)} isn't allowed: {exc}") from exc
+                _post(
+                    self._session,
+                    self.url,
+                    payload,
+                    label=self._label,
+                    secrets=self._secrets,
+                    hints=self._hints,
+                    timeout=self._timeout,
+                    sleep=self._sleep,
+                    follow_redirects=self._follow_redirects,
+                    show_replies=self._show_replies,
+                    max_reply_bytes=self._max_reply_bytes,
+                )
+
+        if self._deadline is None:
+            post_all()
+        else:
+            _within_deadline(post_all, key=self.url, deadline=self._deadline, label=self._label)
         log.info("Posted %s to the %s (%d message(s)).", _one_line(subject), self.name, len(payloads))
+
+
+# URLs with a send running in a background thread (see _within_deadline), so a server that never answers holds at
+# most one thread and one connection per address.
+_IN_FLIGHT: set[str] = set()
+_IN_FLIGHT_LOCK = threading.Lock()
+
+
+def _within_deadline(send: Callable[[], None], *, key: str, deadline: float, label: str) -> None:
+    """Run send() in a daemon thread and wait at most deadline seconds for it: NotifyError when it takes longer (it
+    finishes in the background) or when an earlier send to key is still running; send()'s own exception otherwise."""
+    with _IN_FLIGHT_LOCK:
+        if key in _IN_FLIGHT:
+            raise NotifyError(f"{_capital(label)} is still busy with the previous message; trying again later.")
+        _IN_FLIGHT.add(key)
+    outcome: list[BaseException] = []
+
+    def run() -> None:
+        try:
+            send()
+        except BaseException as exc:  # handed to the caller, if it still waits
+            outcome.append(exc)
+        finally:
+            with _IN_FLIGHT_LOCK:
+                _IN_FLIGHT.discard(key)
+
+    thread = threading.Thread(target=run, name="dip-webhook", daemon=True)
+    try:
+        thread.start()
+    except BaseException:
+        with _IN_FLIGHT_LOCK:
+            _IN_FLIGHT.discard(key)
+        raise
+    thread.join(deadline)
+    if thread.is_alive():
+        log.warning("%s didn't answer within %g s; leaving that send to finish in the background.", label, deadline)
+        raise NotifyError(f"{_capital(label)} didn't answer within {deadline:g} s.")
+    if outcome:
+        raise outcome[0]
+
+
+def _capital(text: str) -> str:
+    return text[:1].upper() + text[1:]
 
 
 class TelegramNotifier:
@@ -347,16 +417,29 @@ def _post(
     sleep: Callable[[float], None],
     follow_redirects: bool = True,
     show_replies: bool = True,
+    max_reply_bytes: int | None = None,
 ):
     """POST JSON; retry once after a 429; NotifyError (secrets scrubbed) on a connection error or non-2xx status.
-    follow_redirects=False makes a redirect a failure; show_replies=False leaves the reply's text out of the error."""
+    follow_redirects=False makes a redirect a failure; show_replies=False leaves the reply's text and the connection
+    error's details out of the error (they are logged); max_reply_bytes reads at most that much of the reply."""
     retried = False
-    options = {} if follow_redirects else {"allow_redirects": False}
+    options: dict[str, Any] = {} if follow_redirects else {"allow_redirects": False}
+    if max_reply_bytes is not None:
+        options["stream"] = True
     while True:
         try:
             response = session.post(url, json=payload, timeout=timeout, **options)
+            if max_reply_bytes is not None:
+                _read_capped(response, max_reply_bytes)
         except requests.RequestException as exc:
-            raise NotifyError(f"Couldn't reach {label}: {_scrub(str(exc), secrets)}") from exc
+            details = _scrub(str(exc), secrets)
+            if show_replies:
+                raise NotifyError(f"Couldn't reach {label}: {details}") from exc
+            # A member reads this: the exception's text would tell them which private ports are open.
+            log.warning("Couldn't reach %s: %s", label, details)
+            if refused_by_guard(exc):
+                raise NotifyError(f"{_capital(label)} isn't allowed: {PRIVATE_TARGET}") from exc
+            raise NotifyError(f"Couldn't reach {label}. Check the address, or try again later.") from exc
         status = response.status_code
         if status == 429 and not retried:
             retried = True
@@ -373,6 +456,22 @@ def _post(
             hint = hints.get(status)
             raise NotifyError(f"{message.rstrip('.')}. {hint}" if hint else message + ("" if show_replies else "."))
         return response
+
+
+def _read_capped(response, limit: int) -> None:
+    """Read at most limit bytes of a streamed reply into it (response.content) and close it; a response that isn't
+    streamed (a test's fake) is left as it is."""
+    raw = getattr(response, "raw", None)
+    if raw is None or getattr(response, "_content_consumed", True):
+        return
+    try:
+        body = raw.read(limit, decode_content=True) or b""
+    except Exception as exc:  # urllib3's errors while reading: like a connection error
+        response.close()
+        raise requests.ConnectionError(exc) from exc
+    response._content = body
+    response._content_consumed = True
+    response.close()
 
 
 def _retry_after(response) -> float:

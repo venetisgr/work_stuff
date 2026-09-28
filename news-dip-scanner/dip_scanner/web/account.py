@@ -22,7 +22,6 @@ from ..accounts import (
     MAX_EMAIL_LENGTH,
     MIN_PASSWORD_LENGTH,
     AccountError,
-    Accounts,
     SettingsError,
     User,
     clean_name,
@@ -46,6 +45,7 @@ TOO_MANY_LOGINS = "Too many failed sign-ins. Wait 15 minutes and try again."
 WRONG_LOGIN = "Wrong email or password."
 PASSWORDS_DIFFER = "The two passwords don't match."
 _BOOLEAN_FIELDS = ("only_watchlist", "thesis_changes", "email_alerts")
+_FORMAT_LABELS = {"slack": "Slack", "discord": "Discord", "generic": "Generic JSON"}
 _ZONE_SKIP = ("Etc/", "SystemV/", "posix/", "right/", "US/", "Canada/", "Brazil/", "Chile/", "Mexico/")
 
 router = APIRouter()
@@ -77,15 +77,15 @@ def login(request: Request, form: auth.PublicForm, ctx: auth.Ctx) -> Response:
     email = str(form.get("email") or "").strip()[:MAX_EMAIL_LENGTH]
     password = str(form.get("password") or "")
     target = auth.safe_next(form.get("next"))
-    keys = Accounts.login_keys(auth.client_ip(request), email)
-    if ctx.accounts.too_many_attempts(*keys):
-        log.warning("Sign-in refused after too many failed attempts from %s.", auth.client_ip(request) or "?")
+    ip = auth.client_ip(request)
+    if ctx.accounts.login_locked(ip, email):
+        log.warning("Sign-in refused after too many failed attempts from %s.", ip or "?")
         return _login_form(request, target, email=email, error=TOO_MANY_LOGINS, status=429)
     user = ctx.accounts.authenticate(email, password)
     if user is None:
-        ctx.accounts.record_login_failure(*keys)
+        ctx.accounts.record_failed_login(ip, email)
         return _login_form(request, target, email=email, error=WRONG_LOGIN, status=400)
-    ctx.accounts.clear_attempts(*(key for key in keys if key.startswith("email:")))
+    ctx.accounts.forget_login_failures(user.email)
     _replace_session(request, user)
     log.info("Account #%d signed in.", user.id)
     return redirect(request, target)
@@ -303,6 +303,14 @@ def show_settings(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Respo
 
 @router.post("/settings")
 def save_settings(request: Request, user: auth.SignedIn, form: auth.SignedForm, ctx: auth.Ctx) -> Response:
+    saved = _save_settings_form(request, ctx, user, form)
+    if isinstance(saved, Response):
+        return saved
+    return redirect(request, "/settings", saved[1])
+
+
+def _save_settings_form(request: Request, ctx: AppContext, user: User, form: Any) -> tuple[User, str] | Response:
+    """Save the settings form: (the user as saved, the message to show), or the settings page with the errors."""
     current = user.settings
     offered = _offered(ctx, user)
     data: dict[str, Any] = {
@@ -334,27 +342,38 @@ def save_settings(request: Request, user: auth.SignedIn, form: auth.SignedForm, 
         return settings_page(request, ctx, user, values=shown, errors=exc.errors, status_code=400)
     if name != user.name:
         ctx.accounts.set_name(user.id, name)
-    ctx.accounts.update_settings(user.id, chosen)
+    saved = ctx.accounts.update_settings(user.id, chosen)
     message = "Settings saved."
+    if chosen.webhook_url and chosen.webhook_format != data["webhook_format"].strip().lower():
+        label = _FORMAT_LABELS.get(chosen.webhook_format, chosen.webhook_format)
+        message += f" The webhook format is {label}, to match the webhook's address."
     if chosen.has_channel and not current.has_channel:
         message += " Your alerts start now: ideas from before aren't sent."
-    return redirect(request, "/settings", message)
+    return saved, message
 
 
 @router.post("/settings/test")
 def test_alert(request: Request, user: auth.SignedIn, form: auth.SignedForm, ctx: auth.Ctx) -> Response:
-    """Send a short test message to each of the user's saved channels and say how each went."""
+    """Send a short test message to each of the user's channels and say how each went. From the settings form (its
+    fields are posted too), what is on the screen is saved first, so a webhook address typed a moment ago is the one
+    tested. The results are shown at the top of the settings page, where it opens."""
     if ctx.accounts.rate_limited(f"test:{user.id}", limit=TEST_LIMIT, window=TEST_WINDOW):
         return error_page(
             request,
             429,
             f"You sent {TEST_LIMIT} test alerts in the last 15 minutes. Wait a little and try again.",
         )
-    recipient = user_recipient(user, ctx.settings, ctx.config, session=ctx.http, resolver=ctx.resolver)
+    if "min_score" in form:
+        saved = _save_settings_form(request, ctx, user, form)
+        if isinstance(saved, Response):
+            return saved
+        user, message = saved
+        flash(request, message)
+    recipient = user_recipient(
+        user, ctx.settings, ctx.config, session=ctx.http, webhook_session=ctx.webhook_http, resolver=ctx.resolver
+    )
     if not recipient.notifiers:
-        return redirect(
-            request, "/settings#channels", "Set up an alert channel and save it first, then send a test.", kind="error"
-        )
+        return redirect(request, "/settings", "Set up an alert channel first, then send a test.", kind="error")
     secrets = secrets_of(ctx.settings)
     for channel, problem in send_test(recipient, now=ctx.now()):
         label = channel[:1].upper() + channel[1:]
@@ -362,13 +381,14 @@ def test_alert(request: Request, user: auth.SignedIn, form: auth.SignedForm, ctx
             flash(request, f"{label}: test alert sent.")
         else:
             flash(request, f"{label}: the test alert failed: {one_line(scrub(problem, secrets), 300)}", "error")
-    return redirect(request, "/settings#channels")
+    return redirect(request, "/settings")
 
 
 @router.post("/settings/password")
 def change_password(request: Request, user: auth.SignedIn, form: auth.SignedForm, ctx: auth.Ctx) -> Response:
-    """Change the password (the current one is needed); every other session ends."""
-    key = f"email:{user.email}"
+    """Change the password (the current one is needed); every other session ends. Wrong current passwords are counted
+    per account (the session already shows who this is), apart from the sign-in form's counts."""
+    key = f"pwchange:{user.id}"
     if ctx.accounts.too_many_attempts(key):
         return settings_page(request, ctx, user, password_error=TOO_MANY_LOGINS, status_code=429)
     current, new, confirm = (str(form.get(name) or "") for name in ("current_password", "new_password", "confirm"))
@@ -392,17 +412,23 @@ def end_other_sessions(request: Request, user: auth.SignedIn, form: auth.SignedF
 
 
 def change_watchlist(ctx: AppContext, user: User, *, add: str | None = None, remove: str | None = None) -> User:
-    """The user's watchlist with a symbol added and/or removed (for "Add to watchlist" buttons); AccountError when the
-    symbol isn't one or the list is full."""
+    """The user's watchlist with a symbol added and/or removed (for "Add to watchlist" buttons), judged the way the
+    scanner reads it, through [universe] preferred_listings: adding ASML.AS when ASML (read as ASML.AS) is there adds
+    nothing, and removing ASML.AS removes ASML too. AccountError when the symbol isn't one or the list is full."""
+    preferred = ctx.config.universe.preferred_listings
+
+    def read(symbol: str) -> str:
+        return preferred.get(symbol, symbol)
+
     symbols = list(user.settings.watchlist)
     if add is not None:
         symbol = normalise_ticker(add)
         if symbol is None:
             raise AccountError(f"{add.strip()[:20]!r} isn't a Yahoo Finance symbol; write it like AMD or SAP.DE.")
-        if symbol not in symbols:
+        if read(symbol) not in {read(item) for item in symbols}:
             symbols.append(symbol)
     if remove is not None:
-        gone = normalise_ticker(remove) or remove.strip().upper()
-        symbols = [symbol for symbol in symbols if symbol != gone]
+        gone = read(normalise_ticker(remove) or remove.strip().upper())
+        symbols = [symbol for symbol in symbols if read(symbol) != gone]
     chosen = validate_settings({"watchlist": symbols}, current=user.settings, settings=ctx.settings)
     return ctx.accounts.update_settings(user.id, chosen)

@@ -13,7 +13,8 @@ Anything else the SDKs raise (an Entra ID sign-in that fails, a gateway reply wi
 these too.
 
 After every call a model's last_usage holds the tokens the service reported (Usage), or None when no reply came back
-(the request failed before the service answered). The pipeline stores them to total the day's use.
+(the request failed before the service answered). The pipeline stores them to total the day's use. It is kept per
+thread, since the website's "Analyse now" and the scanner's cycle call the same model objects at the same time.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ import json
 import logging
 import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Protocol, TypeVar
@@ -248,14 +250,33 @@ def _entra_token_provider() -> Callable[[], str]:
     return token
 
 
-class _ChatCompletionsModel:
+class _PerThreadUsage:
+    """last_usage kept per thread: a call in another thread (a manual analysis during a cycle) can't overwrite the one
+    this thread's caller is about to read."""
+
+    @property
+    def last_usage(self) -> Usage | None:
+        return getattr(self._usage_store(), "value", None)
+
+    @last_usage.setter
+    def last_usage(self, value: Usage | None) -> None:
+        self._usage_store().value = value
+
+    def _usage_store(self) -> threading.local:
+        store = self.__dict__.get("_usage_by_thread")
+        if store is None:
+            store = self.__dict__.setdefault("_usage_by_thread", threading.local())
+        return store
+
+
+class _ChatCompletionsModel(_PerThreadUsage):
     """Shared Chat Completions logic for the OpenAI API and Azure AI Foundry (same SDK, same wire format)."""
 
     service = "OpenAI"
 
     def __init__(self, client: openai.OpenAI, name: str, settings: LLMSettings) -> None:
         self.name = name
-        self.last_usage: Usage | None = None
+        self.last_usage = None
         self._client = client
         self._reasoning_effort = settings.reasoning_effort
         self._max_output_tokens = settings.max_output_tokens
@@ -443,7 +464,7 @@ def _import_anthropic() -> Any:
     return anthropic
 
 
-class AnthropicChatModel:
+class AnthropicChatModel(_PerThreadUsage):
     """A Claude model on the Anthropic API (the anthropic package is the optional "anthropic" extra)."""
 
     def __init__(
@@ -458,7 +479,7 @@ class AnthropicChatModel:
         if not model:
             raise ConfigError("No Claude model name given; set LLM_TRIAGE_MODEL / LLM_ANALYSIS_MODEL.")
         self.name = model
-        self.last_usage: Usage | None = None
+        self.last_usage = None
         self._sdk = _import_anthropic()
         if client is None:
             # Without ANTHROPIC_API_KEY the SDK still finds ANTHROPIC_AUTH_TOKEN or an `ant auth login` profile.
@@ -680,9 +701,11 @@ def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel | DebatePa
 
 
 def build_debate_panel(settings: LLMSettings) -> DebatePanel:
-    """The debaters of LLM_DEBATERS and the judge of LLM_DEBATE_JUDGE, each with LLM_ANALYSIS_REASONING_EFFORT (else
-    LLM_REASONING_EFFORT) like the single analysis model. A fixed judge that is one of the debaters shares its model.
-    A debater whose provider isn't set up (no key, no package) is a ConfigError naming the setting."""
+    """The debaters of LLM_DEBATERS and the judge of LLM_DEBATE_JUDGE; the OpenAI and Azure ones with
+    LLM_ANALYSIS_REASONING_EFFORT (else LLM_REASONING_EFFORT) like the single analysis model, Claude at its default
+    effort (the providers' levels differ: "low" for GPT-5 would starve Claude, and Claude's "max" is an error for
+    GPT-5). A fixed judge that is one of the debaters shares its model. A debater whose provider isn't set up (no key,
+    no package) is a ConfigError naming the setting."""
     effort = settings.analysis_reasoning_effort or settings.reasoning_effort
     debaters = tuple(_debater(settings, entry, effort, role="LLM_DEBATERS") for entry in settings.debaters)
     judge = None
@@ -697,7 +720,7 @@ def build_debate_panel(settings: LLMSettings) -> DebatePanel:
 def _debater(settings: LLMSettings, entry: str, effort: str | None, *, role: str) -> DebaterModel:
     provider, name = model_entry(entry, role)
     label = f"{provider}:{name}"
-    model_settings = replace(settings, reasoning_effort=effort)
+    model_settings = replace(settings, reasoning_effort=effort if provider in ("openai", "azure") else None)
     try:
         if provider == "openai":
             if not settings.openai_api_key and not settings.openai_base_url:

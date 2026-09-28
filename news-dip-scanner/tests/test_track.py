@@ -753,6 +753,7 @@ def test_the_scoreboard_brier_scores_are_hand_computed():
         debated((90, 90), (90, 90), 90, up=None),  # 6 months haven't passed: waiting
         debated((10, 10), (10, 10), 10, up=True, price_mismatch=True),  # left out entirely
         Outcome(**{**vars(debated((50, 50), (50, 50), 50, up=True)), "opportunity": make_opportunity()}),  # no debate
+        lone((95, 95), 95, up=False),  # GPT alone while Claude was down: no comparison, left out
     ]
     board = {row["model"]: row for row in model_scoreboard(outcomes)}
     assert list(board) == ["anthropic:claude-sonnet-5", "openai:gpt-5", FINAL_ROW]
@@ -774,6 +775,24 @@ def test_the_scoreboard_brier_scores_are_hand_computed():
     assert final["brier"] == pytest.approx(((0.64 - 1) ** 2 + 0.35**2) / 2)  # 0.12605
     assert final["brier_opening"] is None and final["label"] == "After the debate"
     assert (final["debates"], final["scored"], final["waiting"]) == (3, 2, 1)
+
+
+def lone(gpt: tuple[int, int], outcome: int, *, up: bool | None) -> Outcome:
+    """An outcome of an analysis GPT made alone (mode "single": the other debater was down)."""
+    found = debated(gpt, (0, 0), outcome, up=up)
+    opp = found.opportunity
+    debate = replace(opp.debate, mode="single", participants=opp.debate.participants[:1], judge=None, agreement=None)
+    return replace(found, opportunity=replace(opp, debate=debate))
+
+
+def test_the_scoreboard_compares_the_models_on_the_same_opportunities_only():
+    board = model_scoreboard([debated((80, 70), (50, 60), 64, up=True), lone((90, 90), 90, up=False)])
+    assert [(row["model"], row["debates"], row["scored"]) for row in board] == [
+        ("anthropic:claude-sonnet-5", 1, 1),
+        ("openai:gpt-5", 1, 1),
+        (FINAL_ROW, 1, 1),
+    ]
+    assert model_scoreboard([lone((90, 90), 90, up=False)]) == []
 
 
 def test_the_scoreboard_waits_for_six_months_and_is_empty_without_debates():

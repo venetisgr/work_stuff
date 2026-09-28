@@ -7,12 +7,22 @@ from datetime import UTC, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
+import requests
 from conftest import NOW, FakeSession, make_opportunity
 
 from dip_scanner import accounts as accounts_module
 from dip_scanner.accounts import Accounts, UserSettings
 from dip_scanner.config import AccountConfig, AlertConfig, NotifySettings, ScannerConfig, Settings, UniverseConfig
-from dip_scanner.notify import EmailNotifier, NotifyError, TelegramNotifier, WebhookNotifier
+from dip_scanner.netguard import refused_by_guard
+from dip_scanner.notify import (
+    MAX_REPLY_BYTES,
+    MAX_RETRY_WAIT,
+    USER_WEBHOOK_DEADLINE,
+    EmailNotifier,
+    NotifyError,
+    TelegramNotifier,
+    WebhookNotifier,
+)
 from dip_scanner.recipients import (
     TEST_SUBJECT,
     Recipient,
@@ -149,6 +159,24 @@ def test_a_user_webhook_is_checked_again_when_sending_and_redirects_are_not_foll
     assert len(session.calls) == 1
 
 
+def test_a_user_webhook_has_a_deadline_a_reply_cap_and_a_pinned_session_by_default(accounts):
+    chosen = user(accounts, "jane@example.com", webhook_url="https://hooks.example.com/abc", webhook_format="slack")
+    [webhook] = user_recipient(chosen, Settings(), CONFIG, resolver=lambda host, port: ["10.0.0.8"]).notifiers
+    assert webhook._deadline == USER_WEBHOOK_DEADLINE > MAX_RETRY_WAIT
+    assert webhook._max_reply_bytes == MAX_REPLY_BYTES
+    # Without a session given, the webhook's connections only go to the public addresses they looked up.
+    with pytest.raises(requests.ConnectionError) as error:
+        webhook._session.post("https://hooks.example.com/abc", json={}, timeout=1)
+    assert refused_by_guard(error.value)
+    telegram_session, hook_session = FakeSession(), FakeSession({"https://hooks.example.com/": "ok"})
+    chosen = user(accounts, "joe@example.com", webhook_url="https://hooks.example.com/abc", telegram_chat_id="7")
+    telegram, webhook = user_recipient(
+        chosen, SERVER, CONFIG, session=telegram_session, webhook_session=hook_session, resolver=public_dns
+    ).notifiers
+    webhook.send("Subject", "text", "html")
+    assert len(hook_session.calls) == 1 and telegram_session.calls == []
+
+
 def test_channels_the_server_can_not_serve_are_left_out(accounts):
     chosen = user(accounts, "jane@example.com", email_alerts=True, telegram_chat_id="42")
     assert user_recipient(chosen, Settings(), CONFIG).notifiers == []
@@ -200,6 +228,19 @@ def test_service_hooks_are_asked_again_at_every_cycle(accounts, store):
     assert [r.label for r in hooks["recipients"](NOW)] == ["default", "jane@example.com"]
     assert hooks["watchlist"](NOW) == ("NVDA",) and hooks["currencies"](NOW) == ("CHF",)
     assert [r.label for r in service_hooks(store, SERVER, CONFIG)["recipients"](NOW)] == ["jane@example.com"]
+
+
+def test_the_env_channels_alerts_start_when_they_are_first_set_up(accounts, store):
+    """An .env channel added while users already get alerts mustn't be sent the day's old ideas at its first cycle."""
+    default_notifier = FakeNotifier("email")
+    hooks = service_hooks(store, SERVER, CONFIG, default_notifiers=[default_notifier])
+    [first] = hooks["recipients"](NOW)
+    assert first.since == NOW
+    [later] = hooks["recipients"](NOW + timedelta(hours=5))
+    assert later.since == NOW  # remembered, also across restarts (app_state)
+    service_hooks(store, SERVER, CONFIG)["recipients"](NOW + timedelta(hours=6))  # the .env channels removed
+    [again] = hooks["recipients"](NOW + timedelta(hours=7))
+    assert again.since == NOW + timedelta(hours=7)
 
 
 def test_send_test_reports_each_channel():

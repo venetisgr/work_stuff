@@ -13,6 +13,7 @@ from conftest import NOW
 from dip_scanner import accounts as accounts_module
 from dip_scanner.accounts import (
     CURRENCIES,
+    EMAIL_LIMIT,
     LOGIN_LIMIT,
     AccountError,
     Accounts,
@@ -21,6 +22,7 @@ from dip_scanner.accounts import (
     check_new_password,
     check_password,
     clean_name,
+    client_network,
     hash_password,
     normalise_email,
     same_token,
@@ -355,21 +357,44 @@ def test_a_reset_link_ends_the_sessions(accounts):
 # --- rate limits ---------------------------------------------------------------------------------------------------
 
 
-def test_ten_failed_logins_in_15_minutes_block_the_ip_or_the_email(accounts, clock):
+def test_ten_failed_logins_in_15_minutes_block_the_address_and_that_address_for_the_email(accounts, clock):
     keys = Accounts.login_keys("203.0.113.9", " Owner@Example.com ")
-    assert keys == ["ip:203.0.113.9", "email:owner@example.com"]
+    assert keys == ["ip:203.0.113.9", "email_ip:owner@example.com|203.0.113.9"]
     for _ in range(LOGIN_LIMIT - 1):
-        accounts.record_login_failure(*keys)
-    assert not accounts.too_many_attempts(*keys)
-    accounts.record_login_failure(*keys)
-    assert accounts.too_many_attempts(*keys)
-    assert accounts.too_many_attempts("email:owner@example.com")  # from any other address too
-    assert not accounts.too_many_attempts("ip:198.51.100.1", "email:other@example.com")
+        accounts.record_failed_login("203.0.113.9", "owner@example.com")
+    assert not accounts.login_locked("203.0.113.9", "owner@example.com")
+    accounts.record_failed_login("203.0.113.9", "owner@example.com")
+    assert accounts.login_locked("203.0.113.9", "owner@example.com")
+    assert accounts.login_locked("203.0.113.9", "other@example.com")  # that address is locked for anybody
+    assert not accounts.login_locked("198.51.100.1", "owner@example.com")  # the owner elsewhere isn't
     clock.advance(minutes=15, seconds=1)
-    assert not accounts.too_many_attempts(*keys)
-    accounts.record_login_failure(*keys)
-    accounts.clear_attempts("email:owner@example.com")
-    assert accounts.login_keys(None, "") == []
+    assert not accounts.login_locked("203.0.113.9", "owner@example.com")
+    assert accounts.login_keys(None, "") == [] and accounts.login_keys(None, "owner@example.com") == []
+
+
+def test_failed_logins_for_an_email_from_anywhere_have_a_ceiling(accounts, clock):
+    for number in range(EMAIL_LIMIT - 1):
+        accounts.record_failed_login(f"203.0.{number // 250}.{number % 250 + 1}", "owner@example.com")
+    assert not accounts.login_locked("198.51.100.1", "owner@example.com")
+    accounts.record_failed_login("198.51.100.2", "owner@example.com")
+    assert accounts.login_locked("198.51.100.1", "owner@example.com")
+    assert not accounts.login_locked("198.51.100.1", "other@example.com")
+    assert accounts.forget_login_failures("OWNER@example.com") == 2 * EMAIL_LIMIT
+    assert not accounts.login_locked("198.51.100.1", "owner@example.com")
+
+
+@pytest.mark.parametrize(
+    ("address", "network"),
+    [
+        ("203.0.113.9", "203.0.113.9"),
+        ("2001:db8:1:2:aaaa::1", "2001:db8:1:2::/64"),
+        ("::ffff:203.0.113.9", "203.0.113.9"),
+        ("testclient", "testclient"),
+        ("", None),
+    ],
+)
+def test_failed_logins_count_per_network_address(address, network):
+    assert client_network(address) == network
 
 
 def test_rate_limited_counts_and_refuses_over_the_limit(accounts, clock):
@@ -431,12 +456,26 @@ def test_a_whole_settings_form_is_checked_and_normalised():
         email_alerts=True,
         telegram_chat_id="-1001234567",
         webhook_url="https://hooks.slack.com/services/T0/B0/XYZ",
-        webhook_format="discord",
+        webhook_format="slack",  # Slack's address takes Slack's format only, whatever was chosen
         currency="EUR",
         timezone="Europe/Athens",
     )
     assert result.has_channel
     assert check({"telegram_chat_id": "", "webhook_url": "", "currency": ""}, current=result).webhook_url is None
+
+
+@pytest.mark.parametrize(
+    ("url", "chosen", "kept"),
+    [
+        ("https://discord.com/api/webhooks/1/abc", "slack", "discord"),
+        ("https://discordapp.com/api/webhooks/1/abc", "generic", "discord"),
+        ("https://hooks.slack.com/services/T0/B0/XYZ", "discord", "slack"),
+        ("https://hooks.slack.com/workflows/T0/A0/1/abc", "generic", "generic"),  # Workflow Builder: any JSON
+        ("https://example.com/hook", "discord", "discord"),  # anything else: as chosen
+    ],
+)
+def test_a_known_services_webhook_gets_its_format(url, chosen, kept):
+    assert check({"webhook_url": url, "webhook_format": chosen}).webhook_format == kept
 
 
 def test_keys_left_out_keep_their_current_value():
@@ -584,5 +623,103 @@ def test_jobs_count_per_user_over_24_hours_and_restarts_fail_unfinished_ones(acc
     assert accounts.count_jobs(member.id) == 1
     assert accounts.count_jobs(member.id, since=NOW - timedelta(days=1)) == 2
     assert accounts.fail_unfinished_jobs() == 3
-    assert {job.status for job in accounts.list_jobs()} == {"failed"}
-    assert "restart" in accounts.list_jobs()[0].error
+    assert {(job.status, job.failure) for job in accounts.list_jobs()} == {("failed", "restart")}
+    assert (
+        "restart" in accounts.list_jobs()[0].error
+        and "doesn't count toward your limit" in accounts.list_jobs()[0].error
+    )
+    assert accounts.count_jobs(member.id, since=NOW - timedelta(days=1)) == 0  # a restart isn't the member's doing
+
+
+@pytest.mark.parametrize(
+    ("failure", "counts", "retry"),
+    [
+        ("no_prices", False, False),
+        ("prices_down", False, True),
+        ("setup", False, False),
+        ("restart", False, True),
+        ("model", True, True),
+        ("error", True, True),
+        ("anything else", True, True),  # recorded as "error"
+    ],
+)
+def test_failed_jobs_count_toward_the_limit_only_after_the_model_was_asked(accounts, failure, counts, retry):
+    member = accounts.create_user("friend@example.com", password=PASSWORD)
+    job = accounts.create_job(member.id, "AMD")
+    job = accounts.finish_job(job.id, error="It failed.", failure=failure)
+    assert (job.counts, job.can_retry, accounts.count_jobs(member.id)) == (counts, retry, int(counts))
+    done = accounts.finish_job(accounts.create_job(member.id, "NVDA").id, opportunity_id=7, failure="no_prices")
+    assert done.failure is None and done.counts and not done.can_retry
+
+
+# --- links of an admin who is disabled or made a member ------------------------------------------------------------
+
+
+@pytest.mark.parametrize("how", ["disabled", "made a member"])
+def test_an_admin_who_is_disabled_or_demoted_loses_the_links_they_made(accounts, how):
+    """A rogue admin made an admin invite and a reset link for the owner; disabling or demoting them must end both,
+    or the reset link takes over the owner's account within 48 hours."""
+    owner = admin(accounts)
+    rogue = admin(accounts, "rogue@example.com")
+    friend = accounts.create_user("friend@example.com", password=PASSWORD)
+    invite = accounts.create_invite(created_by=rogue.id, role="admin")
+    takeover = accounts.create_password_token(owner.id, created_by=rogue.id)
+    own_link = accounts.create_password_token(friend.id, created_by=owner.id)  # another admin's: keeps working
+    cli_link = accounts.create_password_token(friend.id)  # the command line's: keeps working
+    assert accounts.get_invite(invite) is not None and accounts.get_password_token(takeover) is not None
+
+    if how == "disabled":
+        accounts.set_disabled(rogue.id, True)
+    else:
+        accounts.set_role(rogue.id, "member")
+
+    assert accounts.get_invite(invite) is None
+    with pytest.raises(AccountError):
+        accounts.accept_invite(invite, name="Rogue 2", password="another long password", email="rogue2@example.net")
+    assert accounts.get_password_token(takeover) is None
+    with pytest.raises(AccountError):
+        accounts.use_password_token(takeover, "the rogue's password")
+    assert accounts.verify_password(owner.id, PASSWORD)  # the owner's password is unchanged
+    assert accounts.get_password_token(own_link) is not None and accounts.get_password_token(cli_link) is not None
+    # Enabled or made an admin again: the revoked links stay dead.
+    accounts.set_disabled(rogue.id, False)
+    accounts.set_role(rogue.id, "admin")
+    assert accounts.get_invite(invite) is None and accounts.get_password_token(takeover) is None
+
+
+def test_a_link_whose_maker_is_no_admin_any_more_does_not_work(accounts, store):
+    """Defence in depth: a link that escaped revocation (an older row, a crash) still checks its maker."""
+    owner = admin(accounts)
+    other = admin(accounts, "other@example.com")
+    link = accounts.create_password_token(owner.id, created_by=other.id)
+    invite = accounts.create_invite(created_by=other.id)
+    with store.transaction() as conn:  # made a member behind set_role's back
+        conn.execute("UPDATE users SET role = 'member' WHERE id = ?", (other.id,))
+    assert accounts.get_password_token(link) is None and accounts.get_invite(invite) is None
+
+
+def test_pending_password_links_are_listed_and_can_be_revoked(accounts, clock):
+    owner = admin(accounts)
+    friend = accounts.create_user("friend@example.com", password=PASSWORD)
+    link = accounts.create_password_token(friend.id, created_by=owner.id)
+    [pending] = accounts.list_password_tokens()
+    assert (pending.user.email, pending.purpose, pending.created_by) == ("friend@example.com", "reset", owner.id)
+    assert accounts.revoke_password_token(pending.token_hash)
+    assert not accounts.revoke_password_token(pending.token_hash)  # already revoked
+    assert accounts.get_password_token(link) is None and accounts.list_password_tokens() == []
+    accounts.create_password_token(friend.id)
+    clock.advance(hours=49)
+    assert accounts.list_password_tokens() == []  # expired
+
+
+def test_a_reenabled_users_alerts_start_again_from_then(accounts, clock):
+    """Disabled at 10:30 and enabled at 20:30: the ideas of the hours between aren't sent to them in a burst."""
+    owner = admin(accounts)
+    member = accounts.create_user("friend@example.com", password=PASSWORD)
+    member = accounts.update_settings(member.id, replace(member.settings, telegram_chat_id="42"))
+    started = member.alerts_since
+    accounts.set_disabled(member.id, True)
+    clock.advance(hours=10)
+    enabled = accounts.set_disabled(member.id, False)
+    assert enabled.alerts_since == started + timedelta(hours=10)
+    assert accounts.set_disabled(owner.id, False).alerts_since == owner.alerts_since  # wasn't disabled: unchanged

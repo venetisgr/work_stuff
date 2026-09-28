@@ -27,7 +27,16 @@ from typing import Any
 from fastapi import APIRouter, Request
 from fastapi.responses import Response
 
-from ..accounts import MAX_EMAIL_LENGTH, ROLES, AccountError, Invite, User, email_ready, telegram_ready
+from ..accounts import (
+    MAX_EMAIL_LENGTH,
+    ROLES,
+    AccountError,
+    Invite,
+    PasswordToken,
+    User,
+    email_ready,
+    telegram_ready,
+)
 from ..config import ConfigError
 from ..feeds import needs_contact_user_agent, user_agent_for
 from ..models import CycleRecord, ModelUsage, utc
@@ -655,6 +664,22 @@ def user_rows(ctx: AppContext, me: User) -> list[UserRow]:
     ]
 
 
+@dataclass(frozen=True)
+class LinkRow:
+    """A password link that still works, as the users page lists it."""
+
+    link: PasswordToken
+    created_by: str | None  # the admin's label; None when made with `dip-scanner users reset-link`
+
+
+def link_rows(ctx: AppContext) -> list[LinkRow]:
+    labels = {user.id: user.label for user in ctx.accounts.list_users()}
+    return [
+        LinkRow(link=link, created_by=labels.get(link.created_by) if link.created_by is not None else None)
+        for link in ctx.accounts.list_password_tokens()
+    ]
+
+
 @router.get("/users")
 def users_page(request: Request, user: auth.Admin, ctx: auth.Ctx) -> Response:
     rows = user_rows(ctx, user)
@@ -663,6 +688,7 @@ def users_page(request: Request, user: auth.Admin, ctx: auth.Ctx) -> Response:
         "admin/users.html",
         {
             "rows": rows,
+            "password_links": link_rows(ctx),
             "admins": sum(1 for row in rows if row.user.is_admin and row.status == "active"),
             "shown_link": take_link(request, ctx, "password"),
             "base_url_set": bool(ctx.settings.web.base_url),
@@ -686,7 +712,10 @@ def disable_user(request: Request, user_id: int, user: auth.Admin, form: auth.Si
         return redirect(request, "/admin/users", str(exc), kind="error")
     log.info("Account #%d disabled account #%d.", user.id, target.id)
     return redirect(
-        request, "/admin/users", f"{target.email} is disabled and was signed out everywhere. Their alerts stop too."
+        request,
+        "/admin/users",
+        f"{target.email} is disabled and was signed out everywhere. Their alerts stop too, and the unused invite and "
+        "password links they made were revoked.",
     )
 
 
@@ -727,7 +756,11 @@ def change_role(request: Request, user_id: int, user: auth.Admin, form: auth.Sig
         return redirect(
             request, "/admin/users", f"{target.email} is now an admin: they can manage users, invites and the scanner."
         )
-    return redirect(request, "/admin/users", f"{target.email} is now a member.")
+    return redirect(
+        request,
+        "/admin/users",
+        f"{target.email} is now a member. The unused invite and password links they made were revoked.",
+    )
 
 
 @router.post("/users/{user_id}/password-link")
@@ -742,7 +775,7 @@ def password_link(request: Request, user_id: int, user: auth.Admin, form: auth.S
             f"{target.email} is disabled, so a password link wouldn't work: enable the account first.",
             kind="error",
         )
-    token = ctx.accounts.create_password_token(target.id)
+    token = ctx.accounts.create_password_token(target.id, created_by=user.id)
     found = ctx.accounts.get_password_token(token)
     if found is None:  # can't happen for an enabled user; never show a dead link
         return redirect(request, "/admin/users", "The link couldn't be created. Try again.", kind="error")
@@ -764,6 +797,20 @@ def password_link(request: Request, user_id: int, user: auth.Admin, form: auth.S
         "/admin/users#new-link",
         f"A {what} link for {target.email} is ready. Copy it now: it is shown only once.",
     )
+
+
+@router.post("/users/password-links/revoke")
+def revoke_password_link(request: Request, user: auth.Admin, form: auth.SignedForm, ctx: auth.Ctx) -> Response:
+    link_hash = str(form.get("link") or "")
+    if not link_hash or not ctx.accounts.revoke_password_token(link_hash):
+        return redirect(
+            request,
+            "/admin/users",
+            "That link can't be revoked: it was already used, revoked or expired.",
+            kind="error",
+        )
+    log.info("Account #%d revoked a password link.", user.id)
+    return redirect(request, "/admin/users", "Password link revoked: it no longer works.")
 
 
 # --- invites -------------------------------------------------------------------------------------------------------

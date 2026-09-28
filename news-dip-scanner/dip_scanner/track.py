@@ -48,7 +48,9 @@ model_scoreboard() scores the models of debated analyses (LLM_ANALYSIS_MODE=deba
 results: for each model, its final positions' probability_up_6m against whether the stock was higher after 6 months
 (up_after_6m), as a Brier score, the mean squared difference between the probability (0-1) and the outcome (1 higher,
 0 not). 0 is perfect; always saying 50% scores 0.25. The same for its opening positions, and a row for the
-debate's outcome (the opportunity's own probability: the judge's ruling, or the merged or lone analysis).
+debate's outcome (the opportunity's own probability: the judge's ruling, or the merged analysis). Only analyses both
+models took part in count (mode "debate" or "agreed"): one model's lone analysis while the other was down would score
+it on stocks and days the other never saw, so every row covers the same opportunities.
 """
 
 from __future__ import annotations
@@ -378,7 +380,8 @@ def brier(pairs: Sequence[tuple[float, bool]]) -> float | None:
 
 
 def model_scoreboard(outcomes: Sequence[Outcome]) -> list[dict]:
-    """The debate's models scored on the debated opportunities (see the module docstring); [] when none was debated.
+    """The debate's models scored on the opportunities both of them analysed (see the module docstring); [] when there
+    is none.
 
     One row per model ("provider:model", sorted), then FINAL_ROW for the debate's outcome, each a dict of: model,
     label (for people), debates (debated opportunities it took part in), scored (those with 6 months of results,
@@ -390,8 +393,8 @@ def model_scoreboard(outcomes: Sequence[Outcome]) -> list[dict]:
     final: dict[str, list] = {"debates": [], "final": [], "opening": []}
     for outcome in outcomes:
         debate = outcome.opportunity.debate
-        if debate is None or not debate.participants or outcome.price_mismatch:
-            continue
+        if debate is None or debate.mode == "single" or len(debate.participants) < 2 or outcome.price_mismatch:
+            continue  # a lone analysis (the other model was down) isn't a comparison
         scored = outcome.priced and outcome.up_after_6m is not None
         for side in debate.participants:
             row = rows.setdefault(side.model, {"debates": [], "final": [], "opening": []})

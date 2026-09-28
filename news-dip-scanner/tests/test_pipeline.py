@@ -1123,6 +1123,55 @@ def test_the_daily_analysis_limit_leaves_the_rest_for_later(build):
     assert [opp.ticker for opp in scanner.run_cycle(CYCLE + timedelta(hours=4, minutes=10)).opportunities] == ["LOW"]
 
 
+def test_a_stopping_scanner_asks_the_model_about_no_more_candidates(build):
+    """The website is shutting down: the cycle ends before its next candidate (no new paid calls), and still reports,
+    alerts and records what it found."""
+    notifier = FakeNotifier()
+    session = FakeSession({CHART_PREFIX: fixture_json("yahoo_chart_amd.json")})
+    asked: list[str] = []
+    holder: dict = {}
+
+    def answer(system, prompt, json_mode):
+        asked.append(prompt)
+        holder["scanner"].stop()  # SIGTERM arrives during the first analysis
+        return ANALYSIS
+
+    scanner = build(
+        session=session, feeds=[], config=QUIET, sec_user_agent=None, notifiers=[notifier],
+        analysis_model=FakeChatModel(answer),
+    )  # fmt: skip
+    holder["scanner"] = scanner
+    for ticker, magnitude in (("BIG", 5), ("MID", 3)):
+        seed(scanner, ticker, magnitude=magnitude)
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert len(asked) == 1 and [opp.ticker for opp in result.opportunities] == ["BIG"]
+    assert "Stopping: left for the next cycle: MID" in result.notes
+    assert [subject for subject, _, _ in notifier.sent] == ["Dip alert: BIG (score 68)"]
+    assert scanner.store.last_cycle().ok
+
+
+def test_manual_analyses_do_not_use_up_the_scanners_daily_limit(build):
+    """Members' "Analyse now" clicks have limits of their own: four of them mustn't leave the day's real dip
+    unanalysed ("left for later") with no alert to anyone."""
+    notifier = FakeNotifier()
+    config = ScannerConfig(scan=ScanConfig(context_news=False, max_analyses_per_day=3))
+    session = FakeSession({CHART_PREFIX: fixture_json("yahoo_chart_amd.json")})
+    scanner = build(session=session, feeds=[], config=config, sec_user_agent=None, notifiers=[notifier])
+    for number, ticker in enumerate(("MSFT", "AAPL", "GOOG", "ORCL")):
+        scanner.analyze_ticker(ticker, now=CYCLE - timedelta(hours=3, minutes=number))
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=24)) == 4
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=24), include_manual=False) == 0
+    seed(scanner, "AMD", magnitude=4)
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["AMD"]
+    assert not any(note.startswith("Daily limit") for note in result.notes)
+    assert [subject for subject, _, _ in notifier.sent] == ["Dip alert: AMD (score 68)"]
+
+
 def test_a_model_unavailable_for_six_cycles_sends_one_notice_every_12_hours(build):
     notifier = FakeNotifier()
     down = FakeChatModel(LLMUnavailableError("Couldn't connect to https://api.openai.com/v1/."))
@@ -1343,6 +1392,24 @@ def test_one_debater_down_is_noted_and_told_once_and_the_scanner_goes_on(build):
     again = scanner.analyze_ticker("AMD", now=CYCLE + timedelta(hours=1))
     assert again.debate.mode == "single"
     assert len([subject for subject, _, _ in notifier.sent if "unavailable" in subject]) == 1
+
+
+def test_a_judge_that_can_not_be_used_is_told_once(build):
+    """A wrong LLM_DEBATE_JUDGE model (or its provider's key) fails every debate: each is merged by rule, and the
+    admins hear about it instead of finding out from the ideas weeks later."""
+    notifier = FakeNotifier()
+    judge = FakeChatModel(LLMSetupError("Anthropic has no model named claude-opus-9."), name="claude-opus-9")
+    panel = DebatePanel(debaters=debate_panel().debaters, judge=DebaterModel("anthropic:claude-opus-9", judge))
+    scanner = build(analysis_model=panel, notifiers=[notifier], config=QUIET)
+
+    [opp] = scanner.run_cycle(CYCLE).opportunities
+
+    assert opp.model == "debate: gpt-5 vs claude-sonnet-5, merged without a judge"
+    [(subject, markdown)] = [(subject, markdown) for subject, markdown, _ in notifier.sent if "judge" in subject]
+    assert subject == "dip-scanner: the debate's judge (Anthropic) can't be used"
+    assert "anthropic:claude-opus-9 couldn't be used for AMD" in markdown and "Check LLM_DEBATE_JUDGE" in markdown
+    scanner.analyze_ticker("AMD", now=CYCLE + timedelta(hours=1))
+    assert len([subject for subject, _, _ in notifier.sent if "judge" in subject]) == 1  # once in 12 hours
 
 
 def test_manual_analyses_debate_too(build):

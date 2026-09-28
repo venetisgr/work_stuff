@@ -51,8 +51,10 @@ CYCLES_KEPT = 500  # the newest cycle records kept (record_cycle deletes older o
 # the lookups of version 4 forgotten (its looser name test took HESM for Hess and a bond fund for Credit Suisse);
 # 6: the website's tables (users, invites, sessions, password_tokens, login_attempts, jobs, app_state, cycles) and
 # alert_deliveries, the alert state of each recipient, with the notified/alerted marks of version 5 moved to the
-# recipient "default".
-SCHEMA_VERSION = 6
+# recipient "default"; 7: opportunities.manual (manual analyses, backfilled from jobs), jobs.failure (why a job failed:
+# some failures don't count toward a member's limit), password_tokens.created_by (unused links of before forgotten:
+# their maker is unknown), model_calls.manual (the scanner's daily limit counts its own analyses only).
+SCHEMA_VERSION = 7
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -113,7 +115,8 @@ CREATE TABLE IF NOT EXISTS opportunities (
     -- handled for everybody: never to be sent (--no-notify, read in `analyze`, a cycle without any channel). Before
     -- version 6 also the command line's own sent or not-sent marks, which are in alert_deliveries now.
     notified TEXT,
-    alerted TEXT    -- shown to the command line's user (mark_notified); alert decisions use alert_deliveries
+    alerted TEXT,   -- shown to the command line's user (mark_notified); alert decisions use alert_deliveries
+    manual INTEGER NOT NULL DEFAULT 0  -- 1: a manual analysis ("Analyse now", `analyze`), not the scanner's own
 );
 CREATE INDEX IF NOT EXISTS opportunities_ticker_created ON opportunities (ticker, created);
 CREATE INDEX IF NOT EXISTS opportunities_created ON opportunities (created);
@@ -130,7 +133,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
     model TEXT NOT NULL,
     ticker TEXT,             -- the analysed ticker (analysis only)
     input_tokens INTEGER,    -- NULL when the service didn't report them
-    output_tokens INTEGER
+    output_tokens INTEGER,
+    manual INTEGER NOT NULL DEFAULT 0  -- 1: for a manual analysis ("Analyse now", `analyze`)
 );
 CREATE INDEX IF NOT EXISTS model_calls_created ON model_calls (created);
 CREATE TABLE IF NOT EXISTS system_notices (
@@ -190,7 +194,8 @@ CREATE TABLE IF NOT EXISTS password_tokens (
     purpose TEXT NOT NULL CHECK (purpose IN ('setup', 'reset')),
     created TEXT NOT NULL,
     expires TEXT NOT NULL,
-    used_at TEXT
+    used_at TEXT,
+    created_by INTEGER                  -- the admin who made it; NULL when made with the command line
 );
 CREATE TABLE IF NOT EXISTS login_attempts (
     key TEXT NOT NULL,                  -- "ip:<address>", "email:<address>", or another rate limit's key
@@ -206,7 +211,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     created TEXT NOT NULL,
     finished TEXT,
     opportunity_id INTEGER,
-    error TEXT
+    error TEXT,
+    failure TEXT                        -- the kind of failure (accounts.JOB_FAILURES), NULL unless failed
 );
 CREATE INDEX IF NOT EXISTS jobs_user_created ON jobs (user_id, created);
 CREATE TABLE IF NOT EXISTS app_state (
@@ -283,6 +289,22 @@ class Store:
                 if version < 6:
                     for statement in filter(str.strip, _MIGRATE_MARKS.split(";")):
                         conn.execute(statement)
+                if "manual" not in columns:
+                    conn.execute("ALTER TABLE opportunities ADD COLUMN manual INTEGER NOT NULL DEFAULT 0")
+                    conn.execute(
+                        "UPDATE opportunities SET manual = 1 "
+                        "WHERE id IN (SELECT opportunity_id FROM jobs WHERE opportunity_id IS NOT NULL)"
+                    )
+                if "manual" not in {row[1] for row in conn.execute("PRAGMA table_info(model_calls)")}:
+                    conn.execute("ALTER TABLE model_calls ADD COLUMN manual INTEGER NOT NULL DEFAULT 0")
+                if "failure" not in {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}:
+                    conn.execute("ALTER TABLE jobs ADD COLUMN failure TEXT")
+                if "created_by" not in {row[1] for row in conn.execute("PRAGMA table_info(password_tokens)")}:
+                    conn.execute("ALTER TABLE password_tokens ADD COLUMN created_by INTEGER")
+                    # Who made an unused link is unknown, so a disabled admin's can't be told apart: they go (a link
+                    # lives 48 hours at most, and a new one is a click or a command away).
+                    now = _ts(datetime.now(UTC))
+                    conn.execute("UPDATE password_tokens SET used_at = ? WHERE used_at IS NULL", (now,))
                 if version < SCHEMA_VERSION:
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.DatabaseError as exc:
@@ -650,21 +672,32 @@ class Store:
 
     # --- opportunities ---
 
-    def add_opportunity(self, opp: Opportunity) -> Opportunity:
-        """Store an opportunity and return a copy with its id set."""
+    def add_opportunity(self, opp: Opportunity, *, manual: bool = False) -> Opportunity:
+        """Store an opportunity and return a copy with its id set. manual: a manual analysis ("Analyse now" on the
+        website, `dip-scanner analyze`), marked in the same insert so a cycle running alongside never mistakes it
+        for one of the scanner's own."""
         data = opp.to_dict()
         data.pop("id", None)
         with self._write() as conn:
             cursor = conn.execute(
-                "INSERT INTO opportunities (ticker, created, score, data) VALUES (?, ?, ?, ?)",
-                (opp.ticker.strip().upper(), _ts(opp.created), float(opp.score), json.dumps(data)),
+                "INSERT INTO opportunities (ticker, created, score, data, manual) VALUES (?, ?, ?, ?, ?)",
+                (opp.ticker.strip().upper(), _ts(opp.created), float(opp.score), json.dumps(data), int(manual)),
             )
             return replace(opp, id=cursor.lastrowid)
 
-    def last_opportunity(self, ticker: str) -> Opportunity | None:
-        """The newest opportunity stored for a ticker."""
-        found = self.opportunities(ticker=ticker, limit=1)
-        return found[0] if found else None
+    def last_opportunity(self, ticker: str, *, include_manual: bool = True) -> Opportunity | None:
+        """The newest opportunity stored for a ticker; with include_manual=False, the newest of the scanner's own
+        (what its cooldown and same-session wait go by: a member's "Analyse now" mustn't hold a dip back)."""
+        sql = "SELECT id, data FROM opportunities WHERE ticker = ?"
+        if not include_manual:
+            sql += " AND manual = 0"
+        rows = self._query(sql + " ORDER BY created DESC, id DESC LIMIT 1", (ticker.strip().upper(),))
+        return _opportunity(rows[0]) if rows else None
+
+    def is_manual(self, opportunity_id: int) -> bool:
+        """Whether an opportunity is a manual analysis (see add_opportunity)."""
+        rows = self._query("SELECT manual FROM opportunities WHERE id = ?", (int(opportunity_id),))
+        return bool(rows and rows[0]["manual"])
 
     def opportunities(
         self,
@@ -783,6 +816,44 @@ class Store:
         rows = self._query(sql + " ORDER BY o.created DESC, o.id DESC LIMIT 1", params)
         return _opportunity(rows[0]) if rows else None
 
+    def sent_as_alert(self, opportunity_ids: Iterable[int], *, recipient: str = DEFAULT_RECIPIENT) -> set[int]:
+        """Those of these opportunities the scanner sent the recipient as alerts (not manual analyses they read, which
+        also count as alerted to them: recipients.mark_manual_analysis, `analyze`)."""
+        ids = [int(item) for item in dict.fromkeys(opportunity_ids)]
+        found: set[int] = set()
+        for chunk in _chunks(ids):
+            rows = self._query(
+                "SELECT d.opportunity_id FROM alert_deliveries d JOIN opportunities o ON o.id = d.opportunity_id "
+                "WHERE d.recipient = ? AND d.kind = 'alert' AND d.sent = 1 AND o.manual = 0 AND o.notified IS NULL "
+                f"AND d.opportunity_id IN ({_placeholders(len(chunk))})",
+                (recipient, *chunk),
+            )
+            found.update(int(row[0]) for row in rows)
+        return found
+
+    def alerted_ids(self, opportunity_ids: Iterable[int], *, recipient: str = DEFAULT_RECIPIENT) -> set[int]:
+        """Those of these opportunities that reached the recipient as an alert or a thesis change (a manual analysis
+        they read included: it counts as alerted to them)."""
+        ids = [int(item) for item in dict.fromkeys(opportunity_ids)]
+        found: set[int] = set()
+        for chunk in _chunks(ids):
+            rows = self._query(
+                "SELECT opportunity_id FROM alert_deliveries WHERE recipient = ? AND kind IN ('alert', 'thesis') "
+                f"AND sent = 1 AND opportunity_id IN ({_placeholders(len(chunk))})",
+                (recipient, *chunk),
+            )
+            found.update(int(row[0]) for row in rows)
+        return found
+
+    def waiting_for(self, opportunity_id: int, *, recipient: str = DEFAULT_RECIPIENT) -> bool:
+        """Whether a recipient has neither been sent an opportunity nor had it deliberately skipped (an attempt no
+        channel took leaves it waiting)."""
+        rows = self._query(
+            "SELECT 1 FROM alert_deliveries WHERE recipient = ? AND opportunity_id = ? AND (kind = 'handled' OR sent)",
+            (recipient, int(opportunity_id)),
+        )
+        return not rows
+
     def unnotified(self, *, since: datetime | None = None, recipient: str = DEFAULT_RECIPIENT) -> list[Opportunity]:
         """Opportunities still waiting for a recipient's decision, newest first (optionally only those created since):
         not handled for everybody (mark_notified), not sent to it and not deliberately skipped for it. An attempt
@@ -844,13 +915,23 @@ class Store:
         ticker: str | None = None,
         input_tokens: int | None = None,
         output_tokens: int | None = None,
+        manual: bool = False,
     ) -> None:
-        """Remember one call the model service answered, with the tokens it reported (None when it didn't)."""
+        """Remember one call the model service answered, with the tokens it reported (None when it didn't); manual:
+        for a manual analysis (see analyses_since)."""
         with self._write() as conn:
             conn.execute(
-                "INSERT INTO model_calls (created, step, model, ticker, input_tokens, output_tokens) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (_ts(when), step, model, ticker.strip().upper() if ticker else None, input_tokens, output_tokens),
+                "INSERT INTO model_calls (created, step, model, ticker, input_tokens, output_tokens, manual) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (
+                    _ts(when),
+                    step,
+                    model,
+                    ticker.strip().upper() if ticker else None,
+                    input_tokens,
+                    output_tokens,
+                    int(manual),
+                ),
             )
 
     def model_usage(self, *, since: datetime) -> list[ModelUsage]:
@@ -880,13 +961,14 @@ class Store:
             for row in rows
         ]
 
-    def analyses_since(self, since: datetime) -> int:
+    def analyses_since(self, since: datetime, *, include_manual: bool = True) -> int:
         """How many analyses the model answered since the given time (a corrective retry is part of its analysis,
         and a reply that turned out unusable counts too: it was paid for). A debate is one analysis however many
-        calls it made: its calls share the ticker and the time."""
+        calls it made: its calls share the ticker and the time. include_manual=False: the scanner's own only."""
+        manual = "" if include_manual else " AND manual = 0"
         rows = self._query(
             "SELECT COUNT(*) FROM (SELECT DISTINCT ticker, created FROM model_calls "
-            "WHERE (step = 'analysis' OR step LIKE 'analysis:%') AND created >= ?)",
+            f"WHERE (step = 'analysis' OR step LIKE 'analysis:%') AND created >= ?{manual})",
             (_ts(since),),
         )
         return int(rows[0][0])

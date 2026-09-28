@@ -773,6 +773,26 @@ def test_users_invite_list_disable_enable_and_reset_link(workdir, capsys, monkey
     assert "There is already an account for owner@example.com." in capsys.readouterr().err
 
 
+def test_users_unlock_forgets_an_emails_failed_sign_ins(workdir, capsys, fast_scrypt):
+    from dip_scanner.accounts import EMAIL_LIMIT, Accounts
+
+    with store_at(workdir) as store:
+        accounts = Accounts(store)
+        accounts.create_user("owner@example.com", role="admin", password="a long enough password")
+        for number in range(EMAIL_LIMIT):
+            accounts.record_failed_login(f"203.0.{number // 250}.{number % 250 + 1}", "Owner@example.com")
+        assert accounts.login_locked("198.51.100.1", "owner@example.com")
+    assert cli.main(["users", "unlock", "OWNER@example.com"]) == 0
+    assert capsys.readouterr().out == (
+        f"Forgot {2 * EMAIL_LIMIT} failed sign-ins for owner@example.com; it can sign in again.\n"
+    )
+    with store_at(workdir) as store:
+        accounts = Accounts(store)
+        assert not accounts.login_locked("198.51.100.1", "owner@example.com")
+        keys = [row[0] for row in store.query("SELECT key FROM login_attempts")]
+        assert len(keys) == EMAIL_LIMIT and all(key.startswith("ip:") for key in keys)  # the addresses' own counts
+
+
 def test_backup_copies_the_database_and_keeps_the_newest(workdir, capsys, monkeypatch):
     assert cli.main(["backup"]) == 1  # nothing yet
     assert "nothing to back up" in capsys.readouterr().err

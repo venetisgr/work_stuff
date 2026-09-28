@@ -56,7 +56,7 @@ from ..config import ScannerConfig, Settings, zone_name
 from ..feeds import USER_AGENT
 from ..fx import FxRates
 from ..models import VERDICTS, Feed, Opportunity, from_iso, utc
-from ..netguard import Resolver
+from ..netguard import Resolver, public_https_session
 from ..pipeline import format_tokens
 from ..prices import YahooPrices
 from ..report import (
@@ -76,7 +76,7 @@ from ..report import (
 from ..store import Store
 from . import auth
 from .context import AppContext, get_context
-from .control import ScannerControl
+from .control import SHUTDOWN_BUDGET, ScannerControl
 
 if TYPE_CHECKING:
     from .jobs import Analyse
@@ -590,7 +590,7 @@ async def _server_error(request: Request, exc: Exception) -> Response:
     else:
         response = await run_in_threadpool(error_page, request, 500, signed_out=True)
     # This response doesn't pass through WebMiddleware (Starlette sends it from its outermost layer).
-    _security_headers(response.headers, request.scope)
+    _security_headers(response.headers, request.scope, response.status_code)
     return response
 
 
@@ -602,14 +602,17 @@ def redact_path(path: str) -> str:
     return _TOKEN_PATH.sub(lambda match: f"/{match.group(1)}/…", path)
 
 
-def _security_headers(headers: MutableHeaders, scope: Scope) -> None:
+def _security_headers(headers: MutableHeaders, scope: Scope, status: int = 200) -> None:
     for name, value in SECURITY_HEADERS.items():
         if name not in headers:
             headers[name] = value
     if scope.get("scheme") == "https" and "strict-transport-security" not in headers:
         headers["Strict-Transport-Security"] = HSTS
     if "cache-control" not in headers:
-        headers["Cache-Control"] = STATIC_CACHE if str(scope.get("path", "")).startswith("/static/") else "no-store"
+        # Only a static file itself may be cached: a missing one is an error page for the signed-in visitor (their
+        # name, the session's form token, a renewed session cookie), which no cache may keep.
+        static = str(scope.get("path", "")).startswith("/static/") and (200 <= status < 300 or status == 304)
+        headers["Cache-Control"] = STATIC_CACHE if static else "no-store"
 
 
 def _write_cookies(headers: MutableHeaders, scope: Scope) -> None:
@@ -707,7 +710,7 @@ class WebMiddleware:
         if refusal is not None:
             status = refusal.status_code
             refusal.headers["Cache-Control"] = "no-store"  # also under /static/: a cache must never keep a refusal
-            _security_headers(refusal.headers, scope)
+            _security_headers(refusal.headers, scope, refusal.status_code)
             await refusal(scope, receive, send)
             _log_access(scope, status, started)
             return
@@ -717,7 +720,7 @@ class WebMiddleware:
             if message["type"] == "http.response.start":
                 status = message["status"]
                 headers = MutableHeaders(scope=message)
-                _security_headers(headers, scope)
+                _security_headers(headers, scope, status)
                 _write_cookies(headers, scope)
                 if "location" in headers:
                     headers["location"] = relative_location(headers["location"], scope)
@@ -776,9 +779,11 @@ def create_app(
     analyse_unavailable: str | None = None,
     job_executor: Executor | None = None,
     http_session: Any = None,
+    webhook_session: Any = None,
     resolver: Resolver | None = None,
     trust_fly_client_ip: bool = False,
     on_shutdown: Sequence[Callable[[], None]] = (),
+    shutdown_budget: float = SHUTDOWN_BUDGET,
 ) -> FastAPI:
     """The website. Everything it talks to can be passed in (tests pass fakes); what isn't is built from settings.
 
@@ -786,9 +791,11 @@ def create_app(
     control (server.py builds it; None: the scanner is "disabled" here). prices / fx: Yahoo clients (the scanner's in
     `serve`, so their caches are shared). analyse(ticker, now) -> Opportunity: what "Analyse now" runs (the
     scanner's analyze_ticker; None: not available, analyse_unavailable says why). job_executor: where the analyses
-    run (default: one background thread). http_session: for test alerts. resolver: webhook host lookups.
+    run (default: one background thread). http_session: for test alerts. webhook_session: for test alerts to members'
+    webhooks (default: netguard.public_https_session, or http_session when one is given). resolver: webhook host
+    lookups.
     trust_fly_client_ip: take the visitor's address from Fly-Client-IP (on Fly.io). on_shutdown: called when the
-    app stops, after the scanner's loop.
+    app stops, after the scanner's loop and the running analysis (given shutdown_budget seconds together, see _stop).
 
     Raises ConfigError when SECRET_KEY is missing or too short.
     """
@@ -797,6 +804,8 @@ def create_app(
     clock = clock or _now
     store = Store(Path(store_path))
     accounts = Accounts(store, defaults=UserSettings.defaults(config, settings), clock=clock)
+    if webhook_session is None:
+        webhook_session = http_session if http_session is not None else public_https_session(resolver)
     http = http_session if http_session is not None else _http_session()
     prices = prices if prices is not None else YahooPrices(http, clock=clock)
     fx = fx if fx is not None else FxRates(prices, clock=clock)
@@ -826,6 +835,7 @@ def create_app(
         jobs=jobs,
         templates=make_templates(),
         http=http,
+        webhook_http=webhook_session,
         clock=clock,
         resolver=resolver,
         trust_fly_client_ip=trust_fly_client_ip,
@@ -838,7 +848,7 @@ def create_app(
         try:
             yield
         finally:
-            await run_in_threadpool(_stop, ctx, on_shutdown)
+            await run_in_threadpool(_stop, ctx, on_shutdown, shutdown_budget)
 
     app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.ctx = ctx
@@ -868,9 +878,18 @@ def _start(ctx: AppContext) -> None:
     ctx.control.start()
 
 
-def _stop(ctx: AppContext, on_shutdown: Sequence[Callable[[], None]]) -> None:
-    ctx.control.shutdown()
-    ctx.jobs.shutdown()
+def _stop(ctx: AppContext, on_shutdown: Sequence[Callable[[], None]], budget: float = SHUTDOWN_BUDGET) -> None:
+    """The website is stopping (SIGTERM from Fly on a deploy or restart): no new manual analyses, the scanner ends its
+    cycle before its next candidate, and both get up to budget seconds together to finish what they are doing (a model
+    call that is paid for must also be recorded). Only then are the databases closed. It all happens here, inside the
+    lifespan: uvicorn ends the process as soon as this returns."""
+    ctx.jobs.stop()
+    ctx.control.begin_shutdown()
+    deadline = time.monotonic() + budget
+    ctx.control.join(max(0.0, deadline - time.monotonic()))
+    if ctx.control.alive():
+        log.warning("The scanner's cycle didn't finish within %.0f s of the shutdown; leaving it behind.", budget)
+    ctx.jobs.wait(max(0.0, deadline - time.monotonic()))
     for callback in on_shutdown:
         try:
             callback()

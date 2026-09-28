@@ -27,7 +27,7 @@ from dip_scanner import cli
 from dip_scanner.config import DATABASE_NAME, ScannerConfig, Settings, WebSettings, load_settings
 from dip_scanner.web import server
 from dip_scanner.web.app import create_app
-from dip_scanner.web.control import STOP_TIMEOUT
+from dip_scanner.web.control import SHUTDOWN_BUDGET
 
 PROJECT = Path(__file__).resolve().parent.parent
 REPOSITORY = PROJECT.parent
@@ -272,7 +272,8 @@ def test_the_proxy_port_is_the_one_serve_listens_on():
 def test_fly_waits_long_enough_for_a_clean_stop():
     config = fly()
     assert config["kill_signal"] in ("SIGINT", "SIGTERM")  # uvicorn shuts down gracefully on both
-    assert seconds(config["kill_timeout"]) > server.GRACEFUL_SHUTDOWN_SECONDS + STOP_TIMEOUT
+    # uvicorn's graceful shutdown, then the scanner's cycle and a running analysis (together), with a margin.
+    assert seconds(config["kill_timeout"]) >= server.GRACEFUL_SHUTDOWN_SECONDS + SHUTDOWN_BUDGET + 10
     assert seconds(config["kill_timeout"]) <= 300  # Fly's maximum
 
 
@@ -321,10 +322,18 @@ def test_workflow_structure():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.safe_load(workflow_text())
     triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 reads a bare `on` as true
-    for event in ("pull_request", "push"):
-        assert triggers[event]["paths"] == ["news-dip-scanner/**", ".github/workflows/news-dip-scanner.yml"]
+    # Every pull request runs it: a workflow skipped by a paths filter leaves a required check waiting for ever.
+    assert "pull_request" in triggers and not (triggers["pull_request"] or {}).get("paths")
+    assert triggers["push"]["paths"] == ["news-dip-scanner/**", ".github/workflows/news-dip-scanner.yml"]
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {"contents": "read"}
+    # Pending pushes must never be cancelled: the changes job only compares its own push, so the run that replaced a
+    # cancelled one would miss its files and skip a deploy.
+    assert workflow["concurrency"] == {
+        "group": "news-dip-scanner-${{ github.ref }}",
+        "cancel-in-progress": False,
+        "queue": "max",
+    }
 
     changes = workflow["jobs"]["changes"]
     assert set(changes["outputs"]) == {"app", "python", "frontend"}
@@ -348,6 +357,10 @@ def test_workflow_structure():
     assert node["with"]["cache-dependency-path"] == "news-dip-scanner/frontend/package-lock.json"
     commands = [step.get("run", "") for step in frontend["steps"]]
     assert commands[-5:] == ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"]
+
+    checks = workflow["jobs"]["checks"]  # the one check branch protection requires (docs/DEPLOY.md step 10)
+    assert checks["name"] == "Checks" and checks["needs"] == ["changes", "test", "frontend"]
+    assert checks["if"] == "always()"
 
     deploy = workflow["jobs"]["deploy"]
     assert deploy["needs"] == ["changes", "test"]
@@ -389,16 +402,66 @@ def run_changes(files: str, tmp_path: Path) -> dict[str, str]:
         ("news-dip-scanner/frontend/contract/api-v1.schema.json", ("false", "true", "true")),
         ("news-dip-scanner/README.md\nnews-dip-scanner/frontend/README.md", ("true", "true", "true")),
         (".github/workflows/news-dip-scanner.yml", ("true", "true", "true")),
-        ("news-dip-scanner/frontend-notes.md", ("true", "true", "false")),
+        ("news-dip-scanner/frontend-notes.md", ("false", "true", "false")),
+        ("news-dip-scanner/docs/DEPLOY.md", ("false", "true", "false")),  # a typo fix doesn't restart the Machine
+        ("news-dip-scanner/tests/test_web.py\nnews-dip-scanner/docs/screenshots/a.png", ("false", "true", "false")),
+        ("news-dip-scanner/fly.toml", ("true", "true", "false")),
+        ("news-dip-scanner/Dockerfile\nnews-dip-scanner/scanner.toml", ("true", "true", "false")),
+        ("news-dip-scanner/pyproject.toml", ("true", "true", "false")),
+        ("sharepoint-digest/README.md\nREADME.md", ("false", "false", "false")),  # another project's pull request
     ],
 )
 def test_workflow_runs_and_deploys_only_what_changed(files, expected, tmp_path):
-    """A front-end change alone neither tests nor redeploys the Python app; a contract change tests both sides."""
+    """Only the Fly image's inputs redeploy the Python app; a front-end change alone neither tests nor redeploys it;
+    a contract change tests both sides."""
     outputs = run_changes(files, tmp_path)
     assert (outputs["app"], outputs["python"], outputs["frontend"]) == expected
 
 
+@pytest.mark.parametrize(
+    ("results", "passes"),
+    [
+        ("success skipped skipped", True),  # a change to another project: nothing to check
+        ("success success success", True),
+        ("success success skipped", True),
+        ("failure skipped skipped", False),  # "What changed" failed: every check skipped isn't a pass
+        ("success failure skipped", False),
+        ("success cancelled success", False),
+    ],
+)
+def test_the_required_check_passes_only_when_every_needed_check_did(results, passes):
+    yaml = pytest.importorskip("yaml")
+    if shutil.which("bash") is None:
+        pytest.skip("no bash")
+    [step] = yaml.safe_load(workflow_text())["jobs"]["checks"]["steps"]
+    env = {"PATH": os.environ.get("PATH", ""), "RESULTS": results}
+    done = subprocess.run(["bash", "-eo", "pipefail", "-c", step["run"]], env=env, capture_output=True)
+    assert (done.returncode == 0) is passes
+
+
 # --- docs/DEPLOY.md ------------------------------------------------------------------------------------------------
+
+
+def test_the_settings_steps_work_with_flyctls_sftp():
+    """flyctl's sftp refuses to overwrite a file on either side: `get` into the repository's own scanner.toml fails at
+    once, and a second `put` to /data/scanner.toml fails for good (checked with flyctl v0.4.108's code)."""
+    text = DEPLOY_MD.read_text(encoding="utf-8")
+    commands = [line.strip() for line in text.splitlines() if "fly ssh sftp" in line]
+    assert commands, "step 14 downloads and uploads with fly ssh sftp"
+    for command in commands:
+        assert not re.search(r"sftp get \S+ (scanner|feeds)\.toml\b", command), command
+        put = re.search(r"sftp put \S+ (/data/\S+\.toml)\b", command)
+        if put:
+            target = put.group(1)
+            assert target.endswith("-new.toml"), command  # uploaded next to the file in use, checked, then moved
+            assert f"rm -f {target}" in text and f"mv {target} /data/" in text
+    assert "rm -f scanner-fly.toml" in text
+
+
+def test_the_required_check_is_the_one_that_always_runs():
+    text = " ".join(DEPLOY_MD.read_text(encoding="utf-8").split())
+    assert 'requires the "Checks" status check' in text
+    assert "counts as passed" not in text
 
 
 def slug(heading: str) -> str:

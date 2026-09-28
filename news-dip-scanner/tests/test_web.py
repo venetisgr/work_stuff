@@ -9,12 +9,15 @@ from __future__ import annotations
 import logging
 import re
 import socket
-from concurrent.futures import Executor, Future
+import threading
+import time
+from concurrent.futures import Executor, Future, ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
+import requests
 from conftest import FakeSession, make_analysis, make_opportunity
 from fastapi.testclient import TestClient
 
@@ -22,6 +25,7 @@ from dip_scanner import accounts as accounts_module
 from dip_scanner.config import DATABASE_NAME, NotifySettings, ScannerConfig, Settings, WebSettings
 from dip_scanner.prices import PriceError
 from dip_scanner.report import display_zone_as
+from dip_scanner.store import Store
 from dip_scanner.web import app as web_app
 from dip_scanner.web import auth
 from dip_scanner.web.app import CSP, create_app, make_templates, paginate, relative_time, static_url, url_with
@@ -95,6 +99,7 @@ class Site:
         http: FakeSession | None = None,
         trust_fly: bool = False,
         base_url: str = BASE,
+        shutdown_budget: float = 5.0,
     ) -> None:
         values = {"secret_key": "s" * 40, "base_url": BASE, "cookie_secure": True}
         values.update(web or {})
@@ -114,6 +119,7 @@ class Site:
             http_session=self.http,
             resolver=public_resolver,
             trust_fly_client_ip=trust_fly,
+            shutdown_budget=shutdown_budget,
         )
         self.ctx = self.app.state.ctx
         self.accounts = self.ctx.accounts
@@ -228,17 +234,72 @@ def test_failed_sign_ins_count_per_address_across_emails(site):
     assert site.sign_in("real@example.com").status_code == 429  # the same IP address
 
 
-def test_failed_sign_ins_count_per_email_across_addresses(tmp_path):
+def test_failures_from_other_addresses_never_lock_the_owner_out(tmp_path):
+    """Anybody who knows an address can send wrong passwords for it: that mustn't keep its owner from signing in."""
     site = Site(tmp_path, trust_fly=True)
     site.user()
     client = site.client
     for number in range(10):
         client.headers["Fly-Client-IP"] = f"203.0.113.{number}"
-        site.sign_in("member@example.com", "wrong password!")
+        assert site.sign_in("member@example.com", "wrong password!").status_code == 400
     client.headers["Fly-Client-IP"] = "198.51.100.1"
-    assert site.sign_in("member@example.com").status_code == 429
+    assert site.sign_in("member@example.com").status_code == 303
     keys = {row[0] for row in site.store.query("SELECT key FROM login_attempts")}
-    assert "ip:203.0.113.4" in keys and "email:member@example.com" in keys
+    assert "ip:203.0.113.4" in keys  # the attackers' own addresses still count
+    assert not any(key.startswith(("email:", "email_ip:")) for key in keys)  # forgotten after signing in
+
+
+def test_ten_failures_from_one_address_lock_that_address_and_email(tmp_path):
+    site = Site(tmp_path, trust_fly=True)
+    site.user()
+    site.client.headers["Fly-Client-IP"] = "203.0.113.7"
+    for _ in range(10):
+        site.sign_in("member@example.com", "wrong password!")
+    assert site.sign_in("member@example.com").status_code == 429
+    site.client.headers["Fly-Client-IP"] = "2001:db8:1:2:aaaa::1"
+    for _ in range(10):
+        site.sign_in("member@example.com", "wrong password!")
+    site.client.headers["Fly-Client-IP"] = "2001:db8:1:2:bbbb::9"  # the same /64: the same household
+    assert site.sign_in("member@example.com").status_code == 429
+    site.client.headers["Fly-Client-IP"] = "198.51.100.1"
+    assert site.sign_in("member@example.com").status_code == 303
+
+
+def test_guessing_spread_over_many_addresses_hits_a_ceiling_per_email(tmp_path):
+    site = Site(tmp_path, trust_fly=True)
+    site.user()
+    for number in range(100):
+        site.client.headers["Fly-Client-IP"] = f"203.0.{number // 250}.{number % 250 + 1}"
+        site.sign_in("member@example.com", "wrong password!")
+    site.client.headers["Fly-Client-IP"] = "198.51.100.1"
+    assert site.sign_in("member@example.com").status_code == 429
+    site.clock.advance(minutes=61)  # the ceiling counts the last hour
+    assert site.sign_in("member@example.com").status_code == 303
+
+
+def test_sign_in_failures_elsewhere_never_block_a_password_change(tmp_path):
+    site = Site(tmp_path, trust_fly=True)
+    client = site.signed_in()
+    attacker = site.new_client()
+    for number in range(100):
+        attacker.headers["Fly-Client-IP"] = f"203.0.{number // 250}.{number % 250 + 1}"
+        site.sign_in("member@example.com", "wrong password!", client=attacker)
+    form = {"current_password": PASSWORD, "new_password": "y" * 12, "confirm": "y" * 12}
+    assert post_form(client, "/settings/password", form).status_code == 303
+
+
+def test_a_password_link_forgets_the_failed_sign_ins(tmp_path):
+    site = Site(tmp_path, trust_fly=True)
+    user = site.user()
+    for number in range(100):
+        site.client.headers["Fly-Client-IP"] = f"203.0.{number // 250}.{number % 250 + 1}"
+        site.sign_in("member@example.com", "wrong password!")
+    link = site.accounts.create_password_token(user.id, "reset")
+    site.accounts.use_password_token(link, "a brand new password")
+    keys = [row[0] for row in site.store.query("SELECT key FROM login_attempts")]
+    assert keys and not any(key.startswith(("email:", "email_ip:")) for key in keys)
+    site.client.headers["Fly-Client-IP"] = "198.51.100.1"
+    assert site.sign_in("member@example.com", "a brand new password").status_code == 303
 
 
 def test_fly_client_ip_is_only_trusted_on_fly(site):
@@ -612,8 +673,8 @@ def test_send_test_alert_reports_each_channel_and_is_rate_limited(tmp_path):
     http = FakeSession({HOOK: 200})
     site = Site(tmp_path, http=http)
     client = site.signed_in()
-    assert post_form(client, "/settings/test").headers["location"] == "/settings#channels"
-    assert "Set up an alert channel and save it first" in client.get("/settings").text
+    assert post_form(client, "/settings/test").headers["location"] == "/settings"
+    assert "Set up an alert channel first" in client.get("/settings").text
     post_form(client, "/settings", full_form(webhook_format="slack"))
 
     response = post_form(client, "/settings/test")
@@ -630,6 +691,68 @@ def test_send_test_alert_reports_each_channel_and_is_rate_limited(tmp_path):
         post_form(client, "/settings/test")
     blocked = post_form(client, "/settings/test")  # the 6th in 15 minutes (the first had no channel)
     assert blocked.status_code == 429 and "test alerts in the last 15 minutes" in blocked.text
+
+
+def test_the_test_alert_result_is_where_the_page_opens(tmp_path):
+    """The redirect used to jump to #channels, a screen or two below the result at the top of the page: on a phone
+    the button seemed to do nothing."""
+    site = Site(tmp_path, http=FakeSession({HOOK: 200}))
+    client = site.signed_in()
+    post_form(client, "/settings", full_form(webhook_format="slack"))
+    response = post_form(client, "/settings/test")
+    assert response.status_code == 303 and response.headers["location"] == "/settings"
+    page = client.get("/settings").text
+    assert page.index("Slack webhook: test alert sent.") < page.index('id="alerts"')  # above the first card
+
+
+def test_the_test_alert_button_saves_and_tests_what_is_on_the_screen(tmp_path):
+    """A webhook typed but not saved used to be thrown away, and the test went to the old one."""
+    other = "https://hooks.example.com/services/T000/B000/the-new-hook"
+    http = FakeSession({HOOK: 200, other: 200})
+    site = Site(tmp_path, http=http)
+    client = site.signed_in()
+    post_form(client, "/settings", full_form(webhook_format="generic"))
+    page = client.get("/settings").text
+    assert 'formaction="/settings/test"' in page  # the button is part of the settings form
+    response = post_form(client, "/settings/test", full_form(webhook_url=other, webhook_format="generic"))
+    assert response.headers["location"] == "/settings"
+    assert [call["url"] for call in http.calls] == [other]
+    assert site.accounts.get_user_by_email("member@example.com").settings.webhook_url == other
+    shown = client.get("/settings").text
+    assert "Settings saved." in shown and "Generic webhook: test alert sent." in shown
+    bad = post_form(client, "/settings/test", full_form(webhook_url="http://127.0.0.1/x"))
+    assert bad.status_code == 400 and "Nothing was saved" in bad.text and len(http.calls) == 1
+
+
+def test_a_discord_address_gets_the_discord_format(tmp_path):
+    """Slack's payload is an empty message to Discord (400): every alert would fail, unseen, for a day."""
+    discord = "https://discord.com/api/webhooks/123/SECRET-TOKEN"
+    site = Site(tmp_path)
+    client = site.signed_in()
+    post_form(client, "/settings", full_form(webhook_url=discord, webhook_format="slack"))
+    assert site.accounts.get_user_by_email("member@example.com").settings.webhook_format == "discord"
+    assert "The webhook format is Discord, to match the webhook&#39;s address." in client.get("/settings").text
+    post_form(
+        client, "/settings", full_form(webhook_url=HOOK, webhook_format="generic")
+    )  # any other address: as chosen
+    assert site.accounts.get_user_by_email("member@example.com").settings.webhook_format == "generic"
+
+
+def test_a_failed_test_alert_says_nothing_about_the_servers_network(tmp_path):
+    raw = requests.ConnectionError(
+        "HTTPSConnectionPool(host='hooks.example.com', port=443): Max retries exceeded (Caused by NewConnectionError("
+        "'Failed to establish a new connection: [Errno 111] Connection refused'))"
+    )
+    http = FakeSession({HOOK: raw})
+    site = Site(tmp_path, http=http)
+    client = site.signed_in()
+    post_form(client, "/settings", full_form(webhook_format="slack"))
+    post_form(client, "/settings/test")
+    [flash] = re.findall(r'<div class="flash flash-error"><p>(.*?)</p>', client.get("/settings").text)
+    assert flash == (
+        "Slack webhook: the test alert failed: Couldn&#39;t reach the slack webhook at hooks.example.com. Check the "
+        "address, or try again later."
+    )
 
 
 def test_changing_the_password_signs_out_the_other_sessions(site):
@@ -733,8 +856,58 @@ def test_a_failed_analysis_says_why(tmp_path):
     post_form(client, "/analyze", {"ticker": "XYZ"})
     page = client.get("/jobs/1")
     assert page.status_code == 200
-    assert "No prices for XYZ (unknown symbol)." in page.text
-    assert "http-equiv" not in page.text and "Try again" in page.text
+    assert "No prices for XYZ (unknown symbol). It doesn't count toward your limit." in page.text
+    assert "http-equiv" not in page.text
+    assert "Try again" not in page.text  # it would only fail the same way
+
+
+def test_failures_before_the_model_is_asked_do_not_use_up_the_limit(tmp_path):
+    """No prices, Yahoo down, a setup problem, a restart: a member's retries cost nothing, so they can't cost one of
+    their analyses either. A failure after the model answered (paid for) does count."""
+    from dip_scanner.llm import LLMError, LLMSetupError
+    from dip_scanner.prices import PriceFetchError
+
+    outcomes = {"now": PriceError("Yahoo Finance has no prices for ZZZZQ.")}
+
+    def analyse(ticker, now):
+        if isinstance(outcomes["now"], Exception):
+            raise outcomes["now"]
+        return analyse_ok(ticker, now)
+
+    site = Site(tmp_path, analyse=analyse, web={"analyze_limit_per_user": 2})
+    client = site.signed_in()
+    user = site.accounts.get_user_by_email("member@example.com")
+    for number in range(5):
+        assert post_form(client, "/analyze", {"ticker": f"ZZ{number}"}).status_code == 303
+    assert site.ctx.jobs.remaining(user) == 2
+    outcomes["now"] = PriceFetchError("Yahoo Finance couldn't be reached.")
+    post_form(client, "/analyze", {"ticker": "AMD"})
+    assert "Try again" in client.get("/jobs/6").text  # Yahoo may answer in a minute
+    outcomes["now"] = LLMSetupError("The model can't be used.")
+    post_form(client, "/analyze", {"ticker": "NVDA"})
+    assert site.ctx.jobs.remaining(user) == 2
+    outcomes["now"] = LLMError("The model's reply was unusable.")
+    post_form(client, "/analyze", {"ticker": "INTC"})
+    assert site.ctx.jobs.remaining(user) == 1  # the model was asked: it counts
+    outcomes["now"] = None
+    assert post_form(client, "/analyze", {"ticker": "AAPL"}).status_code == 303
+    assert site.ctx.jobs.remaining(user) == 0
+    last = client.get("/jobs/8").text  # the LLMError one, with nothing left: no "Try again" leading to a 429
+    assert "didn't finish" in last and "Try again" not in last
+
+
+def test_the_command_lines_hint_reads_as_the_websites_on_a_job_page(tmp_path):
+    def renamed(ticker, now):
+        raise PriceError(
+            f"Yahoo Finance has no prices for {ticker}. Yahoo's search finds ALWN.AT (Allwyn) for OPAP: try "
+            "`dip-scanner analyze ALWN.AT`."
+        )
+
+    site = Site(tmp_path, analyse=renamed)
+    client = site.signed_in()
+    post_form(client, "/analyze", {"ticker": "OPAP.AT"})
+    page = client.get("/jobs/1").text
+    assert "open ALWN.AT&#39;s page to analyse it" in page and "dip-scanner analyze" not in page
 
 
 def test_an_unexpected_failure_is_logged_but_not_shown(tmp_path, caplog):
@@ -778,7 +951,10 @@ def test_analyse_now_refuses_what_it_cannot_do(tmp_path):
     client = site.signed_in()
     response = post_form(client, "/analyze", {"ticker": "AMD", "next": "/ideas/1"})
     assert response.headers["location"] == "/ideas/1"
-    assert "Manual analyses aren&#39;t available on this server." in client.get("/settings").text
+    assert "Manual analyses aren&#39;t available right now." in client.get("/settings").text  # a member's words
+    admin = site.signed_in("admin@example.com", role="admin")
+    post_form(admin, "/analyze", {"ticker": "AMD"})
+    assert "Manual analyses aren&#39;t available on this server." in admin.get("/settings").text
     works = Site(tmp_path / "other", analyse=analyse_ok)
     client = works.signed_in()
     bad = post_form(client, "/analyze", {"ticker": "not a symbol!", "next": "https://evil.com"})
@@ -803,7 +979,66 @@ def test_unfinished_jobs_are_marked_failed_when_the_website_starts(tmp_path):
     post_form(client, "/analyze", {"ticker": "AMD"})
     with TestClient(site.app, base_url=BASE):
         job = site.accounts.get_job(1)
+        user = site.accounts.get_user_by_email("member@example.com")
+        assert site.ctx.jobs.remaining(user) == site.settings.web.analyze_limit_per_user
     assert job.status == "failed" and "restart" in job.error
+    assert not job.counts and job.can_retry  # a restart isn't the member's doing
+
+
+def slow_analysis():
+    """An analysis that starts and then waits for release (a debate's model calls taking their time)."""
+    started, release = threading.Event(), threading.Event()
+
+    def analyse(ticker, now):
+        started.set()
+        release.wait(10)
+        return analyse_ok(ticker, now)
+
+    return analyse, started, release
+
+
+def test_a_shutdown_waits_for_the_running_analysis_before_closing_the_database(tmp_path):
+    """SIGTERM on a deploy: the paid analysis that is running is finished and stored, not cut off under a closed
+    database (and its usage lost), and no new one starts."""
+    analyse, started, release = slow_analysis()
+    site = Site(tmp_path, analyse=analyse, executor=ThreadPoolExecutor(max_workers=1))
+    user = site.user()
+    client = TestClient(site.app, base_url=BASE)
+    client.__enter__()
+    job = site.ctx.jobs.submit(user, "AMD")
+    assert started.wait(5)
+    closer = threading.Thread(target=client.__exit__, args=(None, None, None))
+    closer.start()
+    time.sleep(0.3)
+    assert closer.is_alive()  # the shutdown waits for it
+    with pytest.raises(accounts_module.AccountError, match="restarting"):
+        site.ctx.jobs.submit(user, "NVDA")
+    release.set()
+    closer.join(10)
+    assert not closer.is_alive()
+    with Store(site.settings.data_dir / DATABASE_NAME) as store:
+        done = accounts_module.Accounts(store).get_job(job.id)
+        assert done.status == "done" and store.get_opportunity(done.opportunity_id) is not None
+
+
+def test_an_analysis_that_outlasts_the_shutdown_budget_is_failed_and_not_counted(tmp_path, caplog):
+    analyse, started, release = slow_analysis()
+    site = Site(tmp_path, analyse=analyse, executor=ThreadPoolExecutor(max_workers=1), shutdown_budget=0.2)
+    user = site.user()
+    try:
+        with TestClient(site.app, base_url=BASE):
+            job = site.ctx.jobs.submit(user, "AMD")
+            assert started.wait(5)
+        with Store(site.settings.data_dir / DATABASE_NAME) as store:
+            accounts = accounts_module.Accounts(store, clock=site.clock)
+            failed = accounts.get_job(job.id)
+            assert (failed.status, failed.failure) == ("failed", "restart") and not failed.counts
+            assert "doesn't count toward your limit" in failed.error
+            assert accounts.count_jobs(user.id) == 0
+        assert "Cannot operate on a closed database" not in caplog.text
+    finally:
+        release.set()
+        site.ctx.jobs._pool().shutdown(wait=True)  # the abandoned analysis ends (on the closed database)
 
 
 # --- errors, headers, static files ---------------------------------------------------------------------------------
@@ -822,6 +1057,10 @@ def test_every_response_carries_the_security_headers(site):
         assert headers["strict-transport-security"] == "max-age=31536000"
     assert client.get("/settings").headers["cache-control"] == "no-store"
     assert "max-age" in client.get("/static/app.css").headers["cache-control"]
+    # A missing static file is an error page with the visitor's name and form token (and maybe a renewed session
+    # cookie): never cacheable.
+    missing = client.get("/static/nope-x.css")
+    assert missing.status_code == 404 and missing.headers["cache-control"] == "no-store"
     assert "frame-ancestors 'none'" in CSP and "script-src 'self'" in CSP and "unsafe-inline" not in CSP
 
 

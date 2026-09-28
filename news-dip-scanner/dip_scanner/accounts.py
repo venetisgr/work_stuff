@@ -19,6 +19,7 @@ import base64
 import contextlib
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -28,6 +29,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from .config import WEBHOOK_FORMATS, ConfigError, ScannerConfig, Settings, display_zone, zone_name
 from .models import VERDICTS, from_iso, utc
@@ -44,8 +46,13 @@ PASSWORD_TOKEN_LIFETIME = timedelta(hours=48)
 PASSWORD_PURPOSES = ("setup", "reset")
 SESSION_LIFETIME = timedelta(days=30)  # from the last visit
 SESSION_TOUCH = timedelta(minutes=5)  # a session's last_seen and expiry are written at most this often
-LOGIN_LIMIT = 10  # failed logins per IP address, and per email address, within LOGIN_WINDOW
+# Failed logins within LOGIN_WINDOW per network address (an IPv6 /64), and per email address from one network address:
+# failures from elsewhere never lock an account's owner out.
+LOGIN_LIMIT = 10
 LOGIN_WINDOW = timedelta(minutes=15)
+# Failed logins per email address from anywhere within EMAIL_WINDOW: a ceiling for guessing spread over many addresses.
+EMAIL_LIMIT = 100
+EMAIL_WINDOW = timedelta(hours=1)
 MIN_PASSWORD_LENGTH = 10
 MAX_PASSWORD_LENGTH = 1024
 MAX_NAME_LENGTH = 80
@@ -53,6 +60,15 @@ MAX_EMAIL_LENGTH = 254
 MAX_WATCHLIST = 100
 JOB_KINDS = ("analyze",)
 JOB_STATUSES = ("queued", "running", "done", "failed")
+# Why a job failed (jobs.failure): no_prices (Yahoo has none for the symbol), prices_down (Yahoo couldn't be reached),
+# setup (the model or a setting can't be used), model (the model's reply was unusable: it was paid for), restart (the
+# website restarted before it finished), error (a bug).
+JOB_FAILURES = ("no_prices", "prices_down", "setup", "model", "restart", "error")
+# Failures before any model call, or not the member's doing: they don't count toward ANALYZE_LIMIT_PER_USER.
+FREE_FAILURES = ("no_prices", "prices_down", "setup", "restart")
+# Failures that trying again can't fix (until a symbol or a setting changes): no "Try again" for them.
+FINAL_FAILURES = ("no_prices", "setup")
+RESTART_FAILURE = "Interrupted by a restart of the website; it doesn't count toward your limit. Start it again."
 DAY = timedelta(hours=24)
 SCRYPT_N, SCRYPT_R, SCRYPT_P = 2**14, 8, 1
 _SALT_BYTES = 16
@@ -346,6 +362,9 @@ def validate_settings(
     take("timezone", _parse_timezone)
 
     result = replace(current, **values)
+    known = webhook_format_for(result.webhook_url)
+    if known is not None and result.webhook_format != known:  # a Discord address with the Slack format fails for good
+        result = replace(result, webhook_format=known)
     # A channel the server can't serve is refused when it is asked for (not when other settings are saved).
     if values.get("email_alerts") and not email_ready(settings):
         errors["email_alerts"] = "Email alerts aren't available: the server has no email (SMTP) settings."
@@ -354,6 +373,25 @@ def validate_settings(
     if errors:
         raise SettingsError(errors)
     return result
+
+
+# Webhook addresses whose service takes only one of the formats: (host, path prefix) -> the format.
+_KNOWN_WEBHOOKS = (
+    ("hooks.slack.com", "/services/", "slack"),
+    ("discord.com", "/api/webhooks/", "discord"),
+    ("discordapp.com", "/api/webhooks/", "discord"),
+    ("ptb.discord.com", "/api/webhooks/", "discord"),
+    ("canary.discord.com", "/api/webhooks/", "discord"),
+)
+
+
+def webhook_format_for(url: str | None) -> str | None:
+    """The only format a known service's incoming webhook takes (Slack's, Discord's), or None for other addresses."""
+    if not url:
+        return None
+    parts = urlsplit(url)
+    host = (parts.hostname or "").lower().rstrip(".")
+    return next((fmt for known, path, fmt in _KNOWN_WEBHOOKS if host == known and parts.path.startswith(path)), None)
 
 
 def email_ready(settings: Settings) -> bool:
@@ -536,11 +574,12 @@ class Session:
 
 @dataclass(frozen=True)
 class PasswordToken:
-    token_hash: str
+    token_hash: str  # identifies the link in admin pages (revoke_password_token); not the token in the link
     user: User
     purpose: str  # "setup" (first password) or "reset"
     created: datetime
     expires: datetime
+    created_by: int | None = None  # the admin who made it; None when made with the command line
 
 
 @dataclass(frozen=True)
@@ -554,10 +593,21 @@ class Job:
     finished: datetime | None
     opportunity_id: int | None
     error: str | None
+    failure: str | None = None  # JOB_FAILURES, for a failed job
 
     @property
     def done(self) -> bool:
         return self.status in ("done", "failed")
+
+    @property
+    def counts(self) -> bool:
+        """Whether it counts toward the member's daily limit (failures before any model call don't)."""
+        return self.failure not in FREE_FAILURES
+
+    @property
+    def can_retry(self) -> bool:
+        """Whether starting it again may work (a symbol without prices or a broken setup won't)."""
+        return self.status == "failed" and self.failure not in FINAL_FAILURES
 
 
 _USER_COLUMNS = (
@@ -670,19 +720,23 @@ class Accounts:
         return self._user(user_id)
 
     def set_role(self, user_id: int, role: str) -> User:
-        """Make a user an admin or a member. The last admin who can sign in can't be made a member."""
+        """Make a user an admin or a member. The last admin who can sign in can't be made a member. An admin made a
+        member loses the unused invite and password links they made (_revoke_links_of)."""
         _check_role(role)
         user = self._user(user_id)
         if user.role == "admin" and role != "admin":
             self._guard_last_admin(user, "made a member")
         with self.store.transaction() as conn:
             conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user.id))
+            if role != "admin":
+                self._revoke_links_of(conn, user.id)
         log.info("Account #%d is now a%s %s.", user.id, "n" if role == "admin" else "", role)
         return self._user(user.id)
 
     def set_disabled(self, user_id: int, disabled: bool) -> User:
-        """Disable a user (every session ends at once and they can't sign in) or enable them again. The last admin
-        who can sign in can't be disabled."""
+        """Disable a user (every session ends at once, they can't sign in, and the unused invite and password links
+        they made stop working) or enable them again (those links stay dead; their alerts start again from now, so
+        they don't get a burst of the day's old ideas). The last admin who can sign in can't be disabled."""
         user = self._user(user_id)
         if disabled and user.role == "admin":
             self._guard_last_admin(user, "disabled")
@@ -690,8 +744,31 @@ class Accounts:
             conn.execute("UPDATE users SET disabled = ? WHERE id = ?", (int(bool(disabled)), user.id))
             if disabled:
                 conn.execute("DELETE FROM sessions WHERE user_id = ?", (user.id,))
+                self._revoke_links_of(conn, user.id)
+            elif user.disabled and user.settings.has_channel:  # alerts start again now, not with a day of old ideas
+                conn.execute("UPDATE users SET alerts_since = ? WHERE id = ?", (_ts(self.now()), user.id))
         log.info("Account #%d was %s.", user.id, "disabled" if disabled else "enabled")
         return self._user(user.id)
+
+    def _revoke_links_of(self, conn, user_id: int) -> None:
+        """Revoke the unused invites and password links a user made (in the caller's transaction): someone who is no
+        longer an admin mustn't keep a way in, such as a reset link for the owner's account."""
+        invites = conn.execute(
+            "UPDATE invites SET revoked = 1 WHERE created_by = ? AND used_by IS NULL AND revoked = 0", (user_id,)
+        ).rowcount
+        links = conn.execute(
+            "UPDATE password_tokens SET used_at = ? WHERE created_by = ? AND used_at IS NULL",
+            (_ts(self.now()), user_id),
+        ).rowcount
+        if invites or links:
+            log.info("Revoked %d invite(s) and %d password link(s) made by account #%d.", invites, links, user_id)
+
+    def _creator_ok(self, created_by: int | None) -> bool:
+        """Whether a link's maker may still hand out links: the command line (None), or an enabled admin."""
+        if created_by is None:
+            return True
+        maker = self.get_user(created_by)
+        return maker is not None and maker.is_admin and not maker.disabled
 
     def update_settings(self, user_id: int, settings: UserSettings) -> User:
         """Save a user's settings (already checked with validate_settings). When they set up their first alert
@@ -765,9 +842,12 @@ class Accounts:
         return token
 
     def get_invite(self, token: str) -> Invite | None:
-        """The invite a link's token belongs to, while it can still be used (else None)."""
+        """The invite a link's token belongs to, while it can still be used (else None): unused, not expired or
+        revoked, and made by the command line or an admin who still is one."""
         invite = self._invite(token)
-        return invite if invite is not None and invite.status(self.now()) == "pending" else None
+        if invite is None or invite.status(self.now()) != "pending" or not self._creator_ok(invite.created_by):
+            return None
+        return invite
 
     def list_invites(self, *, pending_only: bool = True) -> list[Invite]:
         """Invites, newest first (only the ones that can still be used, unless pending_only=False)."""
@@ -811,6 +891,7 @@ class Accounts:
             if used != 1:  # someone used it a moment ago: the whole transaction is rolled back
                 raise AccountError("This invite link has expired or was already used. Ask for a new one.")
         log.info("Invite used: created the %s account #%d.", invite.role, user_id)
+        self.forget_login_failures(address)
         return self._user(user_id)
 
     def _invite(self, token: str) -> Invite | None:
@@ -928,9 +1009,10 @@ class Accounts:
 
     # --- password links ---
 
-    def create_password_token(self, user_id: int, purpose: str | None = None) -> str:
+    def create_password_token(self, user_id: int, purpose: str | None = None, *, created_by: int | None = None) -> str:
         """A single-use link token to set a password (/password/<token>), valid for 48 hours. purpose defaults to
-        "setup" for a user without a password, else "reset"."""
+        "setup" for a user without a password, else "reset". created_by: the admin who made it (None: the command
+        line); it stops working when they are disabled or made a member."""
         user = self._user(user_id)
         purpose = purpose or ("reset" if user.has_password else "setup")
         if purpose not in PASSWORD_PURPOSES:
@@ -939,31 +1021,53 @@ class Accounts:
         now = self.now()
         with self.store.transaction() as conn:
             conn.execute(
-                "INSERT INTO password_tokens (token_hash, user_id, purpose, created, expires) VALUES (?, ?, ?, ?, ?)",
-                (token_hash(token), user.id, purpose, _ts(now), _ts(now + PASSWORD_TOKEN_LIFETIME)),
+                "INSERT INTO password_tokens (token_hash, user_id, purpose, created, expires, created_by) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (token_hash(token), user.id, purpose, _ts(now), _ts(now + PASSWORD_TOKEN_LIFETIME), created_by),
             )
         log.info("Created a password %s link for account #%d.", purpose, user.id)
         return token
 
     def get_password_token(self, token: str) -> PasswordToken | None:
-        """The password link a token belongs to while it can be used (unused, not expired, user enabled)."""
+        """The password link a token belongs to while it can be used (unused, not expired, user enabled, made by the
+        command line or an admin who still is one)."""
         if not isinstance(token, str) or not token:
             return None
         hashed = token_hash(token)
         rows = self.store.query("SELECT * FROM password_tokens WHERE token_hash = ?", (hashed,))
         if not rows or not same_token(rows[0]["token_hash"], hashed):
             return None
-        row = rows[0]
+        found = self._password_token(rows[0])
+        return found if found is not None and self._creator_ok(found.created_by) else None
+
+    def _password_token(self, row) -> PasswordToken | None:
+        """A password_tokens row while it can be used (not used, not expired, its user enabled), else None."""
         user = self.get_user(row["user_id"])
         if row["used_at"] or from_iso(row["expires"]) <= self.now() or user is None or user.disabled:
             return None
         return PasswordToken(
-            token_hash=hashed,
+            token_hash=row["token_hash"],
             user=user,
             purpose=row["purpose"],
             created=from_iso(row["created"]),
             expires=from_iso(row["expires"]),
+            created_by=row["created_by"],
         )
+
+    def list_password_tokens(self) -> list[PasswordToken]:
+        """The password links that can still be used, newest first (for the users page, which can revoke them)."""
+        rows = self.store.query("SELECT * FROM password_tokens WHERE used_at IS NULL ORDER BY created DESC")
+        found = [self._password_token(row) for row in rows]
+        return [link for link in found if link is not None and self._creator_ok(link.created_by)]
+
+    def revoke_password_token(self, link_hash: str) -> bool:
+        """Stop an unused password link from working (by PasswordToken.token_hash); False when there was none."""
+        with self.store.transaction() as conn:
+            done = conn.execute(
+                "UPDATE password_tokens SET used_at = ? WHERE token_hash = ? AND used_at IS NULL",
+                (_ts(self.now()), str(link_hash)),
+            ).rowcount
+        return bool(done)
 
     def use_password_token(self, token: str, password: str) -> User:
         """Set the password of the link's user and use the link up (set_password: every session ends)."""
@@ -978,17 +1082,56 @@ class Accounts:
             ).rowcount
         if used != 1:
             raise AccountError("This password link has expired or was already used. Ask an admin for a new one.")
-        return self.set_password(found.user.id, password)
+        user = self.set_password(found.user.id, password)
+        self.forget_login_failures(user.email)  # the link proves who they are: failures of others no longer count
+        return user
 
     # --- rate limits (login_attempts) ---
 
     @staticmethod
     def login_keys(ip: str | None, email: str | None) -> list[str]:
-        """The rate-limit keys of a login attempt: per IP address and per email address."""
-        keys = [f"ip:{ip}"] if ip else []
-        if email and email.strip():
-            keys.append(f"email:{email.strip().lower()[:MAX_EMAIL_LENGTH]}")
+        """The rate-limit keys of a login attempt that lock at LOGIN_LIMIT failures in LOGIN_WINDOW: per network
+        address ("ip:<address>", an IPv6 address's /64) and per email address from that network address
+        ("email_ip:<email>|<address>"). The email's own key (email_key) has a ceiling of its own (login_locked)."""
+        network = client_network(ip)
+        keys = [f"ip:{network}"] if network else []
+        email_key = Accounts.email_key(email)
+        if email_key and network:
+            keys.append(f"email_ip:{email_key.removeprefix('email:')}|{network}")
         return keys
+
+    @staticmethod
+    def email_key(email: str | None) -> str | None:
+        """The rate-limit key of every failed login for an email address, wherever it came from."""
+        if email and email.strip():
+            return f"email:{email.strip().lower()[:MAX_EMAIL_LENGTH]}"
+        return None
+
+    def login_locked(self, ip: str | None, email: str | None) -> bool:
+        """Whether a login for email from ip is refused for now: LOGIN_LIMIT failures in LOGIN_WINDOW from that
+        network address (for any email, or for this one), or EMAIL_LIMIT failures in EMAIL_WINDOW for this email from
+        anywhere."""
+        if self.too_many_attempts(*self.login_keys(ip, email)):
+            return True
+        email_key = self.email_key(email)
+        return email_key is not None and self.too_many_attempts(email_key, limit=EMAIL_LIMIT, window=EMAIL_WINDOW)
+
+    def record_failed_login(self, ip: str | None, email: str | None) -> None:
+        """Count a failed login under every key login_locked looks at."""
+        email_key = self.email_key(email)
+        self.record_login_failure(*self.login_keys(ip, email), *([email_key] if email_key else []))
+
+    def forget_login_failures(self, email: str) -> int:
+        """Forget the failed logins for an email address, from anywhere (after a successful login or password link,
+        or `dip-scanner users unlock`); returns how many were forgotten. Network addresses' own counts stay."""
+        email_key = self.email_key(email)
+        if email_key is None:
+            return 0
+        prefix = f"email_ip:{email_key.removeprefix('email:')}|"
+        with self.store.transaction() as conn:
+            return conn.execute(
+                "DELETE FROM login_attempts WHERE key = ? OR substr(key, 1, ?) = ?", (email_key, len(prefix), prefix)
+            ).rowcount
 
     def record_login_failure(self, *keys: str) -> None:
         """Count a failed attempt under each key (e.g. login_keys(ip, email))."""
@@ -998,7 +1141,7 @@ class Accounts:
             conn.execute("DELETE FROM login_attempts WHERE at < ?", (_ts(self.now() - DAY),))
 
     def too_many_attempts(self, *keys: str, limit: int = LOGIN_LIMIT, window: timedelta = LOGIN_WINDOW) -> bool:
-        """Whether any key has limit or more attempts within window (10 in 15 minutes for logins)."""
+        """Whether any key has limit or more attempts within window (by default LOGIN_LIMIT in LOGIN_WINDOW)."""
         since = _ts(self.now() - window)
         for key in keys:
             count = self.store.query("SELECT COUNT(*) FROM login_attempts WHERE key = ? AND at >= ?", (key, since))
@@ -1043,13 +1186,22 @@ class Accounts:
             conn.execute("UPDATE jobs SET status = 'running' WHERE id = ? AND status = 'queued'", (int(job_id),))
         return self._job(job_id)
 
-    def finish_job(self, job_id: int, *, opportunity_id: int | None = None, error: str | None = None) -> Job:
-        """Mark a job done (with the opportunity it made) or failed (with an error for the user)."""
+    def finish_job(
+        self,
+        job_id: int,
+        *,
+        opportunity_id: int | None = None,
+        error: str | None = None,
+        failure: str | None = None,
+    ) -> Job:
+        """Mark a job done (with the opportunity it made) or failed (with an error for the user and the kind of
+        failure, JOB_FAILURES: "error" when not given)."""
         status = "failed" if error else "done"
+        failure = (failure if failure in JOB_FAILURES else "error") if error else None
         with self.store.transaction() as conn:
             conn.execute(
-                "UPDATE jobs SET status = ?, finished = ?, opportunity_id = ?, error = ? WHERE id = ?",
-                (status, _ts(self.now()), opportunity_id, (error or None) and error[:500], int(job_id)),
+                "UPDATE jobs SET status = ?, finished = ?, opportunity_id = ?, error = ?, failure = ? WHERE id = ?",
+                (status, _ts(self.now()), opportunity_id, (error or None) and error[:500], failure, int(job_id)),
             )
         return self._job(job_id)
 
@@ -1063,18 +1215,23 @@ class Accounts:
         return [_to_job(row) for row in rows]
 
     def count_jobs(self, user_id: int, *, since: datetime | None = None) -> int:
-        """How many jobs a user started since the given time (default: the last 24 hours), failed ones included."""
+        """How many of a user's jobs started since the given time (default: the last 24 hours) count toward their
+        limit: waiting, running, done, or failed after the model was asked (FREE_FAILURES don't count)."""
         since = since if since is not None else self.now() - DAY
         rows = self.store.query(
-            "SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created >= ?", (int(user_id), _ts(since))
+            f"SELECT COUNT(*) FROM jobs WHERE user_id = ? AND created >= ? AND (failure IS NULL OR failure NOT IN "
+            f"({', '.join('?' * len(FREE_FAILURES))}))",
+            (int(user_id), _ts(since), *FREE_FAILURES),
         )
         return int(rows[0][0])
 
-    def fail_unfinished_jobs(self, reason: str = "Interrupted by a restart of the website; start it again.") -> int:
-        """Mark every queued or running job failed (a restarted website can't finish them); returns how many."""
+    def fail_unfinished_jobs(self, reason: str = RESTART_FAILURE) -> int:
+        """Mark every queued or running job failed (a restarted website can't finish them; failure "restart", which
+        doesn't count toward the limit); returns how many."""
         with self.store.transaction() as conn:
             return conn.execute(
-                "UPDATE jobs SET status = 'failed', finished = ?, error = ? WHERE status IN ('queued', 'running')",
+                "UPDATE jobs SET status = 'failed', finished = ?, error = ?, failure = 'restart' "
+                "WHERE status IN ('queued', 'running')",
                 (_ts(self.now()), reason),
             ).rowcount
 
@@ -1083,6 +1240,21 @@ class Accounts:
         if job is None:
             raise AccountError("That job doesn't exist (any more).")
         return job
+
+
+def client_network(ip: str | None) -> str | None:
+    """The address a client's failed logins count under: an IPv4 address as it is, an IPv6 address's /64 (one
+    household or server usually has a whole /64); anything that isn't an address as it is."""
+    if not ip or not ip.strip():
+        return None
+    text = ip.strip()
+    try:
+        address = ipaddress.ip_address(text.split("%", 1)[0])
+    except ValueError:
+        return text[:64]
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped is None:
+        return str(ipaddress.ip_network(f"{address}/64", strict=False))
+    return str(address.ipv4_mapped or address) if isinstance(address, ipaddress.IPv6Address) else str(address)
 
 
 def _check_role(role: str) -> None:
@@ -1115,4 +1287,5 @@ def _to_job(row) -> Job:
         finished=_time(row["finished"]),
         opportunity_id=row["opportunity_id"],
         error=row["error"],
+        failure=row["failure"],
     )

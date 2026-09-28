@@ -12,8 +12,11 @@ other apps on the organisation's private network (fdaa::/16), a cloud metadata s
 - host names that only exist inside a private network (localhost, *.internal, *.flycast, *.local) are refused before
   they are looked up.
 
-The website checks a URL when the user saves it and again before every send (the name may resolve elsewhere by then:
-DNS rebinding), and the webhook notifier doesn't follow redirects. The resolver is injectable, so tests never use the
+The website checks a URL when the user saves it and again before every send, and the webhook notifier doesn't follow
+redirects. Checking the name isn't enough by itself: a name can answer a public address to the check and a private
+one to the connection a moment later (DNS rebinding). So members' webhooks are sent through public_https_session(),
+whose connections look the host up once, refuse unless every address is public, and connect to the address that was
+checked; TLS still checks the certificate against the host name. The resolver is injectable, so tests never use the
 network.
 """
 
@@ -22,9 +25,17 @@ from __future__ import annotations
 import ipaddress
 import socket
 from collections.abc import Callable, Iterable
+from typing import Any
 from urllib.parse import urlsplit
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NameResolutionError, NewConnectionError
+
 MAX_URL_LENGTH = 2048
+PRIVATE_TARGET = "The address must be on the public internet: its host points to a private, local or reserved network."
 # (host, port) -> the IP addresses it resolves to, as text.
 Resolver = Callable[[str, int], Iterable[str]]
 
@@ -129,7 +140,106 @@ def check_public_url(url: object, *, resolver: Resolver | None = None) -> str:
     if not addresses:
         raise UnsafeURLError(f"The host {host} can't be found; check the address.")
     if not all(is_public_address(address) for address in addresses):
-        raise UnsafeURLError(
-            "The address must be on the public internet: its host points to a private, local or reserved network."
-        )
+        raise UnsafeURLError(PRIVATE_TARGET)
     return url
+
+
+# --- connections pinned to the checked address -----------------------------------------------------------------------
+
+
+class UnsafeAddressError(NewConnectionError):
+    """A connection refused because its host doesn't resolve to public addresses only (raised by the connections of
+    public_https_session; requests wraps it in a ConnectionError)."""
+
+
+class _PublicOnly:
+    """Mixin for urllib3 connections: look the host up once with _resolve, refuse unless every address is public, and
+    connect to the checked address itself (never a second lookup of the name). TLS (HTTPSConnection.connect) still
+    sends the host name as SNI and checks the certificate against it, since it uses self.host, not the address."""
+
+    _resolve: Resolver = staticmethod(lambda host, port: system_resolver(host, port))
+    # Set by urllib3's HTTPConnection:
+    _dns_host: str
+    host: str
+    port: int
+    timeout: Any
+    socket_options: Any
+
+    def _new_conn(self) -> socket.socket:
+        host = self._dns_host.strip("[]")
+        try:
+            addresses = list(dict.fromkeys(self._resolve(host, self.port)))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise NameResolutionError(self.host, self, exc) from exc  # type: ignore[arg-type]
+        if not addresses or not all(is_public_address(address) for address in addresses):
+            raise UnsafeAddressError(self, PRIVATE_TARGET)  # type: ignore[arg-type]
+        timeout = self.timeout if isinstance(self.timeout, int | float) else None
+        failure: Exception | None = None
+        for address in addresses:
+            family = socket.AF_INET6 if ":" in address else socket.AF_INET
+            sock = socket.socket(family, socket.SOCK_STREAM)
+            try:
+                for option in self.socket_options or ():
+                    sock.setsockopt(*option)
+                sock.settimeout(timeout)
+                sock.connect((address, self.port))
+            except TimeoutError as exc:
+                sock.close()
+                failure = ConnectTimeoutError(self, f"Connection to {self.host} timed out.")
+                failure.__cause__ = exc
+            except OSError as exc:
+                sock.close()
+                failure = NewConnectionError(self, f"Failed to establish a new connection: {exc}")  # type: ignore[arg-type]
+                failure.__cause__ = exc
+            else:
+                return sock
+        assert failure is not None
+        raise failure
+
+
+def public_https_session(resolver: Resolver | None = None) -> requests.Session:
+    """A requests session for URLs website users typed (their webhooks): every connection resolves the host once with
+    resolver (default: the system's DNS), is refused (UnsafeAddressError inside a requests.ConnectionError) unless
+    every address is public, and connects to the address it checked, so a name can't be rebound to a private address
+    between the check and the connection. Proxies from the environment are ignored (a proxy would look the name up
+    itself)."""
+    lookup: Resolver = resolver or system_resolver
+
+    class Connection(_PublicOnly, HTTPConnection):
+        _resolve = staticmethod(lookup)
+
+    class SecureConnection(_PublicOnly, HTTPSConnection):
+        _resolve = staticmethod(lookup)
+
+    class Pool(HTTPConnectionPool):
+        ConnectionCls = Connection
+
+    class SecurePool(HTTPSConnectionPool):
+        ConnectionCls = SecureConnection
+
+    class Adapter(HTTPAdapter):
+        def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+            super().init_poolmanager(*args, **kwargs)
+            self.poolmanager.pool_classes_by_scheme = {"http": Pool, "https": SecurePool}
+
+    session = requests.Session()
+    session.trust_env = False
+    adapter = Adapter()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def refused_by_guard(exc: BaseException) -> bool:
+    """Whether an exception (from requests) comes from public_https_session refusing a private address."""
+    seen: set[int] = set()
+    pending: list[object] = [exc]
+    while pending:
+        item = pending.pop()
+        if not isinstance(item, BaseException) or id(item) in seen:
+            continue
+        seen.add(id(item))
+        if isinstance(item, UnsafeAddressError):
+            return True
+        pending.extend([item.__cause__, item.__context__, getattr(item, "reason", None), *item.args])
+    return False

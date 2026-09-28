@@ -33,7 +33,7 @@ from ..fundamentals import SecFundamentals
 from ..fx import FxRates
 from ..llm import LLMSetupError, build_models
 from ..models import Feed, utc
-from ..netguard import Resolver
+from ..netguard import Resolver, public_https_session
 from ..notices import STOPPED, one_line, scrub, secrets_of, send_notice, stopped_lines
 from ..notify import build_notifiers
 from ..pipeline import Scanner
@@ -73,10 +73,12 @@ def build_scanner(
     session: Any,
     clock: Callable[[], datetime] = _now,
     resolver: Resolver | None = None,
+    webhook_session: Any = None,
 ) -> Scanner:
     """The scanner `serve` runs: like `dip-scanner watch`'s, with the website's users as recipients too (resolver
-    looks up their webhooks' hosts before each message; None: the system's DNS). Raises ConfigError or LLMSetupError
-    when the models can't be set up (e.g. no API key)."""
+    looks up their webhooks' hosts before each message; None: the system's DNS; their webhooks go through
+    webhook_session, see recipients.user_notifiers). Raises ConfigError or LLMSetupError when the models can't be
+    set up (e.g. no API key)."""
     triage_model, analysis_model = build_models(settings.llm)
     fundamentals = None
     if settings.sec_user_agent:
@@ -96,7 +98,15 @@ def build_scanner(
         notify=True,
         clock=clock,
         symbols=SymbolResolver(session, store),
-        **service_hooks(store, settings, config, session, default_notifiers=notifiers, resolver=resolver),
+        **service_hooks(
+            store,
+            settings,
+            config,
+            session,
+            default_notifiers=notifiers,
+            webhook_session=webhook_session,
+            resolver=resolver,
+        ),
     )
 
 
@@ -108,6 +118,7 @@ def stop_notice_sender(
     *,
     clock: Callable[[], datetime] = _now,
     resolver: Resolver | None = None,
+    webhook_session: Any = None,
 ) -> Callable[[str], None]:
     """on_stop for ScannerControl: sends "dip-scanner stopped: <reason>" to the .env channels and every admin's own
     (unless [alerts] system_notices = false); at most once every 12 hours (notices.send_notice)."""
@@ -117,7 +128,15 @@ def stop_notice_sender(
             return
         now = utc(clock())
         default = build_notifiers(settings.notify, session=session)
-        hooks = service_hooks(store, settings, config, session, default_notifiers=default, resolver=resolver)
+        hooks = service_hooks(
+            store,
+            settings,
+            config,
+            session,
+            default_notifiers=default,
+            webhook_session=webhook_session,
+            resolver=resolver,
+        )
         people = [person for person in hooks["recipients"](now) if person.gets_notices]
         notifiers = [notifier for person in people for notifier in person.notifiers]
         if not notifiers:
@@ -148,16 +167,21 @@ def make_server_app(
     trust_fly_client_ip: bool | None = None,
     job_executor: Executor | None = None,
     resolver: Resolver | None = None,
+    webhook_session: Any = None,
 ) -> FastAPI:
     """The app `serve` runs: the website with the scanner's loop (started and stopped by the app's lifespan), sharing
     the scanner's price and exchange-rate caches, and "Analyse now" running the scanner's analyze_ticker.
 
     scanner_enabled=False (SCANNER_ENABLED=false or --no-scanner) serves the pages only; "Analyse now" still works
     when the models can be set up. trust_fly_client_ip defaults to whether FLY_APP_NAME is set (on Fly.io). resolver
-    looks up webhook hosts (None: the system's DNS). scanner_factory(settings, config, feeds, store=, session=,
-    clock=, resolver=) builds the scanner (default: build_scanner). Raises ConfigError when SECRET_KEY is missing.
+    looks up webhook hosts (None: the system's DNS). webhook_session: the HTTP session for members' webhooks
+    (default: netguard.public_https_session, or session when a test passes one). scanner_factory(settings, config,
+    feeds, store=, session=, clock=, resolver=, webhook_session=) builds the scanner (default: build_scanner). Raises
+    ConfigError when SECRET_KEY is missing.
     """
     settings.web.require_secret_key()
+    if webhook_session is None:
+        webhook_session = session if session is not None else public_https_session(resolver)
     session = session if session is not None else make_session()
     database = settings.data_dir / DATABASE_NAME
     scanner_store = Store(database)
@@ -166,7 +190,16 @@ def make_server_app(
     reason = None
     factory = scanner_factory or build_scanner
     try:
-        scanner = factory(settings, config, feeds, store=scanner_store, session=session, clock=clock, resolver=resolver)
+        scanner = factory(
+            settings,
+            config,
+            feeds,
+            store=scanner_store,
+            session=session,
+            clock=clock,
+            resolver=resolver,
+            webhook_session=webhook_session,
+        )
     except ConfigError as exc:
         reason = f"Configuration problem: {exc}"
     except LLMSetupError as exc:
@@ -179,7 +212,9 @@ def make_server_app(
         enabled=scanner_enabled,
         interval_minutes=config.scan.interval_minutes,
         reason=reason,
-        on_stop=stop_notice_sender(settings, config, scanner_store, session, clock=clock, resolver=resolver),
+        on_stop=stop_notice_sender(
+            settings, config, scanner_store, session, clock=clock, resolver=resolver, webhook_session=webhook_session
+        ),
         clock=clock,
         secrets=secrets,
     )
@@ -200,9 +235,10 @@ def make_server_app(
         analyse_unavailable=f"Manual analyses aren't available: {reason}" if reason else None,
         job_executor=job_executor,
         http_session=session,
+        webhook_session=webhook_session,
         resolver=resolver,
         trust_fly_client_ip=trust_fly_client_ip,
-        on_shutdown=(scanner_store.close, session.close),
+        on_shutdown=(scanner_store.close, session.close, webhook_session.close),
     )
 
 

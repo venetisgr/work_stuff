@@ -305,22 +305,92 @@ def test_dashboard_filters(seeded):
     assert ideas_on(client.get("/?days=abc&score=12&verdict=<x>&sort=up").text) == ["SAP.DE", "AMD"]
 
 
+def alerted(site: Site, email: str, *opportunity_ids: int) -> None:
+    """The scanner sent these ideas to the user as alerts."""
+    user = site.user(email)
+    site.store.record_deliveries(user.recipient_key, opportunity_ids, "alert", when=NOW - timedelta(days=3), sent=True)
+
+
 def test_the_dashboard_shows_thesis_changes(seeded):
     site, ids = seeded
-    page = site.client().get("/").text
+    client = site.client()
+    alerted(site, "member@example.com", ids["amd_old"])
+    page = client.get("/").text
     assert "Thesis changes" in page and "Review open orders" in page
     assert "no longer passes your alert rules" in page
     assert f'href="/ideas/{ids["amd_old"]}">the earlier idea' in page
-    # Rules the earlier idea didn't pass either: nothing to review.
+    # Rules the earlier idea didn't pass either, and never sent to them: nothing to review.
     strict = site.client("strict@example.com", min_score=90.0).get("/").text
     assert "Thesis changes" not in strict
 
 
 def test_a_drop_in_the_chance_up_is_a_thesis_change(site):
-    site.add(created=NOW - timedelta(days=2), score=80.0, analysis=make_analysis(probability_up_6m=85))
+    client = site.client()
+    old = site.add(created=NOW - timedelta(days=2), score=80.0, analysis=make_analysis(probability_up_6m=85))
     site.add(created=NOW - timedelta(hours=1), score=70.0, analysis=make_analysis(probability_up_6m=62))
-    page = site.client().get("/").text
+    alerted(site, "member@example.com", old.id)
+    page = client.get("/").text
     assert "its chance of being higher fell by 23 points" in page
+
+
+def test_a_new_member_is_not_told_to_review_orders_on_ideas_from_before_they_joined(seeded):
+    """Their first dashboard: no "Review open orders" about ideas nobody sent them, from before they had an account."""
+    site, ids = seeded
+    assert "Thesis changes" not in site.client("newcomer@example.com").get("/").text
+    newcomer = site.user("newcomer@example.com")
+    assert pages.thesis_changes(site.ctx, newcomer, now=NOW) == []
+
+
+def test_ideas_a_member_saw_after_joining_count_without_an_alert(site):
+    """Members without an alert channel follow the ideas on the dashboard: an idea from after they joined counts."""
+    site.client()
+    member = site.user()
+    with site.store.transaction() as conn:
+        conn.execute("UPDATE users SET created = ? WHERE id = ?", ((NOW - timedelta(days=5)).isoformat(), member.id))
+    site.add(created=NOW - timedelta(days=2), score=80.0, analysis=make_analysis(probability_up_6m=85))
+    site.add(created=NOW - timedelta(hours=1), score=30.0, analysis=make_analysis(verdict="fundamental"))
+    [change] = pages.thesis_changes(site.ctx, site.user(), now=NOW)
+    assert change.reason == "no longer passes your alert rules"
+
+
+def test_an_alert_still_counts_after_the_member_tightened_their_rules(site):
+    """They got the alert at score 72.4 and may have orders on it; raising min_score to 80 since doesn't make the
+    later "fundamental damage" analysis any less of a thesis change. The same analysis again is none, though."""
+    client = site.client(min_score=80.0)
+    old = site.add(created=NOW - timedelta(days=2))
+    alerted(site, "member@example.com", old.id)
+    same = site.add(created=NOW - timedelta(hours=2))
+    assert pages.thesis_changes(site.ctx, site.user(), now=NOW) == []  # nothing new failed
+    site.add(created=NOW - timedelta(hours=1), score=20.0, analysis=make_analysis(verdict="fundamental"))
+    [change] = pages.thesis_changes(site.ctx, site.user(), now=NOW)
+    assert (change.previous.id, change.reason) == (old.id, "no longer passes your alert rules")
+    assert same.id != change.current.id and "Thesis changes" in client.get("/").text
+
+
+def test_thesis_changes_can_be_turned_off(seeded):
+    site, ids = seeded
+    client = site.client(thesis_changes=False)
+    alerted(site, "member@example.com", ids["amd_old"])
+    assert "Thesis changes" not in client.get("/").text
+    assert pages.thesis_changes(site.ctx, site.user(), now=NOW) == []
+
+
+def test_the_thesis_card_comes_after_the_filters_shows_two_and_converts_amounts(site):
+    client = site.client(currency="EUR")
+    ids = []
+    for number, ticker in enumerate(("AMD", "NVDA", "INTC")):
+        old = site.add(ticker=ticker, created=NOW - timedelta(days=2), fx_rates={"EUR": 0.8}, account_currency=None)
+        site.add(ticker=ticker, created=NOW - timedelta(hours=1 + number), score=20.0,
+                 analysis=make_analysis(verdict="fundamental"))  # fmt: skip
+        ids.append(old.id)
+    alerted(site, "member@example.com", *ids)
+    page = client.get("/").text
+    assert page.index('aria-label="Period"') < page.index("Thesis changes")  # the ideas' controls come first
+    card = page[page.index("Thesis changes") :]
+    card = card[: card.index("</section>")]
+    assert card.count("<li>") == 3 and "Show all 3" in card
+    assert card.index("Show all 3") > card.index("the earlier idea")  # two shown, the third behind "Show all"
+    assert "≈ €105.60" in card  # entry $132.00 at 0.8
 
 
 def test_the_dashboard_counts_the_models_calls_of_the_day(site):
@@ -403,7 +473,9 @@ def test_the_idea_page_has_analyse_again_and_watchlist_buttons(tmp_path):
     # Without analyses on the server, the page says so instead of offering a button that can't work.
     plain = Site(tmp_path / "plain")
     other = plain.add()
-    assert "Manual analyses aren&#39;t available on this server." in plain.client().get(f"/ideas/{other.id}").text
+    assert "Manual analyses aren&#39;t available right now." in plain.client().get(f"/ideas/{other.id}").text
+    admin = plain.client("admin@example.com", role="admin")
+    assert "Manual analyses aren&#39;t available on this server." in admin.get(f"/ideas/{other.id}").text
 
 
 def test_an_analysis_asked_for_by_hand_says_so(site):
@@ -584,7 +656,7 @@ def test_the_idea_page_shows_a_judged_debate(site):
     assert "64%</strong> chance up</span>" in ruling and 'target <span class="num">$165.00</span>' in ruling
     assert "They agree the drop is partly sentiment; the crux is the guidance cut" in ruling
     assert "It found GPT-5&#39;s case stronger." in ruling
-    assert "so it couldn&#39;t tell which one was its own model." in ruling
+    assert "in an order that doesn&#39;t say which model wrote which." in ruling
     # the headline figures carry the debate in one line, and the analysis says whose it is
     start = page.index('<header class="card idea-hero">')
     hero = page[start : page.index("</header>", start)]
@@ -639,7 +711,10 @@ def test_a_failed_judge_leaves_a_merge_by_rule(site):
     card = debate_card(page)
     assert "analysed it separately and answered each other twice, but the judge failed." in card
     assert "<h3>Merged by rule, without a judge</h3>" in card
-    assert "The judge Claude Sonnet 5 failed: the request timed out.</p>" in card  # names, not provider labels
+    # Members: what happened, by the models' names; admins: the provider's error too.
+    assert "The judge Claude Sonnet 5 was unavailable, so the two final positions were merged by rule.</p>" in card
+    admin_card = debate_card(site.client("admin@example.com", role="admin").get(f"/ideas/{opp.id}").text)
+    assert "The judge Claude Sonnet 5 failed: the request timed out.</p>" in admin_card  # names, not provider labels
     assert "<mark>66%</mark>" in card and "Changed its mind" in card  # the rebuttal still ran
     assert "Favoured by the judge" not in card and "It found" not in card
     assert "(medium agreement, no judge)" in page
@@ -651,7 +726,9 @@ def test_when_one_model_failed_the_other_stands_alone(site):
     card = debate_card(page)
     assert '<h2 id="debate-title">The models</h2>' in card and "agreement</span>" not in card
     assert "<strong>Only GPT-5 answered.</strong>" in card
-    assert "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no credit left." in card
+    assert "Claude Sonnet 5 was unavailable, so GPT-5 analysed it alone." in card and "no credit" not in card
+    admin_card = debate_card(site.client("admin@example.com", role="admin").get(f"/ideas/{opp.id}").text)
+    assert "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no credit left." in admin_card
     assert "No second model checked this analysis, so read it with more care." in card
     assert card.count("<article") == 1 and "debate-sides is-pair" not in card
     assert "Opening</th>" not in card and "72%" in card
@@ -737,7 +814,7 @@ def test_the_ticker_page(seeded):
     assert "AMD shares slide after weak data-center guidance" in page
     assert "Lower data-center guidance cuts expected revenue growth." in page
     assert "Add to watchlist" in page
-    assert "Manual analyses aren&#39;t available on this server." in page
+    assert "Manual analyses aren&#39;t available right now." in page
 
 
 def test_a_ticker_that_is_no_dip_says_so(site):
@@ -754,6 +831,38 @@ def test_a_ticker_that_is_no_dip_says_so(site):
 def test_a_ticker_without_prices(site):
     page = site.client().get("/tickers/ZZZZ").text
     assert "Yahoo Finance has no prices for ZZZZ." in page and "No chart" in page
+
+
+def test_a_ticker_without_prices_offers_no_analysis_and_names_its_new_symbol(tmp_path):
+    """An analysis of a symbol Yahoo has no prices for fails at once: the page says so instead of offering "Analyse
+    now" (each click cost a member one of their analyses), and points to the symbol the scanner found instead."""
+    site = Site(tmp_path, analyse=lambda ticker, now: make_opportunity(ticker=ticker, created=now))
+    client = site.client()
+    page = client.get("/tickers/ZZZZQ").text
+    assert "Yahoo Finance has no prices for ZZZZQ." in page and "ZZZZQ can&#39;t be analysed without prices." in page
+    assert 'value="ZZZZQ"' not in page  # no "Analyse now" form, and no "Add to watchlist" either
+    assert "Add to watchlist" not in page
+    site.store.save_symbol_lookup("OPAP.AT", "OPAP", "ALWN.AT", "Allwyn International AG", checked=NOW)
+    renamed = client.get("/tickers/OPAP.AT").text
+    assert 'href="/tickers/ALWN.AT"' in renamed and "open that one to analyse it" in renamed
+    # Yahoo merely unreachable: the button stays (it may work in a minute).
+    site.prices.down.add("AMD")
+    assert 'value="AMD"' in client.get("/tickers/AMD").text
+
+
+def test_stock_pages_are_limited_for_members(site):
+    """Each made-up symbol costs two Yahoo requests from the scanner's own address: a script must not get Yahoo to
+    throttle the scanner for everybody."""
+    client = site.client()
+    for number in range(pages.TICKER_LIMIT):
+        assert client.get(f"/tickers/ZZ{number}").status_code == 200
+    blocked = client.get("/tickers/AMD")
+    assert blocked.status_code == 429 and "stock pages in the last 15 minutes" in blocked.text
+    stats_calls = len([call for call in site.prices.calls if call[0] == "stats"])
+    assert stats_calls == pages.TICKER_LIMIT  # the blocked one asked Yahoo nothing
+    admin = site.client("admin@example.com", role="admin")
+    for number in range(pages.TICKER_LIMIT + 1):
+        assert admin.get(f"/tickers/ZZ{number}").status_code == 200
 
 
 def test_ticker_addresses_are_normalised(site):
@@ -818,6 +927,31 @@ def test_the_ticker_page_names_the_preferred_listing(tmp_path):
     site = Site(tmp_path, config=config)
     page = site.client().get("/tickers/ASML").text
     assert 'href="/tickers/ASML.AS"' in page and "preferred_listings" in page
+
+
+def test_the_watchlist_buttons_read_symbols_through_preferred_listings(tmp_path):
+    """A watchlist with ASML is read as ASML.AS by the scanner, its alerts and the API: the pages must agree, and
+    removing ASML.AS must really take it off (not leave ASML, which alerts on ASML.AS all the same)."""
+    config = ScannerConfig(universe=UniverseConfig(preferred_listings={"ASML": "ASML.AS"}))
+    prices = standard_prices()
+    prices.bars["ASML.AS"] = bars_until(TODAY, 700.0)
+    prices.currencies["ASML.AS"] = "EUR"
+    site = Site(tmp_path, config=config, prices=prices)
+    client = site.client(watchlist=("ASML",))
+    idea = site.add(ticker="ASML.AS", company="ASML Holding", stats=make_stats(ticker="ASML.AS", price=700.0))
+    remove_form = 'name="action" value="remove"'
+    for path in ("/tickers/ASML.AS", "/tickers/ASML", f"/ideas/{idea.id}"):
+        page = client.get(path).text
+        assert remove_form in page and "On your watchlist" in page, path
+    assert client.get(f"/api/v1/ideas/{idea.id}").json()["idea"]["on_my_watchlist"] is True
+
+    post_form(client, "/tickers/ASML.AS/watchlist", {"action": "remove"}, page="/tickers/ASML.AS")
+    assert site.user().settings.watchlist == ()
+    assert client.get(f"/api/v1/ideas/{idea.id}").json()["idea"]["on_my_watchlist"] is False
+
+    site.accounts.update_settings(site.user().id, replace(site.user().settings, watchlist=("ASML",)))
+    post_form(client, "/tickers/ASML.AS/watchlist", {"action": "add"}, page="/tickers/ASML.AS")
+    assert site.user().settings.watchlist == ("ASML",)  # no duplicate of the same listing
 
 
 # --- the news ------------------------------------------------------------------------------------------------------
@@ -976,7 +1110,8 @@ def test_the_track_record_scores_the_debating_models(site):
 
 def test_the_scoreboard_shows_dashes_until_six_months_have_passed(site):
     recent = NOW - timedelta(days=10)
-    site.add(created=recent, stats=make_stats(as_of=recent), debate=lone_debate())
+    site.add(created=recent, stats=make_stats(as_of=recent), debate=make_debate())
+    site.add(created=recent, stats=make_stats(as_of=recent), debate=lone_debate())  # one model alone: not compared
     board = scoreboard_on(site.client().get("/track").text)
     assert scoreboard_row(board, "GPT-5") == ["1", "0", "–", "–", "–", "–"]
     assert scoreboard_row(board, "After the debate") == ["1", "0", "–", "–", "–", "–"]
@@ -1066,9 +1201,9 @@ def test_debater_names_tell_two_services_apart():
 def test_a_judge_from_outside_the_debate_is_named_so():
     view = pages.debate_view(make_opportunity(debate=make_debate(judge="openai:o3", favoured=None)))
     assert view.ruling_title == "The ruling by o3"
-    assert (
-        view.judge_note
-        == "It favoured neither side. It saw the two only as Analyst A and Analyst B, without their names."
+    assert view.judge_note == (
+        "It favoured neither side. It saw the two labelled Analyst A and Analyst B, in an order that doesn't say which "
+        "model wrote which."
     )
     assert pages.debate_view(make_opportunity()) is None
 

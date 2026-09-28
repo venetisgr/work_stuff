@@ -13,13 +13,13 @@
   <div class="cluster"><span class="spinner" aria-hidden="true"></span><strong>Analysing now</strong></div>
   <p class="muted">Fetching prices and headlines and asking the model: this usually takes under a minute. This page reloads itself every {{ refresh }} seconds and shows the idea when it is ready.</p>
   {% elif job.status == "failed" %}
-  <div class="callout callout-bad" role="alert"><p><strong>The analysis didn't finish.</strong> {{ job.error or "No reason was recorded." }}</p></div>
+  <div class="callout callout-bad" role="alert"><p><strong>The analysis didn't finish.</strong> {{ error or "No reason was recorded." }}{% if not job.counts %} It doesn't count toward your limit.{% endif %}</p></div>
   {% else %}
   <p>Finished{% if job.finished %} {{ ui.time(job.finished) }}{% endif %}.</p>
   {% endif %}
   <p class="small muted">Started {{ ui.time(job.created) }}.{% if remaining is not none %} You have {{ remaining }} manual {{ "analysis" if remaining == 1 else "analyses" }} left in the last 24 hours.{% endif %}</p>
   <div class="form-actions">
-    {% if job.status == "failed" %}{{ ui.analyse_button(job.ticker, label="Try again", css="btn btn-primary") }}{% endif %}
+    {% if job.can_retry and remaining != 0 %}{{ ui.analyse_button(job.ticker, label="Try again", css="btn btn-primary") }}{% endif %}
     <a class="btn btn-secondary" href="/">Back to the ideas</a>
   </div>
 </div>

@@ -235,6 +235,7 @@ def test_members_get_403_on_every_admin_page_and_action(site):
         (f"/admin/users/{admin_user.id}/password-link", {}),
         ("/admin/invites", {"email": "friend@example.com", "role": "admin"}),
         ("/admin/invites/revoke", {"invite": "x"}),
+        ("/admin/users/password-links/revoke", {"link": "x"}),
     ]
     for path, data in actions:
         assert post_form(member, path, data).status_code == 403, path
@@ -690,6 +691,48 @@ def test_no_password_link_for_a_disabled_account(site):
     page = client.get("/admin/users").text
     assert shown_link(page) is None and "enable the account first" in page
     assert site.store.query("SELECT COUNT(*) FROM password_tokens")[0][0] == 0
+
+
+def test_a_disabled_admins_links_die_with_their_access(site):
+    """The owner disables a rogue admin who made an admin invite and a reset link for the owner: both links are dead
+    at once, and the users page lists the links that still work, with a way to revoke them."""
+    owner = site.admin("owner@example.com")
+    rogue = site.admin("rogue@example.com")
+    owner_user = site.accounts.get_user_by_email("owner@example.com")
+    rogue_user = site.accounts.get_user_by_email("rogue@example.com")
+    post_form(rogue, "/admin/invites", {"role": "admin"}, page="/admin/invites")
+    invite = shown_link(rogue.get("/admin/invites").text).rsplit("/", 1)[1]
+    post_form(rogue, f"/admin/users/{owner_user.id}/password-link", page="/admin/users")
+    takeover = shown_link(rogue.get("/admin/users").text).rsplit("/", 1)[1]
+    page = owner.get("/admin/users").text
+    assert "Password links that still work" in page and "owner@example.com" in page and "rogue@example.com" in page
+
+    post_form(owner, f"/admin/users/{rogue_user.id}/disable", page="/admin/users")
+    page = owner.get("/admin/users").text
+    assert "the unused invite and password links they made were revoked" in page
+    assert "Password links that still work" not in page
+    visitor = site.new_client()
+    assert visitor.get(f"/password/{takeover}").status_code == 404
+    assert visitor.get(f"/invite/{invite}").status_code == 404
+    assert site.accounts.verify_password(owner_user.id, PASSWORD)
+
+
+def test_a_pending_password_link_can_be_revoked(site):
+    client = site.admin()
+    member = site.user()
+    post_form(client, f"/admin/users/{member.id}/password-link", page="/admin/users")
+    token = shown_link(client.get("/admin/users").text).rsplit("/", 1)[1]
+    [pending] = site.accounts.list_password_tokens()
+    page = client.get("/admin/users").text
+    assert 'action="/admin/users/password-links/revoke"' in page and f'value="{pending.token_hash}"' in page
+    response = post_form(
+        client, "/admin/users/password-links/revoke", {"link": pending.token_hash}, page="/admin/users"
+    )
+    assert response.status_code == 303
+    assert "Password link revoked: it no longer works." in client.get("/admin/users").text
+    assert site.new_client().get(f"/password/{token}").status_code == 404
+    post_form(client, "/admin/users/password-links/revoke", {"link": pending.token_hash}, page="/admin/users")
+    assert "That link can&#39;t be revoked" in client.get("/admin/users").text
 
 
 # --- invites -------------------------------------------------------------------------------------------------------

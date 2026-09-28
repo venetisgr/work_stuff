@@ -189,6 +189,7 @@ def _parser() -> argparse.ArgumentParser:
     action("disable", "Disable an account: it is signed out at once and can't sign in.").add_argument("email")
     action("enable", "Enable a disabled account again.").add_argument("email")
     action("reset-link", "Print a link to set a new password, valid for 48 hours.").add_argument("email")
+    action("unlock", "Forget an email address's failed sign-ins: it can sign in again at once.").add_argument("email")
 
     serve = command("serve", _serve, "Run the website, with the scanner in the same process (needs the web extra).")
     serve.add_argument(
@@ -623,7 +624,7 @@ def _analyze(args: argparse.Namespace, settings: Settings) -> int:
     with _scanner(args, settings, notify=False, feeds=False) as scanner:
         opp = scanner.analyze_ticker(args.ticker)
         if not args.no_save:
-            opp = scanner.store.add_opportunity(opp)
+            opp = scanner.store.add_opportunity(opp, manual=True)
             # You're reading it right now, so a running `watch` shouldn't send it to you as an alert as well.
             scanner.store.mark_notified([opp.id], when=opp.created)
     if opp.ticker != _symbol(args.ticker):
@@ -795,6 +796,13 @@ def _users(args: argparse.Namespace, settings: Settings) -> int:
         try:
             if action == "list":
                 _list_users(accounts)
+                return EXIT_OK
+            if action == "unlock":
+                forgotten = accounts.forget_login_failures(args.email)
+                print(
+                    f"Forgot {forgotten} failed sign-in{'s' if forgotten != 1 else ''} for "
+                    f"{args.email.strip().lower()}; it can sign in again."
+                )
                 return EXIT_OK
             if action == "invite":
                 token = accounts.create_invite(created_by=None, email=args.email, role=args.role)

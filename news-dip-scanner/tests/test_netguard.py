@@ -3,10 +3,21 @@
 from __future__ import annotations
 
 import socket
+import threading
 
 import pytest
+import requests
 
-from dip_scanner.netguard import UnsafeURLError, check_public_url, is_public_address, system_resolver
+from dip_scanner import netguard
+from dip_scanner.netguard import (
+    UnsafeURLError,
+    check_public_url,
+    is_public_address,
+    public_https_session,
+    refused_by_guard,
+    system_resolver,
+)
+from dip_scanner.notify import NotifyError, WebhookNotifier
 
 
 def resolver(*addresses: str, calls: list | None = None):
@@ -143,3 +154,87 @@ def test_international_host_names_are_looked_up_in_their_ascii_form():
 
 def test_the_system_resolver_answers_an_ip_literal_without_the_network():
     assert system_resolver("127.0.0.1", 443) == ["127.0.0.1"]
+
+
+# --- connections pinned to the checked address ------------------------------------------------------------------
+
+
+def listener():
+    """A loopback server that counts the connections it accepts and keeps what the first one sent."""
+    server = socket.socket()
+    server.bind(("127.0.0.1", 0))
+    server.listen(5)
+    accepted: list[bytes] = []
+
+    def run():
+        while True:
+            try:
+                conn, _ = server.accept()
+            except OSError:
+                return
+            with conn:
+                conn.settimeout(2)
+                try:
+                    accepted.append(conn.recv(4096))
+                except OSError:
+                    accepted.append(b"")
+
+    threading.Thread(target=run, daemon=True).start()
+    return server, server.getsockname()[1], accepted
+
+
+def test_a_name_rebound_to_loopback_after_the_check_is_never_connected_to():
+    """DNS rebinding: public for the check before the send, 127.0.0.1 for the connection a moment later."""
+    answers = iter([["93.184.216.34"], ["127.0.0.1"], ["127.0.0.1"]])
+
+    def flip_flop(host, port):
+        return next(answers)
+
+    server, port, accepted = listener()
+    try:
+        hook = WebhookNotifier(
+            f"https://rebind.attacker.example:{port}/hook",
+            "slack",
+            session=public_https_session(flip_flop),
+            check_url=lambda url: check_public_url(url, resolver=flip_flop),
+            follow_redirects=False,
+            show_replies=False,
+            timeout=2,
+        )
+        with pytest.raises(NotifyError, match="isn't allowed: The address must be on the public internet"):
+            hook.send("Subject", "text", "html")
+    finally:
+        server.close()
+    assert accepted == []
+
+
+def test_a_pinned_connection_goes_to_the_checked_address_and_keeps_the_host_name_for_tls(monkeypatch):
+    lookups: list[tuple[str, int]] = []
+    server, port, accepted = listener()
+    monkeypatch.setattr(netguard, "is_public_address", lambda address: True)  # let 127.0.0.1 stand in for the VPS
+    targets = []
+    real_connect = socket.socket.connect
+
+    def connect(sock, address):
+        targets.append(address)
+        return real_connect(sock, address)
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    try:
+        session = public_https_session(resolver("127.0.0.1", calls=lookups))
+        with pytest.raises(requests.RequestException):  # the listener doesn't speak TLS
+            session.post(f"https://hooks.example.com:{port}/hook", json={}, timeout=2)
+    finally:
+        server.close()
+    assert lookups == [("hooks.example.com", port)]  # one lookup, through the given resolver
+    assert targets == [("127.0.0.1", port)]  # the checked address, not the name
+    assert b"hooks.example.com" in accepted[0]  # the TLS ClientHello names the host (SNI): certificates still count
+
+
+def test_a_pinned_session_refuses_private_addresses_and_says_so():
+    session = public_https_session(resolver("10.0.0.8"))
+    with pytest.raises(requests.ConnectionError) as error:
+        session.post("https://hooks.example.com/hook", json={}, timeout=2)
+    assert refused_by_guard(error.value)
+    assert not refused_by_guard(requests.ConnectionError("Connection refused"))
+    assert session.trust_env is False  # a proxy from the environment would look the name up itself

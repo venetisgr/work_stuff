@@ -187,14 +187,14 @@ def test_me_describes_the_reader(site):
     }
     session = site.accounts.list_sessions(site.user("nikos@example.com").id)[0]
     assert me["csrf"] == session.csrf
-    # No analyses on this site (no model): the button says why.
+    # No analyses on this site (no model): the button says why, in a member's words (the reason is the admin's).
     assert me["capabilities"] == {
         "admin": False,
         "analyse": {
             "available": False,
             "limit": 5,
             "remaining": 5,
-            "note": "Manual analyses aren't available on this server.",
+            "note": "Manual analyses aren't available right now. The site's admin can see why on the admin page.",
         },
     }
 
@@ -218,7 +218,9 @@ def test_me_for_an_admin_and_for_a_member_with_analyses(tmp_path):
 def test_status_before_any_cycle(site):
     status = valid(site.client().get("/api/v1/status"), "Status")
     assert status["state"] == "disabled" and status["label"] == "Scanner off"
-    assert "doesn't run in this process" in status["reason"]
+    assert status["reason"] == "The scanner isn't running on this server right now."  # a member's words
+    admin = valid(site.client("admin@example.com", role="admin").get("/api/v1/status"), "Status")
+    assert "doesn't run in this process" in admin["reason"]
     assert status["last_cycle"] is None and status["feeds"] is None and status["next_cycle_at"] is None
     assert status["interval_minutes"] == 5
     assert status["model_today"] == {
@@ -572,7 +574,7 @@ def test_an_idea_shows_its_debate(site, mode):
     assert (first["model_label"], first["provider"]) == ("GPT-5", "openai")
     assert first["provider_label"] == "OpenAI"
     # the Fly idea page's card, word for word (pages.debate_view)
-    card = pages.debate_view(site.store.get_opportunity(opp.id))
+    card = pages.debate_view(site.store.get_opportunity(opp.id))  # as a member reads it
     assert (view["title"], view["how"], view["reason_label"]) == (card.title, card.how, card.reason)
     assert (view["ruling_title"], view["judge_note"]) == (card.ruling_title, card.judge_note)
     if mode == "debate":
@@ -584,8 +586,8 @@ def test_an_idea_shows_its_debate(site, mode):
         assert first["compare"] and view["ruling_title"] == "The ruling by Claude Sonnet 5"
         assert view["how"].endswith("and Claude Sonnet 5 ruled.")
     elif mode == "single":
-        assert view["reason"].startswith("anthropic:claude-sonnet-5 failed") and len(view["participants"]) == 1
-        assert view["reason_label"] == "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no credit."
+        assert view["reason"] is None and len(view["participants"]) == 1  # the provider's error is the admin's
+        assert view["reason_label"] == "Claude Sonnet 5 was unavailable, so GPT-5 analysed it alone."
         assert view["line"] == "GPT-5 alone: 68% (the other model failed)"
         assert view["title"] == "The models" and view["how"] is None and view["ruling_title"] is None
         assert first["other_label"] is None and not first["compare"]
@@ -737,6 +739,12 @@ def test_reanalyse_needs_signing_in_and_an_idea(tmp_path):
 def test_reanalyse_without_a_model_is_unavailable(site):
     opp = site.add()
     error = error_of(post(site.client(), f"/api/v1/ideas/{opp.id}/reanalyse"), 503, "unavailable")
+    assert (
+        error["message"]
+        == "Manual analyses aren't available right now. The site's admin can see why on the admin page."
+    )
+    admin = site.client("admin@example.com", role="admin")
+    error = error_of(post(admin, f"/api/v1/ideas/{opp.id}/reanalyse"), 503, "unavailable")
     assert error["message"] == "Manual analyses aren't available on this server."
 
 
@@ -757,6 +765,16 @@ def test_reanalyse_keeps_the_daily_limit(tmp_path):
     assert me["capabilities"]["analyse"]["available"] is False and me["capabilities"]["analyse"]["remaining"] == 0
     # An admin has no daily limit.
     valid(post(site.client("admin@example.com", role="admin"), path), "ReanalyseAccepted", 202)
+
+
+def test_a_job_that_failed_before_the_model_was_asked_leaves_the_limit_alone(tmp_path):
+    site = analysing_site(tmp_path, web={"analyze_limit_per_user": 2})
+    client = site.client()
+    user = site.user()
+    job = site.accounts.create_job(user.id, "ZZZZQ")
+    site.accounts.finish_job(job.id, error="Yahoo Finance has no prices for ZZZZQ.", failure="no_prices")
+    assert valid(client.get("/api/v1/me"), "Me")["capabilities"]["analyse"]["remaining"] == 2
+    assert valid(client.get(f"/api/v1/jobs/{job.id}"), "Job")["remaining"] == 2
 
 
 def test_reanalyse_keeps_the_burst_limit(tmp_path, monkeypatch):
@@ -792,7 +810,10 @@ def test_reanalyse_returns_the_analysis_already_waiting(tmp_path):
 
 def test_thesis_changes(seeded):
     site, ids = seeded
-    body = valid(eur_reader(site).get("/api/v1/thesis-changes"), "ThesisChanges")
+    reader = eur_reader(site)
+    user = site.accounts.get_user_by_email("eur@example.com")
+    site.store.record_deliveries(user.recipient_key, [ids["amd_old"]], "alert", when=NOW - timedelta(days=3), sent=True)
+    body = valid(reader.get("/api/v1/thesis-changes"), "ThesisChanges")
     assert body["days"] == 7 and len(body["changes"]) == 1
     change = body["changes"][0]
     assert (change["ticker"], change["company"], change["reason"]) == (
@@ -807,7 +828,60 @@ def test_thesis_changes(seeded):
         assert valid(site.client().get(f"/api/v1/thesis-changes?days={days}"), "ThesisChanges")["days"] == echoed
 
 
+def test_no_thesis_changes_about_ideas_from_before_the_reader_joined(seeded):
+    site, _ = seeded
+    assert valid(eur_reader(site).get("/api/v1/thesis-changes"), "ThesisChanges") == {"days": 7, "changes": []}
+
+
 def test_no_thesis_changes_for_rules_the_earlier_idea_didnt_pass(seeded):
     site, _ = seeded
     body = valid(site.client("strict@example.com", min_score=90.0).get("/api/v1/thesis-changes"), "ThesisChanges")
     assert body == {"days": 7, "changes": []}
+
+
+def test_members_never_read_the_operators_setup_hints(tmp_path):
+    """A stopped scanner, a debater that failed and a job that couldn't run: members get what happened in plain
+    words; the key names, `fly secrets` commands and provider errors are for admins."""
+    from dataclasses import replace as replaced
+
+    site = Site(tmp_path)
+    reason = (
+        "Configuration problem: LLM_ANALYSIS_MODE=debate uses anthropic:claude-sonnet-5 (LLM_DEBATERS), but "
+        "ANTHROPIC_API_KEY isn't set. Set it in .env (on Fly.io: fly secrets set ANTHROPIC_API_KEY=...)."
+    )
+    site.ctx.control._reason = reason
+    site.ctx.control.enabled = True
+    debate = replaced(
+        make_debate(),
+        mode="single",
+        participants=make_debate().participants[:1],
+        judge=None,
+        agreement=None,
+        reason="anthropic:claude-sonnet-5 failed, so openai:gpt-5 analysed it alone: Anthropic rejected the "
+        "credentials (401: x). Check ANTHROPIC_API_KEY.",
+    )
+    opp = site.add(debate=debate)
+    member = site.client()
+    user = site.user()
+    job = site.accounts.create_job(user.id, "AMD")
+    site.accounts.finish_job(
+        job.id, error="The language model can't be used: Check ANTHROPIC_API_KEY.", failure="setup"
+    )
+    texts = [
+        member.get("/api/v1/status").text,
+        member.get(f"/api/v1/ideas/{opp.id}").text,
+        member.get(f"/api/v1/jobs/{job.id}").text,
+        member.get("/").text,
+        member.get(f"/ideas/{opp.id}").text,
+        member.get(f"/jobs/{job.id}").text,
+    ]
+    for text in texts:
+        for secret in ("ANTHROPIC_API_KEY", "fly secrets", "in .env", "rejected the credentials"):
+            assert secret not in text
+    assert "The scanner is stopped for now." in texts[0]
+    assert "Claude Sonnet 5 was unavailable, so GPT-5 analysed it alone." in texts[1]
+    assert "the language model isn't set up right on the server" in texts[2]
+    admin = site.client("admin@example.com", role="admin")
+    assert "fly secrets set ANTHROPIC_API_KEY" in admin.get("/api/v1/status").json()["reason"]
+    assert "Check ANTHROPIC_API_KEY" in admin.get(f"/api/v1/ideas/{opp.id}").json()["debate"]["reason_label"]
+    assert "Check ANTHROPIC_API_KEY" in admin.get(f"/api/v1/jobs/{job.id}").json()["error"]

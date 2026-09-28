@@ -8,10 +8,11 @@
 app = "my-dip-scanner"       # your app's name, from `fly apps create`
 primary_region = "fra"       # Frankfurt, the nearest region to Greece (`fly platform regions`)
 
-# Fly stops the Machine with this signal on deploys and restarts: the website finishes its requests (up to 15 s) and
-# the scanner its cycle (up to 10 s more) before the process is killed.
+# Fly stops the Machine with this signal on deploys and restarts: the website finishes its requests (up to 15 s),
+# then the scanner's cycle (it stops before its next stock) and a member's running analysis get up to 150 s together
+# to finish, so model calls already paid for aren't thrown away. Only then does the process end (Fly's limit: 300 s).
 kill_signal = "SIGTERM"
-kill_timeout = "40s"
+kill_timeout = "180s"
 
 # Swap on the Machine's own disk, in case a busy moment goes over the memory below (measured: see docs/DEPLOY.md).
 swap_size_mb = 512

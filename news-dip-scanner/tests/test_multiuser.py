@@ -6,21 +6,35 @@ from __future__ import annotations
 import logging
 import sqlite3
 import threading
+import time
 from datetime import UTC, timedelta
 from zoneinfo import ZoneInfo
 
 import pytest
-from conftest import FakeChatModel, FakeSession, chart_json, make_article, make_impact
-from test_pipeline import AMD_SCORE, ANALYSIS, CYCLE, FEEDS, MARKETWATCH_URL, FakeNotifier, routes, rss, triage_reply
+from conftest import FakeChatModel, FakeResponse, FakeSession, chart_json, make_article, make_impact
+from test_pipeline import (
+    AMD_SCORE,
+    ANALYSIS,
+    CYCLE,
+    FEEDS,
+    MARKETWATCH_URL,
+    FakeNotifier,
+    routes,
+    rss,
+    seed,
+    triage_reply,
+)
 
+from dip_scanner.accounts import Accounts
 from dip_scanner.config import AlertConfig, LLMSettings, ScanConfig, ScannerConfig, Settings
 from dip_scanner.llm import LLMSetupError
-from dip_scanner.notify import NotifyError
+from dip_scanner.notify import NotifyError, WebhookNotifier
 from dip_scanner.pipeline import CycleResult, Scanner, cycle_stats
 from dip_scanner.prices import YahooPrices
 from dip_scanner.recipients import Recipient
 from dip_scanner.report import format_when
 from dip_scanner.store import DEFAULT_RECIPIENT, Store
+from dip_scanner.web.jobs import InlineExecutor, JobRunner
 
 QUIET = ScannerConfig(scan=ScanConfig(context_news=False, reanalyse_same_session_hours=0))
 CHART = "https://query1.finance.yahoo.com/v8/finance/chart/"
@@ -194,6 +208,43 @@ def test_thesis_changes_go_only_to_recipients_who_were_alerted_and_want_them(mak
     assert kinds == {("user:1", "alert"), ("user:1", "thesis"), ("user:3", "alert")}
 
 
+def thesis_run(make, second: dict, *, raise_to: float | None = 70):
+    """AMD alerted to user:1 (min_score 65) in one cycle; then min_score raised to raise_to and AMD analysed again as
+    second 44 hours later. Returns (the notifier, the second cycle's result)."""
+    inbox = FakeNotifier()
+    rules = {"alerts": AlertConfig()}
+    verdict = {"now": ANALYSIS}
+    session = FakeSession(routes())
+    scanner = make(
+        recipients=lambda now: [person(1, [inbox], alerts=rules["alerts"])],
+        session=session,
+        analysis_model=FakeChatModel(lambda *_: verdict["now"]),
+    )
+    scanner.run_cycle(CYCLE)
+    assert [subject for subject, _, _ in inbox.sent] == ["Dip alert: AMD (score 68)"]
+    if raise_to is not None:
+        rules["alerts"] = AlertConfig(min_score=raise_to)
+    later = CYCLE + timedelta(hours=44)
+    session.routes[MARKETWATCH_URL] = rss(("AMD shares slide as the SEC opens a probe", "https://e.com/p", later))
+    verdict["now"] = second
+    return inbox, scanner.run_cycle(later)
+
+
+def test_raising_the_minimum_score_does_not_cancel_a_thesis_change(make):
+    """They may have orders on the alert they got; stricter rules since don't make "fundamental damage" news."""
+    inbox, result = thesis_run(make, {**ANALYSIS, "verdict": "fundamental", "probability_up_6m": 30})
+    assert len(result.thesis_changes) == 1
+    assert inbox.sent[-1][0] == (
+        "Thesis change: AMD now Fundamental damage (was Temporary fear, entry $132.00) - review open orders"
+    )
+
+
+def test_stricter_rules_alone_are_no_thesis_change(make):
+    """The same idea analysed again fails the new rules only because they are stricter: nothing to review."""
+    inbox, result = thesis_run(make, ANALYSIS)
+    assert result.thesis_changes == [] and len(inbox.sent) == 1
+
+
 def test_a_channel_failing_for_one_recipient_does_not_mark_another_as_sent(make):
     broken = FakeNotifier(NotifyError("SMTP server smtp.example.com:587 refused the connection."))
     working = FakeNotifier()
@@ -220,6 +271,34 @@ def test_a_channel_failing_for_one_recipient_does_not_mark_another_as_sent(make)
     assert len(broken.sent) == 2 and len(working.sent) == 1
     assert broken.sent[1][0] == "Dip alert: AMD (score 68)"
     assert scanner.store.deliveries(recipient="user:1")[0]["sent"] is True
+
+
+def test_a_members_webhook_that_never_answers_does_not_hold_the_cycle(make):
+    """A tarpit (a public https server that accepts the POST and trickles its answer) costs the cycle the deadline,
+    not hours: the next member still gets the alert and the stuck delivery is recorded as not sent."""
+    release = threading.Event()
+
+    class Tarpit:
+        def post(self, url, **kwargs):
+            release.wait(10)
+            return FakeResponse(url, 200)
+
+    tarpit = WebhookNotifier("https://tarpit.example.com/hook", "slack", session=Tarpit(), deadline=0.2)
+    working = FakeNotifier()
+    scanner = make(recipients=[person(1, [tarpit]), person(2, [working])])
+    try:
+        started = time.monotonic()
+        result = scanner.run_cycle(CYCLE)
+        assert time.monotonic() - started < 2
+    finally:
+        release.set()
+    assert [subject for subject, _, _ in working.sent] == ["Dip alert: AMD (score 68)"]
+    [stuck] = scanner.store.deliveries(recipient="user:1")
+    assert stuck["sent"] is False and "didn't answer within 0.2 s" in stuck["detail"]
+    assert (
+        "Couldn't send the alerts to user1@example.com by slack webhook: The slack webhook at tarpit.example.com "
+        "didn't answer within 0.2 s." in result.notes
+    )
 
 
 def test_a_recipient_gets_ideas_only_from_when_their_alerts_started(make):
@@ -525,3 +604,148 @@ def test_an_unreadable_pause_flag_counts_as_running(make, monkeypatch):
 
     monkeypatch.setattr(scanner.store, "scanner_paused", broken)
     assert scanner.paused() is False
+
+
+# --- a member's "Analyse now" and everybody else's alerts ---------------------------------------------------------
+
+PASSWORD = "a long enough password"
+
+
+def members(scanner: Scanner):
+    """Two website users on the scanner's database (ids 1 and 2) with a notifier each, as recipients."""
+    accounts = Accounts(scanner.store, clock=lambda: CYCLE)
+    alice = accounts.create_user("user1@example.com", password=PASSWORD)
+    bob = accounts.create_user("user2@example.com", password=PASSWORD)
+    inboxes = FakeNotifier(), FakeNotifier()
+    return accounts, (alice, bob), inboxes, [person(1, [inboxes[0]]), person(2, [inboxes[1]])]
+
+
+def analyse_now(scanner: Scanner, accounts: Accounts, user, *, at):
+    """What the website's "Analyse now" does: a job running the scanner's analyze_ticker (inline here)."""
+    jobs = JobRunner(
+        accounts,
+        analyse=scanner.analyze_ticker,
+        settings=Settings(data_dir=scanner.settings.data_dir),
+        clock=lambda: at,
+        executor=InlineExecutor(),
+    )
+    job = accounts.get_job(jobs.submit(user, "AMD").id)
+    assert job.status == "done"
+    return scanner.store.get_opportunity(job.opportunity_id)
+
+
+def test_a_members_analyse_now_does_not_hold_the_dip_back_from_everybody(make):
+    """The story is in (/news shows it) when member 2 clicks "Analyse now". The cycle must still analyse the dip and
+    alert member 1: a manual analysis isn't the scanner's cooldown."""
+    recipients: list = []
+    scanner = make(recipients=recipients, feeds=[])
+    accounts, (_, bob), (alice_inbox, bob_inbox), people = members(scanner)
+    recipients += people
+    seed(scanner, "AMD", magnitude=4, at=CYCLE - timedelta(minutes=10))
+    manual = analyse_now(scanner, accounts, bob, at=CYCLE - timedelta(minutes=10))
+    assert scanner.store.is_manual(manual.id)
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["AMD"]
+    assert not any("cooldown" in note for note in result.notes)
+    assert [subject for subject, _, _ in alice_inbox.sent] == ["Dip alert: AMD (score 68)"]
+    assert bob_inbox.sent == []  # he read the same idea a moment ago: a repeat
+    assert any(note.startswith("Alerted within the last") and "user2@example.com" in note for note in result.notes)
+
+
+def test_a_manual_analysis_before_the_news_does_not_make_the_news_wait_for_the_next_session(make):
+    config = ScannerConfig(scan=ScanConfig(context_news=False))  # the same-session wait on (12 hours)
+    recipients: list = []
+    scanner = make(recipients=recipients, feeds=[], config=config)
+    accounts, (_, bob), (alice_inbox, _), people = members(scanner)
+    recipients += people
+    analyse_now(scanner, accounts, bob, at=CYCLE - timedelta(hours=5))
+    seed(scanner, "AMD", magnitude=4, at=CYCLE - timedelta(minutes=30))  # the news comes after the click
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["AMD"]
+    assert not any(note.startswith("Already analysed on the latest session's prices") for note in result.notes)
+    assert [subject for subject, _, _ in alice_inbox.sent] == ["Dip alert: AMD (score 68)"]
+
+
+def test_a_manual_analysis_stored_during_the_cycle_is_sent_in_the_pending_alerts_place(make):
+    """A member's analysis finishes while the cycle is still busy with later candidates: the cycle's alert is
+    superseded, and the others get the newer analysis instead of nothing."""
+    recipients: list = []
+    scanner = make(recipients=recipients)
+    accounts, (_, bob), (alice_inbox, bob_inbox), people = members(scanner)
+    recipients += people
+    store = scanner.store
+    real_add = store.add_opportunity
+    manual: list = []
+
+    def add_then_click(opp, **kwargs):
+        stored = real_add(opp, **kwargs)
+        if not manual and not kwargs.get("manual"):  # the website's job, in its own thread, a minute later
+            manual.append(analyse_now(scanner, accounts, bob, at=CYCLE + timedelta(minutes=1)))
+        return stored
+
+    store.add_opportunity = add_then_click
+    result = scanner.run_cycle(CYCLE)
+    store.add_opportunity = real_add
+
+    [cycle_opp] = result.opportunities
+    [(subject, markdown, _)] = alice_inbox.sent
+    assert subject == "Dip alert: AMD (score 68)" and "analysed 1" not in markdown
+    assert bob_inbox.sent == []  # the viewer read it on the website
+    rows = {(row["recipient"], row["opportunity_id"], row["kind"], row["sent"]) for row in store.deliveries()}
+    assert ("user:1", manual[0].id, "alert", True) in rows
+    assert ("user:2", cycle_opp.id, "handled", False) in rows
+    scanner.run_cycle(CYCLE + timedelta(minutes=5))  # nothing again, and nothing left waiting
+    assert len(alice_inbox.sent) == 1 and store.unnotified(recipient="user:1") == []
+
+
+def test_an_alert_retried_after_a_manual_analysis_is_sent_once(make):
+    recipients: list = []
+    scanner = make(recipients=recipients)
+    accounts, (_, bob), (alice_inbox, _), people = members(scanner)
+    recipients += people
+    alice_inbox.error = NotifyError("Slack answered 503")
+    scanner.run_cycle(CYCLE)
+    analyse_now(scanner, accounts, bob, at=CYCLE + timedelta(minutes=2))  # "Analyse again" while Alice waits
+    scanner.run_cycle(CYCLE + timedelta(minutes=5))  # still down: tried again
+    alice_inbox.error = None
+    scanner.run_cycle(CYCLE + timedelta(minutes=10))
+    scanner.run_cycle(CYCLE + timedelta(minutes=15))
+    assert [subject for subject, _, _ in alice_inbox.sent] == ["Dip alert: AMD (score 68)"] * 3  # 2 failed, 1 sent
+    assert scanner.store.unnotified(recipient="user:1") == []
+
+
+def test_a_bearish_manual_analysis_stops_the_stale_alert(make):
+    replies = {"now": ANALYSIS}
+    recipients: list = []
+    scanner = make(recipients=recipients, analysis_model=FakeChatModel(lambda *_: replies["now"]))
+    accounts, (_, bob), (alice_inbox, _), people = members(scanner)
+    recipients += people
+    alice_inbox.error = NotifyError("Slack answered 503")
+    scanner.run_cycle(CYCLE)
+    replies["now"] = {**ANALYSIS, "verdict": "fundamental", "probability_up_6m": 25}
+    analyse_now(scanner, accounts, bob, at=CYCLE + timedelta(minutes=2))
+    alice_inbox.error = None
+    scanner.run_cycle(CYCLE + timedelta(minutes=5))
+    assert len(alice_inbox.sent) == 1  # only the failed attempt of cycle 1: the bullish alert is stale now
+    assert scanner.store.unnotified(recipient="user:1") == []
+
+
+def test_a_manual_analysis_that_fails_the_rules_is_no_idea_to_review(make):
+    """Member 1 read a "fundamental damage" analysis of their own; the scanner's own, as gloomy, is no thesis change
+    for them: they never had an idea to place orders on."""
+    gloomy = {**ANALYSIS, "verdict": "fundamental", "probability_up_6m": 30}
+    recipients: list = []
+    scanner = make(recipients=recipients, feeds=[], analysis_model=FakeChatModel(gloomy))
+    accounts, (alice, _), (alice_inbox, bob_inbox), people = members(scanner)
+    recipients += people
+    seed(scanner, "AMD", magnitude=4, at=CYCLE - timedelta(minutes=10))
+    analyse_now(scanner, accounts, alice, at=CYCLE - timedelta(minutes=10))
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["AMD"] and result.thesis_changes == []
+    assert alice_inbox.sent == [] and bob_inbox.sent == []

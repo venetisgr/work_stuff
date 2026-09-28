@@ -36,11 +36,12 @@
   </dl>
   {% else %}
   <p class="callout small">{{ price_problem }}</p>
+  {% if replacement %}<p class="callout callout-info small">The scanner found the company under <a class="ticker" href="/tickers/{{ replacement|urlencode }}">{{ replacement }}</a> now: open that one to analyse it.</p>{% endif %}
   {% endif %}
 
   <div class="form-actions idea-actions">
     {{ parts.analyse(symbol, analyse, next=here) }}
-    {{ parts.watchlist_button(symbol, on_watchlist, next=here) }}
+    {% if not no_prices or on_watchlist %}{{ parts.watchlist_button(symbol, on_watchlist, next=here) }}{% endif %}
   </div>
   {% if analyse.available and analyse.remaining is not none %}<p class="small muted">An analysis asks the model now, whatever the price did, and shows the idea when it is ready. You have {{ analyse.remaining }} of {{ analyse.limit }} left in the last 24 hours.</p>{% endif %}
 </header>

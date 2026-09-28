@@ -1,17 +1,18 @@
-# news-dip-scanner: lint and test every pull request and push that touches the project, and deploy the Python app to
-# Fly.io after a push to main, or by hand (Actions > news-dip-scanner > Run workflow, on main; on another branch it
-# only tests). A change to the Next.js front end (news-dip-scanner/frontend/) runs its own checks; Vercel deploys it,
-# so a change to it alone never restarts the scanner on Fly.io. A change to the API contract
-# (frontend/contract/) runs both, since the Python tests check the API against it. Deploying needs the FLY_API_TOKEN
-# repository secret (`fly tokens create deploy`); without it the deploy job only says so. See
+# news-dip-scanner: lint and test every pull request and every push that touches the project, and deploy the Python
+# app to Fly.io after a push to main that changed what goes into its image, or by hand (Actions > news-dip-scanner >
+# Run workflow, on main; on another branch it only tests). A change to the Next.js front end
+# (news-dip-scanner/frontend/) runs its own checks; Vercel deploys it, so a change to it alone never restarts the
+# scanner on Fly.io, and neither do changes to the docs or the tests alone. A change to the API contract
+# (frontend/contract/) runs both checks, since the Python tests check the API against it. The "Checks" job always
+# runs and passes when every check that was needed passed: it is the one to require on main. Deploying needs the
+# FLY_API_TOKEN repository secret (`fly tokens create deploy`); without it the deploy job only says so. See
 # news-dip-scanner/docs/DEPLOY.md and docs/VERCEL.md.
 name: news-dip-scanner
 
 on:
+  # Every pull request, whatever it touches: a workflow skipped by a paths filter leaves a required check waiting for
+  # ever. The jobs a change doesn't concern are skipped instead (see "What changed"), which counts as passed.
   pull_request:
-    paths:
-      - "news-dip-scanner/**"
-      - ".github/workflows/news-dip-scanner.yml"
   push:
     paths:
       - "news-dip-scanner/**"
@@ -21,11 +22,14 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request cancels its older run; runs on a branch otherwise wait their turn, so a deploy is
-# never cut off halfway.
+# Runs on a branch wait their turn in the order they were pushed: queue: max keeps every pending run. (By default
+# GitHub cancels all but the newest pending run, and that run's "What changed" would miss the cancelled pushes' files
+# and skip a Fly deploy.) queue: max can't be combined with cancel-in-progress, so an outdated pull-request run also
+# finishes; a deploy is never cut off halfway.
 concurrency:
   group: news-dip-scanner-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
+  queue: max
 
 jobs:
   changes:
@@ -41,8 +45,10 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      # app: the Python app (tested and deployed); python: its tests' inputs, which include the API contract;
-      # frontend: the Next.js app. A run by hand, a new branch or an unknown base checks everything.
+      # app: what goes into the Fly image (deployed): the Dockerfile and .dockerignore, pyproject.toml, README.md
+      # (pyproject.toml's readme), dip_scanner/, scanner.toml, feeds.toml, and fly.toml; python: the Python checks'
+      # inputs, everything outside frontend/ (docs and tests too) and the API contract; frontend: the Next.js app. A
+      # workflow change, a run by hand, a new branch or an unknown base checks and deploys everything.
       - name: Compare with the base
         id: diff
         env:
@@ -58,9 +64,10 @@ jobs:
           has() { printf '%s\n' "$files" | grep -Eq "$1" && echo true || echo false; }
           workflow=$(has '^\.github/workflows/news-dip-scanner\.yml$')
           outside=$(printf '%s\n' "$files" | grep '^news-dip-scanner/' | grep -v '^news-dip-scanner/frontend/' || true)
-          app=$([ -n "$outside" ] || [ "$workflow" = true ] && echo true || echo false)
+          image=$(has '^news-dip-scanner/(Dockerfile|\.dockerignore|pyproject\.toml|README\.md|scanner\.toml|feeds\.toml|fly\.toml|dip_scanner/)')
+          app=$([ "$image" = true ] || [ "$workflow" = true ] && echo true || echo false)
           contract=$(has '^news-dip-scanner/frontend/contract/')
-          python=$([ "$app" = true ] || [ "$contract" = true ] && echo true || echo false)
+          python=$([ -n "$outside" ] || [ "$workflow" = true ] || [ "$contract" = true ] && echo true || echo false)
           frontend=$([ "$(has '^news-dip-scanner/frontend/')" = true ] || [ "$workflow" = true ] && echo true || echo false)
           echo "app=$app python=$python frontend=$frontend"
           {
@@ -128,11 +135,28 @@ jobs:
       - name: Build
         run: npm run build
 
+  # The check to require on main (branch protection): it always runs, and fails unless every job before it passed or
+  # was skipped because the change didn't concern it. A failed "What changed" fails it too (it would otherwise skip
+  # every check, which counts as passed).
+  checks:
+    name: Checks
+    needs: [changes, test, frontend]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Every needed check passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "$RESULTS"
+          for result in $RESULTS; do case "$result" in success|skipped) ;; *) exit 1 ;; esac; done
+
   deploy:
     name: Deploy to Fly.io
     needs: [changes, test]
-    # Only main is deployed: after a push to it that changed the Python app, or when started by hand on it. Vercel's
-    # production branch is main too, so the front end and the API it calls go out from the same commits.
+    # Only main is deployed: after a push to it that changed the Fly image's inputs, or when started by hand on it.
+    # Vercel's production branch is main too, so the front end and the API it calls go out from the same commits.
     if: >-
       github.ref == 'refs/heads/main' && needs.changes.outputs.app == 'true' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')

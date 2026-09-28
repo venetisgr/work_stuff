@@ -10,25 +10,6 @@
 
 {{ ui.status_strip(status, calls_today=calls_today) }}
 
-{% if changes %}
-<section class="card thesis-card" aria-labelledby="changes-title">
-  <div class="card-header">
-    <h2 id="changes-title">Thesis changes</h2>
-    <span class="badge badge-warn">Review open orders</span>
-  </div>
-  <p class="small muted">A newer analysis undercuts an idea that passed your alert rules. If you placed orders on the earlier idea, check them.</p>
-  <ul class="list">
-    {% for change in changes %}
-    {% set now_a = change.current.analysis %}
-    {% set was = change.previous.analysis %}
-    <li>
-      <p class="change-line"><a class="ticker" href="/ideas/{{ change.current.id }}">{{ change.current.ticker }}</a> {{ change.reason }}: now {{ ui.verdict_badge(now_a.verdict) }} <span class="num">{{ now_a.probability_up_6m|percent }}</span> chance up, score <span class="num">{{ change.current.score|score }}</span>.</p>
-      <p class="meta"><span>Was {{ was.verdict|verdict }}, {{ was.probability_up_6m|percent }}, entry {{ was.entry_price|price(change.previous.currency) }}, target {{ was.target_price|price(change.previous.currency) }}</span><span>analysed {{ ui.time(change.current.created) }}</span><a href="/ideas/{{ change.previous.id }}">the earlier idea</a></p>
-    </li>
-    {% endfor %}
-  </ul>
-</section>
-{% endif %}
 
 <div class="split-layout">
   <div class="split-main">
@@ -76,6 +57,34 @@
       </form>
     </details>
 
+{% macro thesis_item(change) %}
+{% set now_a = change.current.analysis %}
+{% set was = change.previous.analysis %}
+<li>
+  <p class="change-line"><a class="ticker" href="/ideas/{{ change.current.id }}">{{ change.current.ticker }}</a> {{ change.reason }}: now {{ ui.verdict_badge(now_a.verdict) }} <span class="num">{{ now_a.probability_up_6m|percent }}</span> chance up, score <span class="num">{{ change.current.score|score }}</span>.</p>
+  <p class="meta"><span>Was {{ was.verdict|verdict }}, {{ was.probability_up_6m|percent }}, entry {{ was.entry_price|money(change.previous) }}, target {{ was.target_price|money(change.previous) }}</span><span>analysed {{ ui.time(change.current.created) }}</span><a href="/ideas/{{ change.previous.id }}">the earlier idea</a></p>
+</li>
+{% endmacro %}
+{% if changes %}
+<section class="card thesis-card" aria-labelledby="changes-title">
+  <div class="card-header">
+    <h2 id="changes-title">Thesis changes</h2>
+    <span class="badge badge-warn">Review open orders</span>
+  </div>
+  <p class="small muted">A newer analysis undercuts an idea you were alerted about (or that passed your alert rules since you joined). If you placed orders on the earlier idea, check them.</p>
+  <ul class="list">
+    {% for change in changes[:changes_shown] %}{{ thesis_item(change) }}{% endfor %}
+  </ul>
+  {% if changes|length > changes_shown %}
+  <details class="thesis-more">
+    <summary>Show all {{ changes|length }}</summary>
+    <ul class="list">
+      {% for change in changes[changes_shown:] %}{{ thesis_item(change) }}{% endfor %}
+    </ul>
+  </details>
+  {% endif %}
+</section>
+{% endif %}
     {% if ideas %}
     <p class="small muted list-count">{% if shown != total %}{{ shown }} of {{ total|plural("idea") }} match the filters.{% else %}{{ total|plural("idea") }}.{% endif %}{% if watchlist or matching %} <span class="legend"><span class="marker marker-watch" aria-hidden="true">★</span> on your watchlist · <span class="marker marker-rules" aria-hidden="true">✓</span> passes your alert rules</span>{% endif %}</p>
     <div class="card card-flush ideas-list">

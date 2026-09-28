@@ -75,7 +75,8 @@ test("an idea with a debate and a chart, in React", async () => {
   debatedId = debated.id;
 
   await page.goto("/?days=30");
-  await page.locator(`a[href="/ideas/${debatedId}"]`).first().click();
+  // The list renders cards on narrow screens and a table on wide ones: click the link that is showing.
+  await page.locator(`a[href="/ideas/${debatedId}"]:visible`).first().click();
   await page.waitForURL(`**/ideas/${debatedId}`);
   await expect(page.getByRole("heading", { level: 1 })).toContainText(debated.ticker);
 

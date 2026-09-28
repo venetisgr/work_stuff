@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import threading
 
 import httpx2
 import pytest
@@ -204,6 +205,34 @@ def test_openai_sends_system_and_user_messages_to_chat_completions():
         "model": "gpt-5-mini",
         "messages": [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "What now?"}],
     }
+
+
+def test_last_usage_is_kept_per_thread():
+    """A manual analysis in the website's thread and the scanner's cycle share the model: one call starting in another
+    thread must not wipe the usage this thread is about to record."""
+    gate, arrived = threading.Event(), threading.Event()
+    replies = [completion(), {**completion(), "usage": {"prompt_tokens": 99, "completion_tokens": 1}}]
+
+    def answer(request):
+        index = len(seen)
+        seen.append(request)
+        if index == 1:
+            arrived.set()
+            gate.wait(5)
+        return httpx2.Response(200, json=replies[index])
+
+    seen: list = []
+    model = OpenAIChatModel(
+        openai_settings(), "gpt-5", http_client=httpx2.Client(transport=httpx2.MockTransport(answer)), max_retries=0
+    )
+    model.complete("s", "p")
+    other = threading.Thread(target=model.complete, args=("s", "p"))
+    other.start()
+    assert arrived.wait(5)  # the other thread's call has started (and reset its own last_usage)
+    assert model.last_usage == Usage(input_tokens=10, output_tokens=5)
+    gate.set()
+    other.join(5)
+    assert model.last_usage == Usage(input_tokens=10, output_tokens=5)
 
 
 def test_openai_json_mode_asks_for_a_json_object():
@@ -792,14 +821,17 @@ def test_build_models_in_debate_mode_returns_the_panel_and_keeps_triage():
     assert panel.name == "debate: gpt-5 vs claude-sonnet-5"
 
 
-def test_the_debaters_and_the_judge_use_the_analysis_effort():
-    triage, panel = build_models(debate_settings(triage_reasoning_effort="low", analysis_reasoning_effort="high"))
+def test_the_openai_debater_uses_the_analysis_effort_and_claude_its_default():
+    """The spec's "OpenAI/Azure only": LLM_ANALYSIS_REASONING_EFFORT=low to save on GPT-5 mustn't run Claude at low
+    effort too, and a Claude level such as "max" mustn't reach GPT-5 (an error on every opening)."""
+    triage, panel = build_models(debate_settings(triage_reasoning_effort="low", analysis_reasoning_effort="low"))
     assert triage._reasoning_effort == "low"
     first, second = panel.debaters
-    assert (first.model._reasoning_effort, second.model._effort) == ("high", "high")
+    assert (first.model._reasoning_effort, second.model._effort) == ("low", None)
 
     _, panel = build_models(debate_settings(debate_judge="anthropic:claude-opus-5", reasoning_effort="medium"))
-    assert panel.judge.label == "anthropic:claude-opus-5" and panel.judge.model._effort == "medium"
+    assert panel.judge.label == "anthropic:claude-opus-5" and panel.judge.model._effort is None
+    assert panel.debaters[0].model._reasoning_effort == "medium"
     assert panel.name == "debate: gpt-5 vs claude-sonnet-5, judged by claude-opus-5"
 
 

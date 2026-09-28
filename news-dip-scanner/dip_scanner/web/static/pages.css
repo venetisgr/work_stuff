@@ -405,6 +405,12 @@
   margin: 0 0 2px;
 }
 
+.thesis-more > summary {
+  cursor: pointer;
+  font-size: var(--text-sm, 0.875rem);
+  margin-top: var(--space-2);
+}
+
 .lookup {
   display: flex;
   gap: var(--space-2);

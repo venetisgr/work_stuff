@@ -83,7 +83,8 @@ class TimedCache:
 @dataclass
 class AppContext:
     """The website's services. store is the website's own connection to the database (the scanner thread has
-    another); accounts works on it. http is the HTTP session for test alerts and other outgoing requests."""
+    another); accounts works on it. http is the HTTP session for test alerts and other outgoing requests; webhook_http
+    the one for members' own webhooks (netguard.public_https_session: connections only to public addresses)."""
 
     settings: Settings
     config: ScannerConfig
@@ -97,6 +98,7 @@ class AppContext:
     templates: Jinja2Templates
     http: Any  # a requests.Session (or a test's fake)
     clock: Callable[[], datetime]
+    webhook_http: Any = None  # a netguard.public_https_session (or a test's fake); None: http
     resolver: Resolver | None = None  # webhook host lookups (None: the system's DNS)
     trust_fly_client_ip: bool = False  # take the client's address from Fly-Client-IP (set by Fly's proxy)
     extra_css: tuple[str, ...] = ()  # pages.css / admin.css when they exist

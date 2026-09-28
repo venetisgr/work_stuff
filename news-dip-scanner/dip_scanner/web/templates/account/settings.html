@@ -77,6 +77,10 @@
       {% if not offered.email and not offered.telegram %}
       <p class="help">Email and Telegram alerts aren't set up on this server; a webhook works.</p>
       {% endif %}
+      <div class="form-actions" id="test-alert">
+        <button class="btn btn-secondary" type="submit" formaction="/settings/test" formnovalidate>Save and send a test alert</button>
+      </div>
+      <p class="help">Saves this page, then sends a short test message to each channel above; how each went shows at the top of the page.</p>
     </div>
   </section>
 
@@ -125,15 +129,6 @@
 <hr>
 
 <div class="grid">
-  <section class="card" aria-labelledby="test-title">
-    <h2 class="section-title" id="test-title">Test your alerts</h2>
-    <p class="section-lede">Sends a short test message to each saved channel and says how each went.</p>
-    <form method="post" action="/settings/test">
-      {{ ui.csrf_field() }}
-      <button class="btn btn-secondary" type="submit"{% if not has_channel %} disabled{% endif %}>Send a test alert</button>
-    </form>
-  </section>
-
   <section class="card" aria-labelledby="analyses-title">
     <h2 class="section-title" id="analyses-title">Manual analyses</h2>
     <p class="section-lede">"Analyse now" on an idea or a ticker asks the model about it at once.</p>

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import logging
 import smtplib
+import socket
+import threading
+import time
 from datetime import timedelta
 
 import pytest
 import requests
 from conftest import NOW, FakeResponse, FakeSession, make_analysis, make_debate, make_opportunity
 
+from dip_scanner import notify as notify_module
 from dip_scanner.config import ConfigError, NotifySettings
 from dip_scanner.notify import (
     ALERT_FOOTER,
@@ -610,3 +614,174 @@ def test_short_alert_adds_a_line_for_a_debate():
     assert lines[2] == "  Debate: GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)"
     assert lines[3] == ALERT_FOOTER
     assert "Debate" not in short_alert([make_opportunity()])
+
+
+# --- a member's webhook can't hold the scanner ----------------------------------------------------------------------
+
+
+class BlockingSession:
+    """A session whose post() waits until release is set (a server that never finishes answering)."""
+
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.calls = 0
+
+    def post(self, url, **kwargs):
+        self.calls += 1
+        self.release.wait(10)
+        return FakeResponse(url, 200)
+
+
+@pytest.fixture
+def blocking():
+    session = BlockingSession()
+    yield session
+    session.release.set()  # let the abandoned threads finish
+
+
+def test_a_webhook_with_a_deadline_gives_up_on_a_server_that_never_answers(blocking):
+    hook = WebhookNotifier("https://tarpit.example.com/hook", "slack", session=blocking, deadline=0.2)
+    started = time.monotonic()
+    with pytest.raises(NotifyError, match=r"^The slack webhook at tarpit.example.com didn't answer within 0.2 s"):
+        hook.send("Subject", "text", "html")
+    assert time.monotonic() - started < 1
+    # The first send still hangs in the background: the next one doesn't start another.
+    started = time.monotonic()
+    with pytest.raises(NotifyError, match="is still busy with the previous message"):
+        hook.send("Subject", "text", "html")
+    assert time.monotonic() - started < 0.2 and blocking.calls == 1
+    blocking.release.set()  # the server finally answers
+    for _ in range(100):
+        if not notify_module._IN_FLIGHT:
+            break
+        time.sleep(0.01)
+    hook.send("Subject", "text", "html")
+    assert blocking.calls == 2
+
+
+def test_a_webhook_without_a_deadline_is_sent_in_the_callers_thread():
+    threads = []
+
+    class Recording(FakeSession):
+        def post(self, url, **kwargs):
+            threads.append(threading.current_thread())
+            return super().post(url, **kwargs)
+
+    hook = WebhookNotifier(SLACK_URL, "slack", session=Recording({SLACK_URL: "ok"}))
+    hook.send("Subject", "text", "html")
+    assert threads == [threading.current_thread()]
+    with pytest.raises(NotifyError, match="answered 404"):  # errors come back as before, deadline or not
+        WebhookNotifier(SLACK_URL, "slack", session=FakeSession({}), deadline=5).send("Subject", "text", "html")
+
+
+def local_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = False  # straight to 127.0.0.1, whatever proxy the environment names
+    return session
+
+
+def trickling_server(head: bytes, *, delay: float, body: bytes = b"", trickle_head: bool = False):
+    """A local HTTP server that answers every request with head (the status line and headers) then body, one byte
+    every delay seconds (the head too with trickle_head). Returns (url, stop, connections)."""
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(5)
+    stop = threading.Event()
+    connections = []
+
+    def serve(conn):
+        with conn:
+            conn.settimeout(5)
+            data = b""
+            while b"\r\n\r\n" not in data:
+                data += conn.recv(65536)
+            try:
+                if trickle_head:
+                    for byte in head:
+                        if stop.wait(delay):
+                            return
+                        conn.sendall(bytes([byte]))
+                else:
+                    conn.sendall(head)
+                if not delay:
+                    conn.sendall(body)
+                for byte in body if delay else b"":
+                    if stop.wait(delay):
+                        return
+                    conn.sendall(bytes([byte]))
+            except OSError:
+                return
+
+    def accept():
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            connections.append(conn)
+            threading.Thread(target=serve, args=(conn,), daemon=True).start()
+
+    threading.Thread(target=accept, daemon=True).start()
+
+    def close():
+        stop.set()
+        listener.close()
+
+    return f"http://127.0.0.1:{listener.getsockname()[1]}/hook", close, connections
+
+
+@pytest.mark.parametrize("trickle_head", [False, True], ids=["body", "headers"])
+def test_a_trickling_reply_is_cut_off_at_the_deadline(trickle_head):
+    """requests' timeout only limits each read: a byte every 0.3 s would pass a 20 s timeout for ever."""
+    url, close, connections = trickling_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 50\r\nX-Slow: aaaaaaaaaaaaaaaaaaaa\r\n\r\n",
+        body=b"x" * 50,
+        delay=0.3,
+        trickle_head=trickle_head,
+    )
+    try:
+        hook = WebhookNotifier(url, "generic", session=local_session(), timeout=1, deadline=1)
+        started = time.monotonic()
+        with pytest.raises(NotifyError, match="didn't answer within 1 s"):
+            hook.send("Subject", "text", "html")
+        assert time.monotonic() - started < 2
+        with pytest.raises(NotifyError, match="still busy"):
+            hook.send("Subject", "text", "html")
+        assert len(connections) == 1  # no second connection while the first is stuck
+    finally:
+        close()
+
+
+def test_only_the_start_of_a_members_webhook_reply_is_read():
+    """A huge reply is dropped unread instead of filling the machine's memory."""
+    url, close, _ = trickling_server(
+        b"HTTP/1.1 200 OK\r\nContent-Length: 5000000\r\n\r\n", body=b"x" * 5_000_000, delay=0
+    )
+    options = {"label": "the generic webhook at 127.0.0.1", "secrets": [], "hints": {}, "timeout": 5}
+    try:
+        reply = notify_module._post(local_session(), url, {}, sleep=time.sleep, max_reply_bytes=1000, **options)
+        assert len(reply.content) == 1000
+        full = notify_module._post(local_session(), url, {}, sleep=time.sleep, **options)
+        assert len(full.content) == 5_000_000  # the .env webhook reads the whole reply, as before
+    finally:
+        close()
+
+
+def test_a_members_webhook_error_names_no_connection_details(caplog):
+    """The raw exception would tell a member which of the server's private ports are open (and what answers there)."""
+    raw = requests.ConnectionError(
+        "HTTPSConnectionPool(host='127.0.0.1', port=18517): Max retries exceeded with url: /hook (Caused by "
+        "SSLError(SSLError(1, '[SSL: WRONG_VERSION_NUMBER] wrong version number')); NewConnectionError [Errno 111]"
+    )
+    session = FakeSession({"https://127.0.0.1:18517/": raw})
+    hook = WebhookNotifier("https://127.0.0.1:18517/hook", "slack", session=session, show_replies=False)
+    with caplog.at_level(logging.WARNING, logger="dip_scanner.notify"), pytest.raises(NotifyError) as error:
+        hook.send("Subject", "text", "html")
+    assert str(error.value) == "Couldn't reach the slack webhook at 127.0.0.1. Check the address, or try again later."
+    for detail in ("SSLError", "Errno", "NewConnectionError", "WRONG_VERSION", "18517"):
+        assert detail not in str(error.value)
+    assert "WRONG_VERSION_NUMBER" in caplog.text  # the details are in the server's log
+    # The owner's own .env webhook still says what went wrong.
+    own = WebhookNotifier("https://127.0.0.1:18517/hook", "slack", session=session)
+    with pytest.raises(NotifyError, match="WRONG_VERSION_NUMBER"):
+        own.send("Subject", "text", "html")
