@@ -1,6 +1,8 @@
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
-{% block head %}<meta name="referrer" content="no-referrer">{% endblock %}
+{#- The link's token must not reach a Referer header, so only the origin is sent; "no-referrer" would make
+    browsers send "Origin: null" with the form, which the Origin check refuses. -#}
+{% block head %}<meta name="referrer" content="strict-origin">{% endblock %}
 {% block content %}
 <div class="auth-card card">
   <h1>Create your account</h1>

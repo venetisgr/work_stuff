@@ -26,7 +26,9 @@
 
 {#- A signed percentage, green when above zero and red below. -#}
 {% macro pct(value) -%}
-<span class="num{% if value is not none and value > 0 %} up{% elif value is not none and value < 0 %} down{% endif %}">{{ value|pct }}</span>
+{#- coloured by the value as shown: a -0.04% move reads "+0.0%" and gets no colour -#}
+{% set shown = (value|float)|round(1) if value is not none else none %}
+<span class="num{% if shown is not none and shown > 0 %} up{% elif shown is not none and shown < 0 %} down{% endif %}">{{ value|pct }}</span>
 {%- endmacro %}
 
 {#- A time: "5 min ago" (relative=true) or "2026-09-25 18:00 EEST", the other form in the tooltip. -#}
@@ -130,6 +132,6 @@
   <span class="status-item">No cycle yet</span>
   {% endif %}
   {% if calls_today is not none %}<span class="status-item num">{{ calls_today|plural("model call") }} today</span>{% endif %}
-  {% if status.reason %}<span class="status-reason">{{ status.reason }}</span>{% endif %}
+  {% if status.reason %}<span class="status-reason is-{{ status.state }}">{{ status.reason }}</span>{% endif %}
 </div>
 {%- endmacro %}

@@ -413,7 +413,8 @@ catches a spike instead of the kernel stopping the process.
   of the build, so secrets only ever reach the Machine as Fly secrets.
 - The Machine is only reachable through Fly's proxy, which ends HTTPS (`force_https` sends plain HTTP to HTTPS). The
   server trusts the proxy's `X-Forwarded-Proto` and `X-Forwarded-For`, and uses `Fly-Client-IP` for the sign-in
-  limits (see "Behind Fly.io's proxy" in the README).
+  limits (see [Security model](../README.md#security-model) in the README, which lists the rest of the site's
+  safeguards).
 - Anyone with the deploy token can deploy code that reads the app's secrets: keep `FLY_API_TOKEN` in GitHub's secrets
   only, and let GitHub Actions deploy only from the default branch or by hand (the workflow does both).
 - Backups contain password hashes and users' settings: keep downloaded copies private.

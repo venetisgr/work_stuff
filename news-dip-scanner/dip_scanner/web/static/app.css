@@ -291,6 +291,7 @@ main.container {
   font-size: 1.0625rem;
   letter-spacing: -0.01em;
   margin-right: auto;
+  min-height: 40px;
 }
 
 .brand:hover {
@@ -318,11 +319,16 @@ main.container {
   display: none;
 }
 
+/* a row that scrolls sideways clips anything drawn outside it, so its links get the focus ring inside */
+.nav a:focus-visible {
+  outline-offset: -3px;
+}
+
 .nav a {
   flex: none;
   display: inline-flex;
   align-items: center;
-  min-height: 36px;
+  min-height: 40px;
   padding: 0 10px;
   border-radius: var(--radius-pill);
   color: var(--muted);
@@ -795,6 +801,17 @@ main.container {
   border-color: var(--accent-hover);
 }
 
+/* the second action next to a primary one: outlined in the accent colour */
+.btn-secondary {
+  background: var(--surface);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.btn-secondary:hover {
+  background: var(--accent-soft);
+}
+
 .btn-danger {
   background: var(--surface);
   border-color: var(--bad);
@@ -830,9 +847,11 @@ main.container {
   .btn {
     min-height: var(--tap);
   }
+}
 
+@media (pointer: coarse), (max-width: 639.98px) {
   .btn-small {
-    min-height: 36px;
+    min-height: 40px;
   }
 }
 
@@ -941,7 +960,8 @@ legend {
   gap: var(--space-2);
   font-weight: 500;
   cursor: pointer;
-  min-height: 32px;
+  min-height: 40px;
+  padding: var(--space-2) 0;
 }
 
 .check input {
@@ -961,14 +981,14 @@ legend {
 
 .check-list {
   display: grid;
-  gap: var(--space-2);
+  gap: 0;
 }
 
 @media (min-width: 640px) {
   .check-list-inline {
     display: flex;
     flex-wrap: wrap;
-    gap: var(--space-2) var(--space-5);
+    gap: 0 var(--space-5);
   }
 
   .field-row {
@@ -1143,6 +1163,12 @@ legend {
 
 .status-reason {
   flex-basis: 100%;
+  color: var(--muted);
+}
+
+/* a problem (stopped, stalled) in red; "off" on purpose stays quiet */
+.status-reason.is-stopped,
+.status-reason.is-stalled {
   color: var(--bad);
 }
 
@@ -1327,7 +1353,7 @@ legend {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  min-height: 36px;
+  min-height: 40px;
   padding: 0 var(--space-3);
   border: 1px solid var(--line);
   border-radius: var(--radius-pill);
@@ -1339,6 +1365,12 @@ legend {
 
 .menu > summary::-webkit-details-marker {
   display: none;
+}
+
+@media (min-width: 960px) {
+  .menu > summary {
+    max-width: 20rem;
+  }
 }
 
 .menu > summary::after {
@@ -1424,6 +1456,11 @@ legend {
   font-size: 1.375rem;
 }
 
+/* a note under the form ("Forgot your password?") */
+.auth-card .form + p {
+  margin: var(--space-4) 0 0;
+}
+
 .copy-row {
   display: flex;
   gap: var(--space-2);
@@ -1475,10 +1512,11 @@ details.disclosure > summary {
   cursor: pointer;
   font-weight: 600;
   color: var(--accent);
+  padding: var(--space-2) 0;
 }
 
 details.disclosure[open] > summary {
-  margin-bottom: var(--space-3);
+  margin-bottom: var(--space-1);
 }
 
 .ideas-list .idea-row {

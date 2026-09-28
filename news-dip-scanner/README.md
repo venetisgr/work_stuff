@@ -8,6 +8,17 @@ limit-order ideas and a score, and ends up in a ranked report and, optionally, a
 It is a research and alerting tool. It never connects to a broker and never places orders: you do your own checks and
 decide.
 
+It runs from the command line, or as a small invite-only website for you and a few people you trust: one scanner (and
+one model bill) for everybody, and each person with their own watchlist, alert rules, alert channels, currency and time
+zone. The website deploys to Fly.io for about $4 a month plus the model.
+
+**Contents:** [What it replicates](#what-it-replicates) · [How it works](#how-it-works) · [Setup](#setup) ·
+[Configuration](#configuration) · [Scanning Athens stocks](#scanning-athens-stocks) ·
+[Investing from a euro account](#investing-from-a-euro-account) · [Commands](#commands) · [Scoring](#scoring) ·
+[Costs](#costs) · [Running it every 5 minutes](#running-it-every-5-minutes) · [Web app](#web-app) ·
+[Deploy to Fly.io](#deploy-to-flyio) · [Security model](#security-model) · [Track record](#track-record) ·
+[Limitations](#limitations) · [Risks](#risks) · [Troubleshooting](#troubleshooting) · [Development](#development)
+
 ## What it replicates
 
 A user on r/PersonalFinanceGreece described a "hobby" system that, by their account, turned €2,500 into €57,500 in
@@ -105,6 +116,11 @@ Older backlog is stored but never sent to the model. Later cycles only see what'
 | [`feeds.toml`](feeds.toml) | The news sources: 20 enabled, plus 14 switched off (six Greek sources and eight checked alternates). Each entry notes what it covers and when it was last verified; `exclude_titles` drops headlines that aren't news (see the file's header). |
 | [`scanner.toml`](scanner.toml) | Thresholds, watchlist and alert rules. Every key is optional and the file shows the defaults; a misspelled key is an error, never silently ignored, and so is a `--config` or `SCANNER_CONFIG` file that doesn't exist. |
 
+When the `DATA_DIR` variable is set (on Fly.io: `/data`), a `scanner.toml` or `feeds.toml` in that folder is used
+instead of the one next to the program; see [changing the scanner's settings on
+Fly.io](docs/DEPLOY.md#14-changing-the-scanners-settings). `--config`/`SCANNER_CONFIG` and `--feeds`/`FEEDS_FILE`
+still come first.
+
 The settings you are most likely to change in `scanner.toml`:
 
 | Setting | Default | Meaning |
@@ -166,33 +182,8 @@ them, except `BASE_URL` for the links `dip-scanner users` prints.
 | `ANALYZE_LIMIT_PER_USER` | 5 | Manual analyses ("Analyse now") a member may start in 24 hours; admins have no limit, 0 turns them off for members. |
 | `SCANNER_ENABLED` | true | Run the scanner inside the website's process; `false` serves the pages only. |
 
-To try the website on your own computer, install it with `pip install -e ".[web]"`, put a `SECRET_KEY`,
-`BASE_URL=http://127.0.0.1:8080` and `COOKIE_SECURE=false` in `.env`, run `dip-scanner users add-admin
-you@example.com`, start `dip-scanner serve` and open the link it printed. It is invite-only: there is no sign-up
-page, and new people come in through invite links.
-
-What the website does to keep accounts safe:
-
-- **Sessions**: a random token in an HttpOnly, SameSite=Lax cookie (Secure unless `COOKIE_SECURE=false`), of which
-  the database keeps only a hash; 30 days from the last visit. Signing out, a new password and disabling an account
-  end sessions at once.
-- **Forms**: every change is a POST carrying a token (the session's, or before signing in a signed cookie token), and
-  a POST from another site (by its `Origin` or `Referer` header, compared with `BASE_URL`) is refused.
-- **Limits**: 10 failed sign-ins in 15 minutes lock that email address and that network address for 15 minutes;
-  invite and password links, test alerts and "Analyse now" have limits of their own.
-- **Pages**: a strict Content-Security-Policy (no inline scripts or styles), HSTS over https, no framing, and error
-  pages without technical details. Invite and password link tokens never appear in the log.
-- **Behind Fly.io's proxy**, the server trusts `X-Forwarded-Proto` and `X-Forwarded-For` from any address, which is
-  safe there because a Fly Machine is only reachable through the proxy; the address used for the limits is
-  `Fly-Client-IP` (set by the proxy) when `FLY_APP_NAME` shows it runs on Fly. On another host, put it behind a proxy
-  that overwrites those headers.
-
-Website users choose their own alert rules, watchlist, currency and time zone. Their email alerts go through the
-server's `SMTP_*` settings to their account's address, and Telegram alerts through the server's
-`TELEGRAM_BOT_TOKEN` to their own chat id, so those channels are offered only when the server has them. A user's
-webhook must be an `https://` address on the public internet: it is checked when saved and again before every message,
-and redirects aren't followed. Each user's watchlist joins `[universe] watchlist` for finding candidates, and every
-analysis stores the exchange rates into every user's currency.
+The pages, how to try the website on your own computer and how each user's alerts work are under
+[Web app](#web-app); what keeps the accounts safe is under [Security model](#security-model).
 
 ## Scanning Athens stocks
 
@@ -576,6 +567,145 @@ Or run `dip-scanner watch` in a terminal that stays open. With cron and Task Sch
 looks, so set up at least one notification channel: the system notices above are how you learn that the runs stopped
 working.
 
+On a server, `dip-scanner serve` runs the same loop together with a website that shows how it is doing (see
+[Web app](#web-app) and [Deploy to Fly.io](#deploy-to-flyio)).
+
+## Web app
+
+`dip-scanner serve` runs the scanner and a small website in one process, for you and a few people you invite. The
+scanner, and its model bill, is shared: each cycle serves everybody. Each person has their own watchlist, alert
+rules, alert channels, currency and time zone. The pages are made for a phone first, work without JavaScript and
+follow the system's light or dark mode; the footer of every page says that none of it is investment advice.
+
+![The idea page on a phone: verdict, chance of being higher, score, the price in HKD and about EUR, the 6-month chart with the idea's levels and the outcome so far](docs/screenshots/idea-mobile-light.png)
+
+![The ideas dashboard on a desktop in dark mode: the scanner's status, a thesis change, the period and filters, and the ranked ideas with the reader's watchlist and alert rules marked](docs/screenshots/dashboard-desktop-dark.png)
+
+![The settings on a phone: alert rules, watchlist, the webhook channel, currency and time zone](docs/screenshots/settings-mobile-light.png)
+
+The screenshots come from a demo database: real news, prices and exchange rates of 28 September 2026, with a
+stand-in for the language model, so the analysis texts and verdicts are placeholders, not a model's judgement of
+these stocks.
+
+| Page | What it shows |
+|---|---|
+| Ideas (`/`) | The newest analysis of every stock in the last 1, 3, 7 or 30 days, best score first, with filters for the score, the verdict, your watchlist and your alert rules (★ marks your watchlist, ✓ what passes your rules). The scanner's status, a ticker lookup, and "thesis changes": newer analyses that undercut an idea that passed your rules, so you can review open orders. |
+| An idea (`/ideas/N`) | What the report shows: verdict, confidence, chance up, score, the levels (target, price, entry, potential and statistical low) in the trading currency and about yours, a 6-month price chart with those levels (a table of the closes under it), the analysis, what to check, risks and catalysts, the headlines, the outcome so far (as in `track`), and every analysis of the stock. "Analyse again now" and the watchlist button. |
+| A stock (`/tickers/AMD`) | Price statistics and whether they count as a dip, a 6-month chart with the newest idea's levels, its ideas and 30 days of its news. Add it to your watchlist, or analyse it now. |
+| News (`/news`) | The news digest ("newsletter") of the last 6, 24 or 72 hours: the companies in the news, most worrying first, then every article with the companies the model linked to it and why. |
+| Track record (`/track`) | `dip-scanner track` for the last 30 days to 2 years, with the returns also in your currency. Prices are downloaded at most once an hour. |
+| Settings (`/settings`) | Your alert rules, watchlist, channels, currency, time zone and name; a test alert; your password and your other signed-in devices. |
+| Admin (`/admin`) | For admins: the scanner (pause, resume, run a cycle now, start again after a setup problem), the recent cycles with their notes, the model's use today and in the last 7 days with its estimated cost (at the list prices under [Costs](#costs)), and the health of every feed. Users: roles, disabling, password links. Invites: create, revoke, see who used them. |
+
+"Analyse now" asks the model about one stock at once, whatever its price did, like `dip-scanner analyze`. Analyses
+run one at a time in the background; the page says how it is going and opens the idea when it is ready. A member can
+start `ANALYZE_LIMIT_PER_USER` (5) in 24 hours and an admin as many as they like, everybody at most 10 in 10 minutes.
+Each one costs an analysis on the model bill.
+
+**Roles.** There is no sign-up page. People come in through invite links: single use, valid for 7 days, made on the
+admin page or with `dip-scanner users invite`, and optionally only for one email address. A **member** uses the pages
+above for their own account. An **admin** also has the admin pages: the scanner, users and invites. The first admin
+comes from the command line (`dip-scanner users add-admin`), and admins can make others admins. The last admin who
+can sign in can't be made a member or disabled. Someone who forgot their password gets a new link from an admin
+("Reset link" on the Users page, or `dip-scanner users reset-link`). The site shows an invite or password link once:
+the database keeps only a fingerprint of it. With `SMTP_*` set, the site can email the invite as well.
+
+**How alerts work for each user:**
+
+- A user's alert rules (lowest score, lowest chance up, verdicts, only their watchlist, thesis changes) replace
+  `[alerts]` for them, and start as `scanner.toml`'s. The repeat rules (`repeat_hours`, `min_score_change`) are
+  `scanner.toml`'s for everybody.
+- Channels: email to the account's address through the server's `SMTP_*` settings, Telegram to their own chat id
+  through the server's `TELEGRAM_BOT_TOKEN` (each offered only when the server has it), and their own Slack, Discord
+  or generic webhook. "Send a test alert" tries each one and says how it went.
+- Repeats, retries and thesis changes are counted per user, as described under [Output](#output): one user's channel
+  being down never marks another's alert as sent. A user's alerts start when they set up their first channel; ideas
+  from before are never sent late.
+- Messages show amounts in the user's currency too, at the exchange rate stored with the analysis (every analysis
+  stores the rates into every user's currency), and times in their time zone.
+- Each user's watchlist joins `[universe] watchlist` for finding candidates, with the same leniency.
+- The `.env` channels still get every alert under `scanner.toml`'s `[alerts]`, as on the command line. "dip-scanner
+  stopped" notices go to them and to every admin's own channels.
+
+**Try it on your own computer.** Install it with `pip install -e ".[web]"`, put a `SECRET_KEY`,
+`BASE_URL=http://127.0.0.1:8080` and `COOKIE_SECURE=false` in `.env` (see [Website settings](#website-settings)),
+run `dip-scanner users add-admin you@example.com`, start `dip-scanner serve` and open the link it printed.
+`dip-scanner serve --no-scanner` serves the pages of an existing database without running cycles.
+
+## Deploy to Fly.io
+
+The website is made to run on one [Fly.io](https://fly.io) Machine in Frankfurt (the nearest region to Greece), with
+the database on a Fly volume and HTTPS at `https://<your-app>.fly.dev` or your own domain, for about $3.85 a month
+plus the model. **[docs/DEPLOY.md](docs/DEPLOY.md) is the full step-by-step guide**, checked against Fly's
+documentation on 2026-09-28, with backups, restoring, updates, costs and troubleshooting. In short, with
+[flyctl](https://fly.io/docs/flyctl/install/) installed, in the `news-dip-scanner` folder:
+
+```bash
+fly auth signup                          # or fly auth login; Fly needs a payment card
+fly apps create my-dip-scanner           # then put the name in fly.toml: app = "my-dip-scanner"
+fly volumes create scanner_data --region fra --size 1 --snapshot-retention 14
+fly secrets set SECRET_KEY=... BASE_URL=https://my-dip-scanner.fly.dev OPENAI_API_KEY=sk-... \
+  SEC_USER_AGENT="Your Name you@example.com"
+fly deploy --ha=false
+fly scale count 1                        # exactly one Machine
+fly ssh console -C "dip-scanner users add-admin you@example.com"
+```
+
+Open the link the last command prints to set your password, then invite people from the admin page. What to know:
+
+- **Exactly one Machine.** Two would run two scanners (twice the model bill, every alert twice) on two separate
+  databases. `fly.toml` keeps the one Machine running when nobody visits (`auto_stop_machines = "off"`), and deploys
+  use `--ha=false`.
+- **The files.** [`Dockerfile`](Dockerfile) (Python 3.12, runs as a non-root user, `DATA_DIR=/data`),
+  [`fly.toml`](fly.toml) (region, volume, a `/healthz` check, 512 MB) and
+  [`.github/workflows/news-dip-scanner.yml`](../.github/workflows/news-dip-scanner.yml) at the repository's root:
+  ruff and the tests on every change, and a deploy of the default branch once a `FLY_API_TOKEN` secret (from `fly
+  tokens create deploy`) is set in GitHub.
+- **Settings.** Secrets with `fly secrets set`, the rest under `[env]` in `fly.toml` (`DISPLAY_TZ` is
+  `Europe/Athens` there). The image carries `scanner.toml` and `feeds.toml`; a copy in `/data` replaces them without
+  a deploy.
+- **Your own domain:** `fly certs add dips.example.com`, a DNS record, and `BASE_URL` changed to match.
+- **Backups:** Fly's daily volume snapshots (kept 14 days), plus `fly ssh console -C "dip-scanner backup"` and
+  `fly ssh sftp get` to keep a copy of your own.
+- **Logs and health:** `fly logs`, and `/healthz` (`{"status":"ok","db":"ok","scanner":"running",...}`).
+
+## Security model
+
+The site is for a handful of people who know each other, holds no money and places no orders, but it has accounts,
+sends messages to addresses users give it and can spend the model budget, so:
+
+- **Accounts.** Invite-only, as above. Passwords have at least 10 characters and are stored as scrypt hashes
+  (n=2^14, r=8, p=1, a 16-byte random salt), compared in constant time.
+- **Sessions.** A random token in the `dsid` cookie: HttpOnly, SameSite=Lax, Secure unless `COOKIE_SECURE=false`.
+  The database keeps only its SHA-256 hash; it lasts 30 days from the last visit. Signing out, a new password and
+  disabling an account end sessions at once, and a disabled user is signed out on their next request.
+- **Links.** Invite (7 days) and setup or reset links (48 hours) work once and are random 32-byte tokens, stored only
+  as hashes and never written to the log; the link pages keep the token out of the `Referer` header.
+- **Forms.** Every change is a POST carrying a token (the session's, or before signing in a signed double-submit
+  token), and a POST from another site (by its `Origin` or `Referer` header, compared with `BASE_URL`) is refused.
+  `next=` redirects only go to pages of the site.
+- **Limits.** 10 failed sign-ins in 15 minutes lock that email address and that network address for 15 minutes;
+  invite and password link pages, test alerts (5 in 15 minutes), "Analyse now" and "Run a cycle now" have limits of
+  their own.
+- **Pages.** A strict Content-Security-Policy (`script-src 'self'`, no inline scripts, styles or event handlers),
+  HSTS over https, no framing, `nosniff`, `Referrer-Policy: same-origin`, and error pages without technical details.
+  Headlines, article summaries, the model's text and user names are always escaped; links go only to `http` and
+  `https` addresses and open in a new tab without a referrer.
+- **Webhooks.** A user's webhook must be `https://`, without a user name or password in it, and its host must resolve
+  only to public addresses: loopback, private, link-local (169.254.169.254, the cloud metadata address), shared
+  (100.64.0.0/10), `fc00::/7`, Fly's private `fdaa::/16` and internal names are refused. It is checked when saved and
+  again before every message (so a DNS change can't point it inside later), redirects aren't followed, and a failed
+  delivery's error doesn't repeat the service's reply.
+- **Secrets.** Keys live in `.env` or the environment (on Fly, `fly secrets`); `.dockerignore` keeps `.env` out of the
+  image, and the notices, cycle records and error messages leave keys, passwords and tokens out.
+- **Behind Fly.io's proxy**, the server trusts `X-Forwarded-Proto` and `X-Forwarded-For` from any address, which is
+  safe there because a Fly Machine is only reachable through the proxy; the address used for the limits is
+  `Fly-Client-IP` (set by the proxy) when `FLY_APP_NAME` shows it runs on Fly. On another host, put it behind a proxy
+  that overwrites those headers.
+- **Not covered:** two-factor sign-in, checking that an invited person owns their email address (the admin vouches
+  for them), and a log of admin actions. A backup holds password hashes and every user's settings: keep downloaded
+  copies private.
+
 ## Track record
 
 ```bash
@@ -683,7 +813,7 @@ money:
 | Problem | What to check |
 |---|---|
 | `Configuration problem: Set OPENAI_API_KEY ...` | `.env` is in the folder you run from (or pass `--env-file`), and the key for your `LLM_PROVIDER` is set. |
-| `Configuration problem: Scanner config not found` | The file named by `--config` or `SCANNER_CONFIG` doesn't exist; fix the path (without either, `./scanner.toml` or the defaults are used). |
+| `Configuration problem: Scanner config not found` | The file named by `--config` or `SCANNER_CONFIG` doesn't exist; fix the path (without either, `$DATA_DIR/scanner.toml`, `./scanner.toml` or the defaults are used). |
 | `The language model can't be used: ... no quota left (insufficient_quota)` (OpenAI) or `... billing or usage-limit reasons` (Anthropic) | The provider refused the account (credit, spend limit). Articles stay pending meanwhile; fix it and start again. |
 | `sec-8k-filings` fails or is skipped | Set `SEC_USER_AGENT` to your name and email. |
 | A feed fails in `feeds --check` | Some sites block cloud IP addresses; feeds.toml notes the ones known to. Switch it off or use an alternate. |
@@ -733,7 +863,9 @@ without sleeping.
 | `accounts.py` | The website's users, invites, sessions, password links, login limits, per-user settings and "Analyse now" jobs |
 | `netguard.py` | Checks that a user's webhook address is on the public internet (no private or local networks) |
 | `backup.py` | Consistent copies of the database (SQLite's backup API), with rotation |
-| `web/app.py` | The website: `create_app`, security headers, error pages, templates and their filters |
+| `web/app.py` / `web/context.py` | The website: `create_app`, security headers, error pages, templates and their filters; what every page works with (settings, database, prices, the scanner) |
 | `web/auth.py` / `web/account.py` | Session cookie, CSRF and Origin checks, sign-in limits; sign-in, invite, password and settings pages |
 | `web/jobs.py` / `web/control.py` / `web/server.py` | "Analyse now" jobs; the scanner's loop inside the website; `dip-scanner serve` |
 | `web/pages.py` / `web/admin.py` | The member and admin pages (templates in `web/templates`, styles and scripts in `web/static`) |
+| `web/charts.py` | The SVG price chart of the idea and ticker pages (light and dark, with a table view) |
+| `Dockerfile` / `fly.toml` / `docs/DEPLOY.md` | The image, the Fly.io app and the deployment guide; `.github/workflows/news-dip-scanner.yml` at the repository's root tests every change and deploys |

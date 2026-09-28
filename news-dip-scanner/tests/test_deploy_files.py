@@ -355,6 +355,30 @@ def test_deploy_guide_links_resolve():
             assert anchor in anchors(file), f"DEPLOY.md links to a missing heading: {target}"
 
 
+def test_readme_links_and_screenshots_resolve():
+    """The README's links to files and headings (its contents line, docs/DEPLOY.md, the workflow) and its screenshots
+    exist; the screenshots stay small PNGs."""
+    readme = PROJECT / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    targets = re.findall(r"\]\(([^)\s]+)\)", text)
+    assert "docs/DEPLOY.md" in targets and "#deploy-to-flyio" in targets and "#security-model" in targets
+    for target in targets:
+        if target.startswith(("http://", "https://")):
+            continue
+        path, _, anchor = target.partition("#")
+        file = (PROJECT / path).resolve() if path else readme
+        if path.startswith("../") and not (REPOSITORY / ".git").exists():
+            continue  # a file at the repository's root, and this copy isn't in the repository
+        assert file.exists(), f"README.md links to a missing file: {target}"
+        if anchor:
+            assert anchor in anchors(file), f"README.md links to a missing heading: {target}"
+    shots = re.findall(r"!\[[^\]]+\]\((docs/screenshots/[^)]+\.png)\)", text)
+    assert len(shots) == 3
+    for shot in shots:
+        data = (PROJECT / shot).read_bytes()
+        assert data.startswith(b"\x89PNG") and len(data) < 250_000, shot
+
+
 def test_deploy_guide_covers_the_one_machine_rule_and_the_admin():
     text = DEPLOY_MD.read_text(encoding="utf-8")
     for command in (

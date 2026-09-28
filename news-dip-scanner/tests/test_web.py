@@ -24,7 +24,7 @@ from dip_scanner.prices import PriceError
 from dip_scanner.report import display_zone_as
 from dip_scanner.web import app as web_app
 from dip_scanner.web import auth
-from dip_scanner.web.app import CSP, create_app, paginate, relative_time, static_url, url_with
+from dip_scanner.web.app import CSP, create_app, make_templates, paginate, relative_time, static_url, url_with
 from dip_scanner.web.jobs import InlineExecutor
 
 BASE = "https://dips.example.com"
@@ -403,7 +403,7 @@ def test_an_invite_creates_the_account_once_and_signs_it_in(site, caplog):
     client = site.client
     page = client.get(f"/invite/{token}")
     assert page.status_code == 200 and "Create your account" in page.text
-    assert '<meta name="referrer" content="no-referrer">' in page.text
+    assert '<meta name="referrer" content="strict-origin">' in page.text  # the token never reaches a Referer
     data = {
         "csrf_token": token_on(page.text),
         "email": "Friend@Example.com",
@@ -461,8 +461,11 @@ def test_a_setup_link_sets_the_password_once_and_signs_in(site):
     token = site.accounts.create_password_token(user.id)
     page = site.client.get(f"/password/{token}")
     assert page.status_code == 200 and "Set your password" in page.text and "owner@example.com" in page.text
+    assert '<meta name="referrer" content="strict-origin">' in page.text
     data = {"csrf_token": token_on(page.text), "password": PASSWORD, "confirm": PASSWORD}
-    response = site.client.post(f"/password/{token}", data=data)
+    # Regression: with "no-referrer" on this page, a browser sends "Origin: null" with the form and it was refused
+    assert site.client.post(f"/password/{token}", data=data, headers={"Origin": "null"}).status_code == 403
+    response = site.client.post(f"/password/{token}", data=data, headers={"Origin": BASE, "Referer": BASE + "/"})
     assert response.status_code == 303 and response.headers["location"] == "/settings"
     assert site.client.get("/admin").status_code == 200
     assert site.new_client().get(f"/password/{token}").status_code == 404  # used up
@@ -980,6 +983,14 @@ def test_filters_and_helpers():
 
     assert url_with(FakeRequest, page=None, hours=72) == "/news?ticker=AMD&hours=72"
     assert url_with(FakeRequest, ticker=["A", "B"]) == "/news?hours=24&page=2&ticker=A&ticker=B"
+
+
+def test_percentages_are_coloured_as_they_are_shown():
+    macros = make_templates().env.from_string('{% import "_macros.html" as ui %}{{ ui.pct(value) }}')
+    assert macros.render(value=2.34) == '<span class="num up">+2.3%</span>'
+    assert macros.render(value=-0.04) == '<span class="num">+0.0%</span>'  # not a red "+0.0%"
+    assert macros.render(value=-0.06) == '<span class="num down">-0.1%</span>'
+    assert macros.render(value=None) == '<span class="num">–</span>'
 
 
 def test_the_app_needs_a_secret_key(tmp_path):
