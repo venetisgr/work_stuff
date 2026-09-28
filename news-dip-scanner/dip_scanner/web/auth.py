@@ -12,18 +12,24 @@ CSRF, in two layers:
    token (Session.csrf) once signed in, else a double-submit token (a random value signed with SECRET_KEY, sent both
    as the dcsrf cookie and as the form's hidden field) on the sign-in, invite and password forms;
 2. a POST whose Origin (or, without one, Referer) is another site than BASE_URL (without BASE_URL: the address the
-   request came to) is refused.
+   request came to) or one of TRUSTED_ORIGINS is refused.
 
 Cookies are written by the middleware in app.py from what the handlers queue with queue_cookie, start_session and
 end_session, so a redirect, a page and an error page all get them the same way.
+
+Behind a front door (PROXY_SECRET, see app.py's WebMiddleware), a request only gets here once it carried the secret;
+the middleware then marks it as proxied (is_proxied), and only such a request may name the visitor's address in
+x-dip-client-ip (client_ip).
 """
 
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 import hmac
 import ipaddress
+import re
 from datetime import timedelta
 from typing import Annotated
 from urllib.parse import urlsplit
@@ -33,6 +39,7 @@ from starlette.concurrency import run_in_threadpool
 from starlette.datastructures import FormData
 
 from ..accounts import SESSION_LIFETIME, Session, User, new_token, same_token
+from ..config import origin_pattern, origin_text
 from .context import AppContext, get_context
 
 SESSION_COOKIE = "dsid"
@@ -54,6 +61,8 @@ FORM_EXPIRED = (
 _SESSION_KEY = "dip_session"  # request.state: the Session (or None) of this request, once looked up
 _FORM_TOKEN_KEY = "dip_form_token"
 _COOKIES_KEY = "dip_cookies"  # request.state: {name: (value or None to delete, max_age seconds)}
+PROXIED_KEY = "dip_proxied"  # request.state: True when the request carried PROXY_SECRET (set by WebMiddleware)
+PROXY_CLIENT_KEY = "dip_proxy_client"  # request.state: the visitor's address the front door named, when valid
 _MISSING = object()
 
 
@@ -74,9 +83,19 @@ def too_many(message: str, *, retry_after: timedelta | None = None) -> HTTPExcep
 # --- where a request comes from ------------------------------------------------------------------------------------
 
 
+def is_proxied(request: Request) -> bool:
+    """Whether the request came through the front door: it carried PROXY_SECRET (checked by WebMiddleware)."""
+    return getattr(request.state, PROXIED_KEY, False) is True
+
+
 def client_ip(request: Request) -> str | None:
-    """The visitor's IP address: Fly-Client-IP when the app runs on Fly.io (its proxy sets it; X-Forwarded-For can
-    be forged by the client), else the address uvicorn reports."""
+    """The visitor's IP address: the one the front door named in x-dip-client-ip, only for a request that carried
+    PROXY_SECRET; else Fly-Client-IP when the app runs on Fly.io (its proxy sets it; X-Forwarded-For can be forged by
+    the client); else the address uvicorn reports."""
+    if is_proxied(request):
+        named = getattr(request.state, PROXY_CLIENT_KEY, None)
+        if named:
+            return named
     ctx = get_context(request)
     if ctx.trust_fly_client_ip:
         value = request.headers.get("fly-client-ip", "").strip()
@@ -85,12 +104,19 @@ def client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def _is_ip(value: str) -> bool:
+def clean_ip(value: str | None) -> str | None:
+    """An IPv4 or IPv6 address as a header carries it (no port, no brackets), normalised; None for anything else."""
+    text = (value or "").strip()
+    if not text or len(text) > 45:
+        return None
     try:
-        ipaddress.ip_address(value)
+        return str(ipaddress.ip_address(text))
     except ValueError:
-        return False
-    return True
+        return None
+
+
+def _is_ip(value: str) -> bool:
+    return clean_ip(value) is not None
 
 
 def safe_next(value: object, default: str = "/") -> str:
@@ -136,18 +162,53 @@ def _site_origin(request: Request, ctx: AppContext) -> tuple[str, str, int] | No
     return _origin_of(f"{request.url.scheme}://{host}") if host else None
 
 
-def check_origin(request: Request) -> None:
-    """Refuse (403) a request whose Origin, or else Referer, header names another site than this one. Browsers send
-    Origin with every cross-site POST; a request with neither header passes (the CSRF token still has to match)."""
+@functools.lru_cache(maxsize=16)
+def _trusted(entries: tuple[str, ...]) -> tuple[frozenset[str], tuple[re.Pattern[str], ...]]:
+    """TRUSTED_ORIGINS as (exact origins, patterns); the settings were checked when they were read."""
+    exact = frozenset(entry for entry in entries if "*" not in entry)
+    patterns = tuple(origin_pattern(entry) for entry in entries if "*" in entry)
+    return exact, patterns
+
+
+def trusted_origin(request: Request, url: str | None) -> bool:
+    """Whether url (an Origin or Referer header) is this site: BASE_URL's origin (without BASE_URL: the address the
+    request came to), or one of TRUSTED_ORIGINS (an exact origin, or the one pattern, matched whole)."""
+    if not url:
+        return False
     ctx = get_context(request)
+    origin = _origin_of(url)
     site = _site_origin(request, ctx)
+    if origin is None:
+        return False
+    if site is not None and origin == site:
+        return True
+    entries = ctx.settings.web.trusted_origins
+    if not entries:
+        return False
+    try:
+        parts = urlsplit(url.strip())
+        text = origin_text(f"{parts.scheme}://{parts.netloc}")
+    except ValueError:
+        return False
+    if text is None:
+        return False
+    exact, patterns = _trusted(tuple(entries))
+    return text in exact or any(pattern.fullmatch(text) for pattern in patterns)
+
+
+def origin_ok(request: Request) -> bool:
+    """Whether a POST may come from where its Origin, or else Referer, header says (trusted_origin). Browsers send
+    Origin with every cross-site POST; a request with neither header passes (the CSRF token still has to match)."""
     origin = request.headers.get("origin")
     if origin is not None:
-        if site is None or _origin_of(origin) != site:
-            raise HTTPException(status_code=403, detail=CROSS_SITE)
-        return
+        return trusted_origin(request, origin)
     referer = request.headers.get("referer")
-    if referer and (site is None or _origin_of(referer) != site):
+    return not referer or trusted_origin(request, referer)
+
+
+def check_origin(request: Request) -> None:
+    """Refuse (403) a request whose Origin, or else Referer, header names another site than this one (origin_ok)."""
+    if not origin_ok(request):
         raise HTTPException(status_code=403, detail=CROSS_SITE)
 
 
@@ -301,8 +362,7 @@ def _next_after_login(request: Request) -> str:
         parts = urlsplit(referer)
     except ValueError:
         return "/"
-    site = _site_origin(request, get_context(request))
-    if referer and _origin_of(referer) == site:
+    if trusted_origin(request, referer):
         return safe_next(parts.path + (f"?{parts.query}" if parts.query else ""))
     return "/"
 

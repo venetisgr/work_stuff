@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
 import sys
@@ -86,6 +87,10 @@ class NotifySettings:
 
 SECRET_KEY_MIN_LENGTH = 32
 GENERATE_SECRET_KEY = 'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+PROXY_SECRET_MIN_LENGTH = 32
+_ORIGIN_HOST = re.compile(r"[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*")
+_LABEL_PART = re.compile(r"[a-z0-9-]+")
+_DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 @dataclass(frozen=True)
@@ -97,6 +102,13 @@ class WebSettings:
     cookie_secure: bool = True  # COOKIE_SECURE: the session cookie only travels over https (false for local http)
     analyze_limit_per_user: int = 5  # ANALYZE_LIMIT_PER_USER: manual analyses per member in 24 hours (admins: none)
     scanner_enabled: bool = True  # SCANNER_ENABLED: `serve` runs the scanner too (`serve --no-scanner` overrides)
+    # PROXY_SECRET: set when a front door (the Next.js app on Vercel) is the only way in. Every request but /healthz
+    # must then carry it in x-dip-proxy-secret, and only such requests may name the visitor's address
+    # (x-dip-client-ip). The front door's DIP_PROXY_SECRET has the same value.
+    proxy_secret: str | None = None
+    # TRUSTED_ORIGINS: origins (scheme://host[:port]) whose form posts are accepted besides BASE_URL's, normalised,
+    # and at most one pattern with a * for preview deployments (see origin_pattern).
+    trusted_origins: tuple[str, ...] = ()
 
     def link(self, path: str) -> str:
         """An absolute link to a page of the website, e.g. link("/invite/abc") -> https://my-dips.fly.dev/invite/abc.
@@ -122,6 +134,15 @@ class WebSettings:
                 "SECRET_KEY=...)."
             )
         return key
+
+    def require_front_door(self) -> None:
+        """With PROXY_SECRET, BASE_URL must be the front door's address: the refusal page and every link point
+        there. A ConfigError says so when it is missing."""
+        if self.proxy_secret and not self.base_url:
+            raise ConfigError(
+                "PROXY_SECRET is set, so the website is only reachable through its front door: set BASE_URL to the "
+                "front door's address (the Vercel domain, e.g. https://dips.example.com)."
+            )
 
 
 @dataclass(frozen=True)
@@ -221,6 +242,8 @@ def load_settings(env: Mapping[str, str] | None = None, *, problems: list[Config
             cookie_secure=_bool(get("COOKIE_SECURE"), "COOKIE_SECURE", default=True),
             analyze_limit_per_user=_whole_number(get("ANALYZE_LIMIT_PER_USER"), "ANALYZE_LIMIT_PER_USER", default=5),
             scanner_enabled=_bool(get("SCANNER_ENABLED"), "SCANNER_ENABLED", default=True),
+            proxy_secret=_proxy_secret(get("PROXY_SECRET")),
+            trusted_origins=parse_trusted_origins(get("TRUSTED_ORIGINS")),
         ),
     )
 
@@ -319,6 +342,116 @@ def _base_url(value: str | None) -> str | None:
     ):
         raise ConfigError(f"BASE_URL must be the website's address, like https://my-dips.fly.dev (got {value!r}).")
     return url
+
+
+def _proxy_secret(value: str | None) -> str | None:
+    """PROXY_SECRET: at least PROXY_SECRET_MIN_LENGTH printable ASCII characters without spaces (it travels in a
+    header)."""
+    if value is None:
+        return None
+    if len(value) < PROXY_SECRET_MIN_LENGTH or not all("!" <= char <= "~" for char in value):
+        raise ConfigError(
+            f"PROXY_SECRET must be a random secret of at least {PROXY_SECRET_MIN_LENGTH} characters without spaces "
+            f"(got {len(value)} characters). Generate one with {GENERATE_SECRET_KEY} and set the same value as "
+            "DIP_PROXY_SECRET in Vercel."
+        )
+    return value
+
+
+def origin_text(value: str) -> str | None:
+    """An http(s) origin as "scheme://host[:port]": lower case, without the default port and without a trailing
+    slash; None when value isn't an origin (a path, query, fragment, user name or anything but a DNS name, IPv4 or
+    [IPv6] address as the host)."""
+    try:
+        parts = urlsplit(value.strip())
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").rstrip(".")
+    if (
+        scheme not in _DEFAULT_PORTS
+        or not host
+        or parts.path not in ("", "/")
+        or parts.query
+        or parts.fragment
+        or "@" in parts.netloc
+        or any(char.isspace() for char in value.strip())
+    ):
+        return None
+    if ":" in host:  # an IPv6 address
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return None
+        host = f"[{host}]"
+    elif not _ORIGIN_HOST.fullmatch(host):
+        return None
+    suffix = f":{port}" if port is not None and port != _DEFAULT_PORTS[scheme] else ""
+    return f"{scheme}://{host}{suffix}"
+
+
+def origin_pattern(entry: str) -> re.Pattern[str]:
+    """The regular expression of a TRUSTED_ORIGINS pattern such as https://my-dips-git-*-my-team.vercel.app (every
+    branch's preview deployment of one Vercel project). Only a narrow pattern is accepted: https without a port, one
+    *, inside the host's first label with fixed text on both sides of it (the project name before, the team after), and
+    at least two labels after that one; the * then matches letters, digits and hyphens only, never a dot, so it can't
+    reach into another label. "https://*.vercel.app" or "https://my-dips-*.vercel.app" would let any Vercel project
+    in: a ConfigError says so."""
+    text = entry.strip().lower().rstrip("/")
+    problem = (
+        f"TRUSTED_ORIGINS allows one pattern with a * in the first part of the host between fixed text, for a Vercel "
+        f"project's preview deployments, e.g. https://my-dips-git-*-my-team.vercel.app (got {entry.strip()!r})."
+    )
+    scheme, separator, host = text.partition("://")
+    if scheme != "https" or not separator or host.count("*") != 1 or any(char in host for char in "/:@?#"):
+        raise ConfigError(problem)
+    first, _, rest = host.partition(".")
+    before, _, after = first.partition("*")
+    labels = rest.split(".") if rest else []
+    if (
+        not before
+        or not after
+        or len(labels) < 2
+        or not all(_LABEL_PART.fullmatch(part) for part in (before, after))
+        or not all(_ORIGIN_HOST.fullmatch(label) for label in labels)
+        or not before[0].isalnum()
+        or not after[-1].isalnum()
+        or len(before) + len(after) > 62
+    ):
+        raise ConfigError(problem)
+    width = 63 - len(before) - len(after)  # a DNS label has at most 63 characters
+    return re.compile(
+        "https://" + re.escape(before) + f"[a-z0-9-]{{1,{width}}}" + re.escape(after) + r"\." + re.escape(rest)
+    )
+
+
+def parse_trusted_origins(value: str | None) -> tuple[str, ...]:
+    """TRUSTED_ORIGINS: comma-separated origins (https://my-dips-git-main-my-team.vercel.app) and at most one pattern
+    (origin_pattern), each normalised (origin_text); () when unset."""
+    if value is None:
+        return ()
+    found: list[str] = []
+    patterns = 0
+    for entry in (part.strip() for part in value.split(",")):
+        if not entry:
+            continue
+        if "*" in entry:
+            patterns += 1
+            if patterns > 1:
+                raise ConfigError("TRUSTED_ORIGINS can hold only one pattern with a *; list the other origins in full.")
+            origin_pattern(entry)
+            normalised: str | None = entry.lower().rstrip("/")
+        else:
+            normalised = origin_text(entry)
+            if normalised is None:
+                raise ConfigError(
+                    "TRUSTED_ORIGINS entries are origins like https://my-dips-git-main-my-team.vercel.app: http(s), "
+                    f"a host and optionally a port, without a path (got {entry!r})."
+                )
+        if normalised not in found:
+            found.append(normalised)
+    return tuple(found)
 
 
 def _positive_int(value: str | None, name: str) -> int | None:

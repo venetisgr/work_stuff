@@ -188,9 +188,18 @@ them, except `BASE_URL` for the links `dip-scanner users` prints.
 | `COOKIE_SECURE` | true | The session cookie only travels over https; `false` only for testing on `http://localhost`. |
 | `ANALYZE_LIMIT_PER_USER` | 5 | Manual analyses ("Analyse now") a member may start in 24 hours; admins have no limit, 0 turns them off for members. |
 | `SCANNER_ENABLED` | true | Run the scanner inside the website's process; `false` serves the pages only. |
+| `PROXY_SECRET` | none | Behind a front door (the Next.js app on Vercel): a random secret of at least 32 characters, the same as the front door's `DIP_PROXY_SECRET`. Every request but `/healthz` must then carry it (header `x-dip-proxy-secret`), so the Fly address answers nobody else, and `BASE_URL` must be the front door's address. |
+| `TRUSTED_ORIGINS` | none | Addresses whose form posts are accepted besides `BASE_URL`'s, comma-separated (`https://my-dips-git-main-my-team.vercel.app`), and at most one pattern for every preview deployment of one Vercel project: `https://my-dips-git-*-my-team.vercel.app`, the project's name before the `*` and the team's after it. |
 
 The pages, how to try the website on your own computer and how each user's alerts work are under
 [Web app](#web-app); what keeps the accounts safe is under [Security model](#security-model).
+
+The front door reads the website's data from a JSON API under `/api/v1` (`web/api.py`) with the visitor's session
+cookie: `me`, `status`, `ideas` (the dashboard's list, with filters and pages), `ideas/{id}` (everything the idea page
+shows), `POST ideas/{id}/reanalyse` ("Analyse again", with the `X-CSRF-Token` header), `jobs/{id}` and
+`thesis-changes`. Its contract is [`frontend/contract/api-v1.schema.json`](frontend/contract/api-v1.schema.json), a
+JSON Schema that the tests check every answer against; errors are JSON too (`{"error": {"code", "message",
+"retry_after"}}`), with the same limits as the pages.
 
 ## Scanning Athens stocks
 
@@ -781,8 +790,22 @@ sends messages to addresses users give it and can spend the model budget, so:
 - **Links.** Invite (7 days) and setup or reset links (48 hours) work once and are random 32-byte tokens, stored only
   as hashes and never written to the log; the link pages keep the token out of the `Referer` header.
 - **Forms.** Every change is a POST carrying a token (the session's, or before signing in a signed double-submit
-  token), and a POST from another site (by its `Origin` or `Referer` header, compared with `BASE_URL`) is refused.
-  `next=` redirects only go to pages of the site.
+  token; the JSON API's "Analyse again" sends the session's in an `X-CSRF-Token` header), and a POST from another
+  site (by its `Origin` or `Referer` header, compared with `BASE_URL` and `TRUSTED_ORIGINS`) is refused. `next=`
+  redirects only go to pages of the site, and every redirect is relative (`Location: /login?next=%2F`), so a visitor
+  who came through the front door stays on its address.
+- **The front door.** With `PROXY_SECRET` set, every request but `/healthz` must carry it in `x-dip-proxy-secret`
+  (compared in constant time); anything else gets a short page pointing at `BASE_URL`, so the `*.fly.dev` address is
+  of no use on its own. Only a request with the secret may name the visitor's address (`x-dip-client-ip`), which the
+  sign-in limits and the log then use; without it they would count every visitor as the front door's own address.
+- **Preview deployments.** A `TRUSTED_ORIGINS` pattern lets the previews of one Vercel project post: it must be
+  https, with the `*` inside the first part of the host between fixed text (project and team), and matches letters,
+  digits and hyphens only. That is still looser than an exact address: someone who creates a Vercel team whose name
+  ends with yours (`evil-my-team`) and a project of your project's name gets previews the pattern matches. That page
+  still can't make a sign-in count, though: `vercel.app` is a public suffix, so every preview is a site of its own
+  for the browser, which keeps the `SameSite=Lax` session cookie out of posts from another one, and every change also
+  needs the session's token, which another site can't read. List exact addresses (a branch's
+  `…-git-main-…vercel.app`) when that is enough, and protect previews with Vercel's Deployment Protection.
 - **Limits.** 10 failed sign-ins in 15 minutes lock that email address and that network address for 15 minutes;
   invite and password link pages, test alerts (5 in 15 minutes), "Analyse now" and "Run a cycle now" have limits of
   their own.
@@ -799,8 +822,8 @@ sends messages to addresses users give it and can spend the model budget, so:
   image, and the notices, cycle records and error messages leave keys, passwords and tokens out.
 - **Behind Fly.io's proxy**, the server trusts `X-Forwarded-Proto` and `X-Forwarded-For` from any address, which is
   safe there because a Fly Machine is only reachable through the proxy; the address used for the limits is
-  `Fly-Client-IP` (set by the proxy) when `FLY_APP_NAME` shows it runs on Fly. On another host, put it behind a proxy
-  that overwrites those headers.
+  `x-dip-client-ip` from the front door (with the secret, see above), else `Fly-Client-IP` (set by Fly's proxy) when
+  `FLY_APP_NAME` shows it runs on Fly. On another host, put it behind a proxy that overwrites those headers.
 - **Not covered:** two-factor sign-in, checking that an invited person owns their email address (the admin vouches
   for them), and a log of admin actions. A backup holds password hashes and every user's settings: keep downloaded
   copies private.
@@ -944,7 +967,7 @@ Add `-v` to any command for debug logging.
 ## Development
 
 ```bash
-pip install -e ".[dev]"            # pytest, ruff, and the SDKs and web packages the tests use
+pip install -e ".[dev]"            # pytest, ruff, jsonschema, and the SDKs and web packages the tests use
 pytest
 ruff check . && ruff format --check .
 ```
@@ -976,7 +999,8 @@ without sleeping.
 | `netguard.py` | Checks that a user's webhook address is on the public internet (no private or local networks) |
 | `backup.py` | Consistent copies of the database (SQLite's backup API), with rotation |
 | `web/app.py` / `web/context.py` | The website: `create_app`, security headers, error pages, templates and their filters; what every page works with (settings, database, prices, the scanner) |
-| `web/auth.py` / `web/account.py` | Session cookie, CSRF and Origin checks, sign-in limits; sign-in, invite, password and settings pages |
+| `web/auth.py` / `web/account.py` | Session cookie, CSRF and Origin checks (with `TRUSTED_ORIGINS`), the visitor's address, sign-in limits; sign-in, invite, password and settings pages |
+| `web/api.py` | The JSON API under `/api/v1` that the Next.js front end reads (contract: `frontend/contract/api-v1.schema.json`) |
 | `web/jobs.py` / `web/control.py` / `web/server.py` | "Analyse now" jobs; the scanner's loop inside the website; `dip-scanner serve` |
 | `web/pages.py` / `web/admin.py` | The member and admin pages (templates in `web/templates`, styles and scripts in `web/static`) |
 | `web/charts.py` | The SVG price chart of the idea and ticker pages (light and dark, with a table view) |

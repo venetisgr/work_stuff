@@ -6,8 +6,14 @@ in the tests rather than an empty spot on a page) in the reader's own time zone 
 little JavaScript only for niceties: everything works without it. The Content-Security-Policy allows no inline
 scripts, styles or event handlers, so templates use classes from static/app.css and data-attributes for app.js.
 
-Route modules (account.py, jobs.py, pages.py, admin.py) import render, redirect and flash from here; create_app imports
-them in turn, inside the function, so there is no import cycle.
+Route modules (account.py, jobs.py, pages.py, admin.py, api.py) import render, redirect and flash from here;
+create_app imports them in turn, inside the function, so there is no import cycle.
+
+Behind a front door (PROXY_SECRET: the Next.js app on Vercel forwards every request with x-dip-proxy-secret), every
+request but /healthz without that secret is refused with a page pointing at BASE_URL, so the Fly address itself is of
+no use to anyone. Redirects are relative (Location: /login?next=%2F): an absolute one to the address the request came
+to would send the browser to that address instead of the front door. The JSON API (/api/v1, api.py) answers every
+error as JSON ({"error": {"code", "message", "retry_after"}}) instead of an error page.
 """
 
 from __future__ import annotations
@@ -16,6 +22,8 @@ import base64
 import binascii
 import functools
 import hashlib
+import hmac
+import html
 import json
 import logging
 import re
@@ -121,6 +129,31 @@ ERROR_MESSAGES = {
     503: "This part of the site isn't available right now. Try again in a moment.",
 }
 _TOKEN_PATH = re.compile(r"^/(invite|password)/[^/]+")
+PROXY_SECRET_HEADER = b"x-dip-proxy-secret"
+PROXY_CLIENT_HEADER = b"x-dip-client-ip"
+UNGUARDED_PATHS = ("/healthz",)  # answer without PROXY_SECRET: Fly's health check comes straight to the Machine
+API_PREFIX = "/api/"
+API_ERROR_CODES = {
+    400: "bad_request",
+    401: "not_signed_in",
+    403: "forbidden",
+    404: "not_found",
+    405: "method_not_allowed",
+    422: "bad_request",
+    429: "rate_limited",
+    503: "unavailable",
+}
+API_MESSAGES = {
+    "bad_request": "The request couldn't be understood.",
+    "not_signed_in": "Sign in to continue.",
+    "forbidden": "You aren't allowed to do that.",
+    "not_found": "That doesn't exist (any more).",
+    "method_not_allowed": "This address doesn't take that kind of request.",
+    "rate_limited": "Too many requests. Wait a moment and try again.",
+    "unavailable": "That isn't available right now. Try again in a moment.",
+    "server_error": "Something went wrong on the server. It was logged; try again in a moment.",
+}
+FRONT_DOOR_ONLY = "This address only answers through the website's front door."
 
 
 def _now() -> datetime:
@@ -486,6 +519,34 @@ def error_page(
         return PlainTextResponse(f"{status} {title}\n\n{text}\n", status_code=status, headers=headers)
 
 
+def is_api(path: str) -> bool:
+    """Whether a path belongs to the JSON API (/api/...), whose errors are JSON."""
+    return path.startswith(API_PREFIX) or path == API_PREFIX.rstrip("/")
+
+
+def api_error(
+    status: int,
+    code: str | None = None,
+    message: str | None = None,
+    *,
+    retry_after: int | None = None,
+    headers: dict[str, str] | None = None,
+) -> JSONResponse:
+    """An error of the JSON API: {"error": {"code", "message", "retry_after"}} with the HTTP status (the code defaults
+    to the status's, see API_ERROR_CODES), and a Retry-After header when retry_after is given."""
+    code = code or API_ERROR_CODES.get(status, "server_error")
+    body = {"error": {"code": code, "message": message or API_MESSAGES[code], "retry_after": retry_after}}
+    headers = dict(headers or {})
+    if retry_after is not None:
+        headers["Retry-After"] = str(retry_after)
+    return JSONResponse(body, status_code=status, headers=headers or None)
+
+
+def _retry_after(headers: dict[str, str] | None) -> int | None:
+    value = next((v for k, v in (headers or {}).items() if k.lower() == "retry-after"), None)
+    return int(value) if value is not None and value.strip().isdigit() else None
+
+
 def _custom_detail(exc: StarletteHTTPException) -> str | None:
     detail = exc.detail
     if not isinstance(detail, str) or not detail:
@@ -500,22 +561,34 @@ def _custom_detail(exc: StarletteHTTPException) -> str | None:
 
 async def _http_error(request: Request, exc: StarletteHTTPException) -> Response:
     headers = dict(exc.headers) if exc.headers else None
+    if is_api(request.url.path):
+        extra = {k: v for k, v in (headers or {}).items() if k.lower() != "retry-after"}
+        return api_error(
+            exc.status_code, message=_custom_detail(exc), retry_after=_retry_after(headers), headers=extra or None
+        )
     return await run_in_threadpool(error_page, request, exc.status_code, _custom_detail(exc), headers=headers)
 
 
 async def _validation_error(request: Request, exc: RequestValidationError) -> Response:
     # A path parameter that isn't what the route takes (/jobs/abc) is a page that doesn't exist.
     in_path = any((error.get("loc") or ("",))[0] == "path" for error in exc.errors())
+    if is_api(request.url.path):
+        return api_error(404 if in_path else 400)
     return await run_in_threadpool(error_page, request, 404 if in_path else 400)
 
 
 async def _login_required(request: Request, exc: auth.LoginRequired) -> Response:
+    if is_api(request.url.path):
+        return api_error(401)
     return RedirectResponse(login_url(exc.next_url), status_code=303)
 
 
 async def _server_error(request: Request, exc: Exception) -> Response:
     log.error("Error on %s %s", request.method, redact_path(request.url.path), exc_info=exc)
-    response = await run_in_threadpool(error_page, request, 500, signed_out=True)
+    if is_api(request.url.path):
+        response: Response = api_error(500)
+    else:
+        response = await run_in_threadpool(error_page, request, 500, signed_out=True)
     # This response doesn't pass through WebMiddleware (Starlette sends it from its outermost layer).
     _security_headers(response.headers, request.scope)
     return response
@@ -558,13 +631,59 @@ def _write_cookies(headers: MutableHeaders, scope: Scope) -> None:
         headers.append("set-cookie", cookie.headers["set-cookie"])
 
 
+def relative_location(location: str, scope: Scope) -> str:
+    """A redirect's Location without the address the request came to: "http://my-dips.fly.dev/settings" (what
+    Starlette writes for a trailing-slash redirect) becomes "/settings", so a visitor who came through the front door
+    stays there. Other sites' addresses (and BASE_URL's, when it isn't the one asked for) are left alone."""
+    try:
+        parts = urlsplit(location)
+    except ValueError:
+        return location
+    if not parts.netloc:
+        return location
+    asked = dict(scope.get("headers") or []).get(b"host", b"").decode("latin-1").strip().lower()
+    server = scope.get("server")
+    own = {asked} if asked else set()
+    if server:
+        own.add(f"{server[0]}:{server[1]}".lower())
+    if parts.scheme.lower() not in ("http", "https") or parts.netloc.lower() not in own:
+        return location
+    path = parts.path or "/"
+    if path.startswith("//"):  # "//evil.example" would be another site's address
+        path = "/" + path.lstrip("/")
+    return path + (f"?{parts.query}" if parts.query else "") + (f"#{parts.fragment}" if parts.fragment else "")
+
+
+def _front_door_refusal(scope: Scope, base_url: str | None) -> Response:
+    """The answer to a request without PROXY_SECRET: 403, with a link to the front door (BASE_URL)."""
+    if is_api(str(scope.get("path", ""))):
+        return api_error(403, "forbidden", f"{FRONT_DOOR_ONLY} Use {base_url or 'the website'}.")
+    link = f'<a href="{html.escape(base_url)}">{html.escape(base_url)}</a>' if base_url else "the website's address"
+    page = (
+        '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">'
+        f"<title>Not here · {APP_NAME}</title></head>\n"
+        f"<body><h1>Not here</h1><p>{FRONT_DOOR_ONLY} Open {link} instead.</p></body></html>\n"
+    )
+    return Response(page, status_code=403, media_type="text/html")
+
+
 class WebMiddleware:
     """Adds the security headers (CSP, nosniff, Referrer-Policy, Permissions-Policy, frame blocking; HSTS over
-    https), Cache-Control (no-store for pages), the cookies the handlers queued (auth.queue_cookie), refuses bodies
-    over MAX_BODY_BYTES (413), and logs one line per request without query strings or link tokens."""
+    https), Cache-Control (no-store for pages), the cookies the handlers queued (auth.queue_cookie), makes redirects
+    to the address the request came to relative (relative_location), refuses bodies over MAX_BODY_BYTES (413), and
+    logs one line per request without query strings or link tokens.
 
-    def __init__(self, app: ASGIApp) -> None:
+    With proxy_secret (PROXY_SECRET), a request other than /healthz must carry it in x-dip-proxy-secret, compared in
+    constant time, else it is refused (403, a page pointing at base_url). A request that carried it is marked as
+    proxied (auth.is_proxied), and the visitor's address the front door put in x-dip-client-ip, when it is one, is
+    what auth.client_ip and the log use.
+    """
+
+    def __init__(self, app: ASGIApp, *, proxy_secret: str | None = None, base_url: str | None = None) -> None:
         self.app = app
+        self.proxy_secret = proxy_secret.encode("utf-8") if proxy_secret else None
+        self.base_url = base_url
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -572,12 +691,24 @@ class WebMiddleware:
             return
         started = time.monotonic()
         status = 500
-        length = dict(scope.get("headers") or []).get(b"content-length", b"0")
-        if not length.isdigit() or int(length) > MAX_BODY_BYTES:
-            status = 413
-            response = PlainTextResponse("That request is too large.\n", status_code=413)
-            _security_headers(response.headers, scope)
-            await response(scope, receive, send)
+        headers = list(scope.get("headers") or [])
+        refusal: Response | None = None
+        if self.proxy_secret is not None and scope.get("path") not in UNGUARDED_PATHS:
+            if self._from_front_door(scope, headers):
+                state = scope.setdefault("state", {})
+                state[auth.PROXIED_KEY] = True
+                named = [value for name, value in headers if name == PROXY_CLIENT_HEADER]
+                state[auth.PROXY_CLIENT_KEY] = auth.clean_ip(named[0].decode("latin-1")) if len(named) == 1 else None
+            else:
+                refusal = _front_door_refusal(scope, self.base_url)
+        length = dict(headers).get(b"content-length", b"0")
+        if refusal is None and (not length.isdigit() or int(length) > MAX_BODY_BYTES):
+            refusal = PlainTextResponse("That request is too large.\n", status_code=413)
+        if refusal is not None:
+            status = refusal.status_code
+            refusal.headers["Cache-Control"] = "no-store"  # also under /static/: a cache must never keep a refusal
+            _security_headers(refusal.headers, scope)
+            await refusal(scope, receive, send)
             _log_access(scope, status, started)
             return
 
@@ -588,12 +719,20 @@ class WebMiddleware:
                 headers = MutableHeaders(scope=message)
                 _security_headers(headers, scope)
                 _write_cookies(headers, scope)
+                if "location" in headers:
+                    headers["location"] = relative_location(headers["location"], scope)
             await send(message)
 
         try:
             await self.app(scope, receive, send_with_headers)
         finally:
             _log_access(scope, status, started)
+
+    def _from_front_door(self, scope: Scope, headers: list[tuple[bytes, bytes]]) -> bool:
+        """Whether the request carries PROXY_SECRET: exactly one x-dip-proxy-secret header, equal to it."""
+        assert self.proxy_secret is not None
+        given = [value for name, value in headers if name == PROXY_SECRET_HEADER]
+        return len(given) == 1 and hmac.compare_digest(given[0], self.proxy_secret)
 
 
 def _log_access(scope: Scope, status: int, started: float) -> None:
@@ -604,7 +743,10 @@ def _log_access(scope: Scope, status: int, started: float) -> None:
     headers = dict(scope.get("headers") or [])
     app = scope.get("app")
     ctx: AppContext | None = getattr(getattr(app, "state", None), "ctx", None)
-    client = (headers.get(b"fly-client-ip") or b"").decode("latin-1") if ctx and ctx.trust_fly_client_ip else ""
+    state = scope.get("state") or {}
+    client = (state.get(auth.PROXY_CLIENT_KEY) or "") if state.get(auth.PROXIED_KEY) else ""
+    if not client and ctx and ctx.trust_fly_client_ip:
+        client = (headers.get(b"fly-client-ip") or b"").decode("latin-1")
     if not client and scope.get("client"):
         client = str(scope["client"][0])
     elapsed = (time.monotonic() - started) * 1000
@@ -651,6 +793,7 @@ def create_app(
     Raises ConfigError when SECRET_KEY is missing or too short.
     """
     settings.web.require_secret_key()
+    settings.web.require_front_door()
     clock = clock or _now
     store = Store(Path(store_path))
     accounts = Accounts(store, defaults=UserSettings.defaults(config, settings), clock=clock)
@@ -699,7 +842,7 @@ def create_app(
 
     app = FastAPI(title=APP_NAME, docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.ctx = ctx
-    app.add_middleware(WebMiddleware)
+    app.add_middleware(WebMiddleware, proxy_secret=settings.web.proxy_secret, base_url=settings.web.base_url)
     app.add_exception_handler(StarletteHTTPException, _http_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(auth.LoginRequired, _login_required)
@@ -709,10 +852,11 @@ def create_app(
     app.add_api_route("/robots.txt", robots, methods=["GET"], include_in_schema=False)
     app.add_api_route("/favicon.ico", favicon, methods=["GET"], include_in_schema=False)
 
-    from . import account, admin, pages
+    from . import account, admin, api, pages
     from . import jobs as job_pages
 
-    for router in (account.router, job_pages.router, pages.router, admin.router):
+    app.add_exception_handler(api.ApiError, api.api_error_handler)
+    for router in (account.router, job_pages.router, pages.router, admin.router, api.router):
         app.include_router(router)
     return app
 

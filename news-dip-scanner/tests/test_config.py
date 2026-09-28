@@ -29,6 +29,9 @@ from dip_scanner.config import (
     load_feeds,
     load_scanner_config,
     load_settings,
+    origin_pattern,
+    origin_text,
+    parse_trusted_origins,
 )
 from dip_scanner.models import Feed
 
@@ -45,7 +48,7 @@ def test_an_empty_environment_gives_the_defaults(tmp_path, monkeypatch):
     assert settings.sec_user_agent is None
     assert settings.data_dir == tmp_path / "data"
     assert settings.display_tz is UTC
-    assert settings.web == WebSettings() == WebSettings(None, None, True, 5, True)
+    assert settings.web == WebSettings() == WebSettings(None, None, True, 5, True, None, ())
     assert Settings().llm.provider == "openai"
 
 
@@ -90,6 +93,8 @@ def test_every_setting_is_read():
         "COOKIE_SECURE": "false",
         "ANALYZE_LIMIT_PER_USER": "0",
         "SCANNER_ENABLED": "no",
+        "PROXY_SECRET": "p" * 32,
+        "TRUSTED_ORIGINS": "https://My-Dips-Git-Main-My-Team.vercel.app/, https://my-dips-git-*-my-team.vercel.app",
     }
     settings = load_settings(env)
     assert settings.llm == LLMSettings(
@@ -128,6 +133,8 @@ def test_every_setting_is_read():
         cookie_secure=False,
         analyze_limit_per_user=0,
         scanner_enabled=False,
+        proxy_secret="p" * 32,
+        trusted_origins=("https://my-dips-git-main-my-team.vercel.app", "https://my-dips-git-*-my-team.vercel.app"),
     )
 
 
@@ -183,6 +190,29 @@ def test_default_models_cover_openai_and_anthropic_only():
         ({"SCANNER_ENABLED": "sometimes"}, "SCANNER_ENABLED must be true or false"),
         ({"ANALYZE_LIMIT_PER_USER": "five"}, "ANALYZE_LIMIT_PER_USER must be a whole number"),
         ({"ANALYZE_LIMIT_PER_USER": "-1"}, "ANALYZE_LIMIT_PER_USER can't be negative"),
+        ({"PROXY_SECRET": "too-short"}, "PROXY_SECRET must be a random secret of at least 32 characters"),
+        ({"PROXY_SECRET": "a" * 20 + " " + "b" * 20}, "PROXY_SECRET must be a random secret"),
+        ({"PROXY_SECRET": "a" * 40 + "é"}, "PROXY_SECRET must be a random secret"),
+        ({"TRUSTED_ORIGINS": "dips.example.com"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "https://dips.example.com/app"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "https://user@dips.example.com"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "ftp://dips.example.com"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "https://dips.example.com?x=1"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "https://dips_example.com"}, "TRUSTED_ORIGINS entries are origins"),
+        ({"TRUSTED_ORIGINS": "https://*.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://*"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://my-dips-*.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://*-my-team.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "http://my-dips-git-*-my-team.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://my-dips-git-*-my-team.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://my-dips-*-*-my-team.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://a.my-*-b.vercel.app"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://my-dips-git-*-my-team.vercel.app:8443"}, "TRUSTED_ORIGINS allows one pattern"),
+        ({"TRUSTED_ORIGINS": "https://my-dips-git-*-my-team.vercel.app/x"}, "TRUSTED_ORIGINS allows one pattern"),
+        (
+            {"TRUSTED_ORIGINS": "https://a-git-*-t.vercel.app,https://b-git-*-t.vercel.app"},
+            "TRUSTED_ORIGINS can hold only one pattern",
+        ),
     ],
 )
 def test_wrong_values_are_reported(env, message):
@@ -706,10 +736,50 @@ def test_the_website_needs_a_long_random_secret_key():
         assert 'python -c "import secrets; print(secrets.token_urlsafe(48))"' in str(error.value)
 
 
+def test_trusted_origins_are_normalised():
+    value = "HTTPS://Dips.Example.com/, http://localhost:3000, http://[::1]:3000, https://x.example.com:443,"
+    assert parse_trusted_origins(value + " https://dips.example.com") == (
+        "https://dips.example.com",
+        "http://localhost:3000",
+        "http://[::1]:3000",
+        "https://x.example.com",
+    )
+    assert parse_trusted_origins(None) == () and parse_trusted_origins(" , ") == ()
+    assert origin_text("https://dips.example.com:8443/") == "https://dips.example.com:8443"
+    for wrong in ("https://dips.example.com/x", "//dips.example.com", "https://[nope]", "javascript:alert(1)"):
+        assert origin_text(wrong) is None, wrong
+
+
+@pytest.mark.parametrize(
+    ("origin", "matches"),
+    [
+        ("https://my-dips-git-main-my-team.vercel.app", True),
+        ("https://my-dips-git-fix-chart-2-my-team.vercel.app", True),
+        ("https://my-dips-git--my-team.vercel.app", False),  # the * stands for at least one character
+        ("https://my-dips-git-a.b-my-team.vercel.app", False),  # never a dot: it stays in the first label
+        ("https://evil-my-dips-git-x-my-team.vercel.app", False),
+        ("https://my-dips-git-x-my-team.vercel.app.evil.example", False),
+        ("http://my-dips-git-x-my-team.vercel.app", False),
+        ("https://my-dips-git-" + "x" * 60 + "-my-team.vercel.app", False),  # longer than a DNS label
+    ],
+)
+def test_the_preview_pattern_matches_one_projects_previews_only(origin, matches):
+    pattern = origin_pattern("https://My-Dips-Git-*-My-Team.vercel.app/")
+    assert bool(pattern.fullmatch(origin)) is matches
+
+
+def test_a_front_door_needs_base_url():
+    WebSettings().require_front_door()
+    WebSettings(proxy_secret="p" * 32, base_url="https://dips.example.com").require_front_door()
+    with pytest.raises(ConfigError, match="PROXY_SECRET is set.*set BASE_URL"):
+        WebSettings(proxy_secret="p" * 32).require_front_door()
+
+
 def test_the_readme_describes_every_website_setting():
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
     example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-    for name in ("SECRET_KEY", "BASE_URL", "COOKIE_SECURE", "ANALYZE_LIMIT_PER_USER", "SCANNER_ENABLED"):
+    names = ("SECRET_KEY", "BASE_URL", "COOKIE_SECURE", "ANALYZE_LIMIT_PER_USER", "SCANNER_ENABLED")
+    for name in (*names, "PROXY_SECRET", "TRUSTED_ORIGINS"):
         assert f"| `{name}` |" in readme, name
         assert f"# {name}=" in example, name
     assert "### Website settings" in readme
@@ -723,6 +793,8 @@ def test_the_website_extra_and_its_files_are_packaged():
     names = {re.split(r"[\\[<>=]", requirement)[0] for requirement in extras["web"]}
     assert names == {"fastapi", "uvicorn", "jinja2", "python-multipart"}
     assert any(requirement.startswith("httpx") for requirement in extras["dev"])
+    # the API tests check every answer against frontend/contract, date-times included (CI installs [dev,web])
+    assert any(requirement.startswith("jsonschema[format]") for requirement in extras["dev"])
     setuptools = pyproject["tool"]["setuptools"]
     assert "dip_scanner.web" in setuptools["packages"]
     assert setuptools["package-data"]["dip_scanner.web"] == ["templates/**/*", "static/**/*"]

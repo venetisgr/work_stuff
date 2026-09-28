@@ -138,6 +138,7 @@ names, never the values.
 | `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | not needed | Only if users should be able to choose email alerts, or invites should be emailed. |
 | `TELEGRAM_BOT_TOKEN` | not needed | Only if users should be able to choose Telegram alerts. |
 | `WEBHOOK_URL`, `EMAIL_TO`, `TELEGRAM_CHAT_ID`... | optional | The command line's own channels (see `.env.example`): they get every alert under `scanner.toml`'s `[alerts]` rules, and the "scanner stopped" notices. On the website each user sets up their own channels instead, and admins get those notices through theirs. |
+| `PROXY_SECRET`, `TRUSTED_ORIGINS` | with the Vercel front door | Only once the Next.js front end on Vercel is the site's address: see [The Vercel front door](#the-vercel-front-door). |
 
 Settings that aren't secret go under `[env]` in `fly.toml` (they need a deploy to change). It already has
 `DISPLAY_TZ = "Europe/Athens"` (users choose their own time zone on the website), `LLM_PROVIDER = "openai"` (triage)
@@ -411,6 +412,62 @@ database changes are applied automatically when it opens the database. `fly vers
 Memory and the other Machine settings come from `[[vm]]` in `fly.toml` on every deploy: a `fly scale memory 1024`
 without changing `fly.toml` lasts until the next deploy.
 
+## The Vercel front door
+
+The site can have a front door on Vercel: the Next.js app in `frontend/` (its guide is `docs/VERCEL.md`) becomes the
+only address people use. It shows the ideas and each idea's page in React, with the data from this app's JSON API
+(`/api/v1`), and passes every other request (signing in, settings, news, track record, admin) on to this app. Every
+request it makes here carries a shared secret, and this app then answers nobody without it.
+
+Set up and deploy the Vercel project first, with `DIP_API_ORIGIN` (this app's address,
+`https://my-dip-scanner.fly.dev`) and `DIP_PROXY_SECRET` (a new random secret, not `SECRET_KEY`):
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Then give this app the same secret, and make the Vercel address the site's address:
+
+```bash
+fly secrets set \
+  PROXY_SECRET=paste-the-same-secret \
+  BASE_URL=https://dips.example.com \
+  TRUSTED_ORIGINS='https://my-dips-git-*-my-team.vercel.app'
+```
+
+| Setting | What for |
+|---|---|
+| `PROXY_SECRET` | At least 32 characters, exactly the front door's `DIP_PROXY_SECRET`. Every request but `/healthz` must carry it (compared in constant time); without it the answer is 403 with a link to `BASE_URL`, so `my-dip-scanner.fly.dev` is of no use in a browser any more. `/healthz` still answers everybody, for Fly's health check and uptime monitors. |
+| `BASE_URL` | Now the Vercel address: your domain on Vercel, or `https://<project>.vercel.app`. Invite and password links point there, form posts from it are accepted, and the refusal page links to it. It is required with `PROXY_SECRET`. |
+| `TRUSTED_ORIGINS` | Optional: other addresses whose form posts are accepted, comma-separated. For Vercel's preview deployments, either their exact addresses (a branch's `https://my-dips-git-main-my-team.vercel.app`) or one pattern for every preview of the project: `https://my-dips-git-*-my-team.vercel.app` (branch addresses) or `https://my-dips-*-my-team.vercel.app` (commit addresses too), with your project's name before the `*` and your team's (its slug) after it. |
+
+What changes:
+
+- **Addresses.** Every redirect is relative (`Location: /login?next=%2F`), so visitors stay on the Vercel address. The
+  `fly.dev` address answers "Not here" and points at `BASE_URL`; that includes `/static/` and the JSON API.
+- **Limits and the log.** The front door names the visitor's address in `x-dip-client-ip`, and this app believes it
+  only on a request that carried the secret: the sign-in limits then count each visitor, not Vercel's servers, and
+  the log shows the visitor.
+- **Preview deployments use this app**: the data they show is real and so is everything done on them (settings
+  saved, "Analyse again", which costs a model analysis like any other). The session cookie belongs to one address, so
+  on a preview you sign in again. Keep previews private with Vercel's Deployment Protection. A pattern in
+  `TRUSTED_ORIGINS` is looser than an exact address (see [Security model](../README.md#security-model) in the
+  README); and Vercel shortens a preview's address when its first part would be over 63 characters, so a preview of
+  a long branch name may not match: use a shorter branch name, or list that address.
+- **Order.** Once `PROXY_SECRET` is set (it restarts the Machine), the site only works through the front door, so
+  set up Vercel first. To go back: `fly secrets unset PROXY_SECRET TRUSTED_ORIGINS` and `fly secrets set
+  BASE_URL=https://my-dip-scanner.fly.dev`.
+- **A new secret.** Set it in Vercel (and redeploy there) and with `fly secrets set PROXY_SECRET=...`; between the two,
+  pages answer "Not here", so do it when nobody is using the site.
+
+To check it from your computer (the second command puts the secret in your shell history; clear it afterwards):
+
+```bash
+curl -si https://my-dip-scanner.fly.dev/login | head -1                                   # HTTP/2 403
+curl -si -H "x-dip-proxy-secret: paste-the-secret" https://my-dip-scanner.fly.dev/login | head -1   # HTTP/2 200
+curl -si https://my-dip-scanner.fly.dev/healthz | head -1                                 # HTTP/2 200
+```
+
 ## Costs
 
 Fly's prices on 2026-09-28, for Frankfurt (15% above the US East price), 30 days of running around the clock:
@@ -454,6 +511,9 @@ stopping the process.
 | A notice "dip-scanner: Anthropic unavailable, analysing with OpenAI only" (or the other way round) | One of the two debaters failed (a rejected key, no credit, an outage); the other analyses each dip alone meanwhile and the scanner keeps running. The notice names the error; fix it at that provider. At most one such notice per provider every 12 hours. |
 | Forms answer "This form was sent from another site, so it was refused." | You are on another address than `BASE_URL` (e.g. the `fly.dev` one after moving to your own domain). Use the `BASE_URL` address, or correct the secret. |
 | Links in invites point to the wrong address | `BASE_URL` (step 4, or step 9). The links already sent keep the old address. |
+| Every page says "Not here: This address only answers through the website's front door" | `PROXY_SECRET` is set, and the request didn't carry it: you opened the `fly.dev` address (use `BASE_URL`), or the front door's `DIP_PROXY_SECRET` differs from it (set both again, see [The Vercel front door](#the-vercel-front-door)). |
+| The deploy fails its health check, and `fly logs` says `PROXY_SECRET is set, so ... set BASE_URL` | `fly secrets set BASE_URL=https://<the Vercel address>`. |
+| Forms on a Vercel preview answer "This form was sent from another site" | Add the preview's address, or the project's pattern, to `TRUSTED_ORIGINS` (see [The Vercel front door](#the-vercel-front-door)). |
 | `fly machine list` shows two Machines | `fly scale count 1`, then remove the spare volume (step 6). |
 | `Permission denied` or `attempt to write a readonly database` in the log | A file under `/data` belongs to root (made over `fly ssh` or `sftp`). `fly ssh console -C "chown -R app:app /data"`, then `fly apps restart my-dip-scanner`. |
 | The Machine keeps restarting after a settings change | A broken `/data/scanner.toml` or `feeds.toml` (step 14): `fly logs` names it. `fly ssh` needs a running Machine, so run it without the website for a moment: `fly machine update <machine id> --command "sleep infinity" --skip-health-checks`, then `fly ssh console -C "rm /data/scanner.toml"` (or fix the file), then `fly deploy --ha=false`, which puts the normal command back. |
@@ -468,8 +528,8 @@ stopping the process.
   of the build, so secrets only ever reach the Machine as Fly secrets.
 - The Machine is only reachable through Fly's proxy, which ends HTTPS (`force_https` sends plain HTTP to HTTPS). The
   server trusts the proxy's `X-Forwarded-Proto` and `X-Forwarded-For`, and uses `Fly-Client-IP` for the sign-in
-  limits (see [Security model](../README.md#security-model) in the README, which lists the rest of the site's
-  safeguards).
+  limits, or behind the Vercel front door the visitor's address it names, on requests with `PROXY_SECRET` only (see
+  [Security model](../README.md#security-model) in the README, which lists the rest of the site's safeguards).
 - Anyone with the deploy token can deploy code that reads the app's secrets: keep `FLY_API_TOKEN` in GitHub's secrets
   only. The workflow deploys `main` only, so protect `main` (step 10) and review what is merged into it.
 - Backups contain password hashes and users' settings: keep downloaded copies private.
