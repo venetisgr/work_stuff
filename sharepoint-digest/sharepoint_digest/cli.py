@@ -25,8 +25,6 @@ from .summarize import day
 
 log = logging.getLogger("sharepoint_digest")
 
-DEFAULT_DAYS = 7
-
 
 def main_local(argv: list[str] | None = None) -> int:
     """Version 1: a folder on this computer."""
@@ -52,20 +50,22 @@ def _main(argv: list[str] | None, *, local: bool) -> int:
             _print_folders(load_folders(folders_file), local=local)
             return 0
         settings = load_settings()
-        date_range = _date_range(args)
+        date_field = "modified" if local else args.date_field
         if local:
             folder = _choose_local_folder(args.folder, folders_file)
             source: FileSource = LocalFolder(folder.local_path)
+            date_range = _date_range(args, date_field)
         else:
             folders = load_folders(folders_file)
             folder = find_folder(folders, args.folder) if args.folder else _ask_for_folder(folders)
+            date_range = _date_range(args, date_field)  # ask for everything before signing in
             source = open_sharepoint_folder(settings, folder)
         run = run_digest(
             settings,
             folder,
             date_range,
             source,
-            date_field="modified" if local else args.date_field,
+            date_field=date_field,
             recursive=not args.no_subfolders,
             workers=args.workers,
             dry_run=args.dry_run,
@@ -109,10 +109,8 @@ def _parser(local: bool) -> argparse.ArgumentParser:
     )
     parser.add_argument("--folder", help=folder_help)
     when = parser.add_mutually_exclusive_group()
-    when.add_argument("--start", type=_iso_date, metavar="YYYY-MM-DD", help="first day of the range")
-    when.add_argument(
-        "--days", type=_positive_int, metavar="N", help=f"the last N days up to --end (default: {DEFAULT_DAYS})"
-    )
+    when.add_argument("--start", type=_iso_date, metavar="YYYY-MM-DD", help="first day of the range (asks if omitted)")
+    when.add_argument("--days", type=_positive_int, metavar="N", help="the last N days up to --end, instead of --start")
     parser.add_argument("--end", type=_iso_date, metavar="YYYY-MM-DD", help="last day of the range (default: today)")
     if not local:  # synced and downloaded copies don't keep SharePoint's creation dates
         parser.add_argument(
@@ -148,11 +146,34 @@ def _positive_int(value: str) -> int:
     return int(value)
 
 
-def _date_range(args: argparse.Namespace) -> DateRange:
-    end = args.end or date.today()
-    if args.start:
-        return DateRange(args.start, end)
-    return DateRange(end - timedelta(days=(args.days or DEFAULT_DAYS) - 1), end)
+def _date_range(args: argparse.Namespace, date_field: str) -> DateRange:
+    """The range from --start/--days and --end, or asked for when neither --start nor --days was given."""
+    if args.start or args.days:
+        end = args.end or date.today()
+        return DateRange(args.start or end - timedelta(days=args.days - 1), end)
+    if not sys.stdin.isatty():
+        raise ConfigError("Give the date range, e.g. --start 2026-09-01 --end 2026-09-26 (or --days 14).")
+
+    which = "created" if date_field == "created" else "last modified"
+    start = _ask_for_date(f"Start date (files {which} on or after, YYYY-MM-DD): ")
+    end = args.end
+    while end is None:
+        end = _ask_for_date(f"End date (files {which} on or before, YYYY-MM-DD, Enter for today): ", date.today())
+        if end < start:
+            print("The end date can't be before the start date.")
+            end = None
+    return DateRange(start, end)
+
+
+def _ask_for_date(prompt: str, default: date | None = None) -> date:
+    while True:
+        answer = input(prompt).strip()
+        if not answer and default:
+            return default
+        try:
+            return date.fromisoformat(answer)
+        except ValueError:
+            print("Please enter a date like 2026-09-01.")
 
 
 def _choose_local_folder(choice: str | None, folders_file: Path) -> Folder:

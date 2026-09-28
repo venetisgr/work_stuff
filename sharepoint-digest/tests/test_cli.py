@@ -1,4 +1,4 @@
-from datetime import date, timedelta
+from datetime import date
 
 import pytest
 from conftest import FakeModel, make_pptx, write_file
@@ -65,9 +65,40 @@ def test_start_and_days_cannot_be_combined():
 
 def test_days_counts_back_from_the_end_date():
     args = cli._parser(local=False).parse_args(["--days", "7", "--end", "2026-09-27"])
-    assert cli._date_range(args) == pipeline.DateRange(date(2026, 9, 21), date(2026, 9, 27))
-    default = cli._date_range(cli._parser(local=False).parse_args([]))
-    assert default.end - default.start == timedelta(days=cli.DEFAULT_DAYS - 1)
+    assert cli._date_range(args, "modified") == pipeline.DateRange(date(2026, 9, 21), date(2026, 9, 27))
+    start_only = cli._parser(local=False).parse_args(["--start", "2026-09-01"])
+    assert cli._date_range(start_only, "modified") == pipeline.DateRange(date(2026, 9, 1), date.today())
+
+
+class Terminal:
+    def isatty(self):
+        return True
+
+
+def test_without_dates_it_asks_for_them(monkeypatch, capsys):
+    answers = iter(["1 Sep", "2026-09-01", "2026-08-01", ""])  # a bad date, then an end before the start
+    monkeypatch.setattr(cli.sys, "stdin", Terminal())
+    monkeypatch.setattr("builtins.input", lambda prompt: print(prompt) or next(answers))
+
+    date_range = cli._date_range(cli._parser(local=True).parse_args([]), "modified")
+
+    assert date_range == pipeline.DateRange(date(2026, 9, 1), date.today())
+    output = capsys.readouterr().out
+    assert "Start date (files last modified on or after, YYYY-MM-DD):" in output
+    assert "Please enter a date like 2026-09-01." in output
+    assert "The end date can't be before the start date." in output
+
+
+def test_a_given_end_date_is_not_asked_again(monkeypatch):
+    monkeypatch.setattr(cli.sys, "stdin", Terminal())
+    monkeypatch.setattr("builtins.input", lambda prompt: "2026-09-01")
+    args = cli._parser(local=False).parse_args(["--end", "2026-09-26"])
+    assert cli._date_range(args, "created") == pipeline.DateRange(date(2026, 9, 1), date(2026, 9, 26))
+
+
+def test_without_dates_or_a_terminal_it_asks_for_the_flags(capsys):
+    assert cli.main_online(["--folder", "1"]) == 1
+    assert "Give the date range, e.g. --start 2026-09-01 --end 2026-09-26" in capsys.readouterr().err
 
 
 def test_online_dry_run_lists_the_files(sharepoint, model, capsys):

@@ -83,14 +83,14 @@ date ranges work. You can also select the folder and choose **Download** to get 
 **Run it**, pointing `--folder` at the folder's path or at a `folders.toml` folder that has a `local_path`:
 
 ```bash
-# A folder path; covers the last 14 days
-python local_digest.py --folder "C:\Users\you\Contoso\Team Site - Documents\Temp Folder 1" --days 14
+# A folder path and a date range (files last modified from 1 to 26 September)
+python local_digest.py --folder "C:\Users\you\Contoso\Team Site - Documents\Temp Folder 1" --start 2026-09-01 --end 2026-09-26
 
-# A folder from folders.toml, with a date range
-python local_digest.py --folder temp-folder-1 --start 2026-09-01 --end 2026-09-26
+# A folder from folders.toml, covering the last 14 days
+python local_digest.py --folder temp-folder-1 --days 14
 
-# No --folder: choose from the folders that have a local_path
-python local_digest.py --days 7
+# Nothing given: pick a folder that has a local_path from a menu, then type the start and end dates
+python local_digest.py
 
 # See which files would be summarized, without calling the model
 python local_digest.py --folder temp-folder-1 --days 14 --dry-run
@@ -117,7 +117,7 @@ Then fill in `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` (and `AZURE_CLIENT_SECRET` for
 is the default library, whose address ends in "Shared Documents").
 
 ```bash
-# Choose a folder from a menu; covers the last 7 days
+# Nothing given: pick the folder from a menu, then type the start and end dates
 python online_digest.py
 
 # A given folder (by key, label or menu number) and date range
@@ -138,8 +138,8 @@ for the two scripts):
 | Option | Meaning |
 |---|---|
 | `--folder` | Version 1: a folder path, or a `folders.toml` folder with a `local_path`. Version 2: a folder key, label or number from `folders.toml`. Without it you get a menu. |
-| `--start` / `--end` | First and last day of the range (`YYYY-MM-DD`, both included). `--end` defaults to today. |
-| `--days N` | The last N days up to `--end`, instead of `--start`. The default range is the last 7 days. |
+| `--start` / `--end` | First and last day of the range (`YYYY-MM-DD`, both included), by last-modified date. `--end` defaults to today. Leave the dates out and the tool asks for them when it starts. |
+| `--days N` | The last N days up to `--end`, instead of `--start`. |
 | `--date-field created` | Version 2 only: filter on the file's creation date instead of its last-modified date. |
 | `--no-subfolders` | Only look at files directly in the folder. |
 | `--workers N` | Files summarized in parallel (default 4). Lower it if Foundry throttles you. |
