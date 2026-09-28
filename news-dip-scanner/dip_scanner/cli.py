@@ -220,14 +220,17 @@ def _global_options(parser: argparse.ArgumentParser, *, suppress: bool) -> None:
         type=Path,
         default=default(None),
         metavar="PATH",
-        help="thresholds and watchlist (default: $SCANNER_CONFIG, ./scanner.toml or the project's)",
+        help=(
+            "thresholds and watchlist (default: $SCANNER_CONFIG, $DATA_DIR/scanner.toml, ./scanner.toml or the "
+            "project's)"
+        ),
     )
     parser.add_argument(
         "--feeds",
         type=Path,
         default=default(None),
         metavar="PATH",
-        help="feed list (default: $FEEDS_FILE, ./feeds.toml or the project's)",
+        help="feed list (default: $FEEDS_FILE, $DATA_DIR/feeds.toml, ./feeds.toml or the project's)",
     )
     parser.add_argument(
         "--data-dir",

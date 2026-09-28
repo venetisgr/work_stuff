@@ -1,0 +1,31 @@
+# What `fly deploy` and `docker build` leave out of the build context. The Dockerfile copies only pyproject.toml,
+# README.md, dip_scanner/, scanner.toml and feeds.toml; this keeps the upload small and secrets off the builder.
+
+# Secrets and local data: never sent to the (remote) builder
+.env
+.env.*
+!.env.example
+data/
+*.sqlite3
+*.sqlite3-*
+
+# Python and tool caches, virtual environments, build output
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Not needed in the image (the Dockerfile itself stays in: flyctl's builder reads it from the context)
+.git/
+.github/
+tests/
+docs/
+fly.toml

@@ -641,6 +641,25 @@ def test_default_file_prefers_the_env_var_then_the_current_folder_then_the_proje
     assert default_file("feeds.toml", "FEEDS_FILE") == tmp_path / "other.toml"
 
 
+@pytest.mark.parametrize(("name", "env_var"), [("scanner.toml", "SCANNER_CONFIG"), ("feeds.toml", "FEEDS_FILE")])
+def test_default_file_takes_a_copy_in_the_data_dir_first(tmp_path, monkeypatch, name, env_var):
+    """On Fly.io DATA_DIR is the volume: a scanner.toml or feeds.toml put there replaces the image's copy in the
+    working folder."""
+    work, volume = tmp_path / "app", tmp_path / "vol"
+    work.mkdir()
+    volume.mkdir()
+    (work / name).write_text("")
+    monkeypatch.chdir(work)
+    env = {"DATA_DIR": str(volume)}
+    assert default_file(name, env_var, env=env) == work / name  # nothing on the volume yet
+    (volume / name).write_text("")
+    assert default_file(name, env_var, env=env) == volume / name
+    assert default_file(name, env_var, env={**env, env_var: "/etc/mine.toml"}) == Path("/etc/mine.toml")
+    assert default_file(name, env_var, env={"DATA_DIR": "  "}) == work / name  # a blank DATA_DIR is ignored
+    (volume / "other").mkdir()
+    assert default_file("other", env_var, env=env) == PROJECT_ROOT / "other"  # a folder isn't a settings file
+
+
 def test_sec_symbol_maps_a_preferred_listing_back_to_its_us_symbol():
     universe = UniverseConfig(preferred_listings={"ASML": "ASML.AS", "SAP.F": "SAP.DE"})
     assert universe.sec_symbol("ASML.AS") == "ASML"

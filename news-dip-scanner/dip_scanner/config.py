@@ -686,11 +686,17 @@ def _title_patterns(value: Any, key: str, path: Path) -> tuple[re.Pattern[str], 
 
 
 def default_file(name: str, env_var: str, *, env: Mapping[str, str] | None = None) -> Path:
-    """The file named by env_var if set, else ./name if it exists, else the copy shipped with the project."""
+    """The file named by env_var if set, else DATA_DIR/name when the DATA_DIR variable is set and that file exists (on
+    Fly.io a copy on the volume replaces the image's), else ./name if it exists, else the copy shipped with the
+    project. Only the DATA_DIR variable counts here, not --data-dir or the ./data default, so a local command line
+    finds its files as before."""
     env = os.environ if env is None else env
     value = (env.get(env_var) or "").strip()
     if value:
         return Path(value).expanduser()
+    data_dir = (env.get("DATA_DIR") or "").strip()
+    if data_dir and (Path(data_dir).expanduser() / name).is_file():
+        return Path(data_dir).expanduser() / name
     local = Path.cwd() / name
     return local if local.exists() else PROJECT_ROOT / name
 

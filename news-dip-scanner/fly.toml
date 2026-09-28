@@ -1,0 +1,64 @@
+# Fly.io configuration for the website and the scanner (`dip-scanner serve`, built from the Dockerfile next to this
+# file). Step by step: docs/DEPLOY.md. Every key here was checked against https://fly.io/docs/reference/configuration/
+# on 2026-09-28.
+#
+# Exactly ONE Machine must run this app: two would each run the scanner (twice the language-model bill, duplicate
+# alerts), and the SQLite database on the volume can't be shared. Keep it at one with `fly scale count 1`.
+
+app = "my-dip-scanner"       # your app's name, from `fly apps create`
+primary_region = "fra"       # Frankfurt, the nearest region to Greece (`fly platform regions`)
+
+# Fly stops the Machine with this signal on deploys and restarts: the website finishes its requests (up to 15 s) and
+# the scanner its cycle (up to 10 s more) before the process is killed.
+kill_signal = "SIGTERM"
+kill_timeout = "40s"
+
+# Swap on the Machine's own disk, in case a busy moment goes over the memory below (measured: see docs/DEPLOY.md).
+swap_size_mb = 512
+
+# Another language model provider needs its package in the image: uncomment one.
+# [build.args]
+#   EXTRAS = "anthropic"      # LLM_PROVIDER=anthropic
+#   EXTRAS = "azure"          # LLM_PROVIDER=azure with Entra ID
+
+[env]
+  # Not secret. Secrets (SECRET_KEY, BASE_URL, OPENAI_API_KEY...) are set with `fly secrets set`.
+  DATA_DIR = "/data"
+  DISPLAY_TZ = "Europe/Athens"
+
+# The volume with the database, reports and backups. Create it once, in primary_region, before the first deploy:
+#   fly volumes create scanner_data --region fra --size 1 --snapshot-retention 14
+[mounts]
+  source = "scanner_data"
+  destination = "/data"
+  initial_size = "1gb"
+  snapshot_retention = 14             # days of daily snapshots (Fly's default is 5; 1 to 60)
+  auto_extend_size_threshold = 80     # grow by 1 GB when 80% full, up to 5 GB
+  auto_extend_size_increment = "1GB"
+  auto_extend_size_limit = "5GB"
+
+[http_service]
+  internal_port = 8080                # `dip-scanner serve --port 8080` in the Dockerfile
+  force_https = true
+  auto_stop_machines = "off"          # the scanner works between visits: never stop the Machine when the site is idle
+  auto_start_machines = true          # start it again on a visit if it was stopped (e.g. `fly machine stop`)
+  min_machines_running = 1
+  processes = ["app"]
+
+  [http_service.concurrency]
+    type = "requests"
+    soft_limit = 50
+    hard_limit = 100
+
+  # 200 while the database answers; 503 when it can't be read. The scanner's state is in the JSON, not the status
+  # code, so a stopped scanner (e.g. no API key yet) doesn't take the website down.
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "30s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"
