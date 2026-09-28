@@ -1,0 +1,81 @@
+{#- /admin/users: every account with its role, status, last sign-in and alert channels, and what an admin can change. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% import "admin/_link.html" as links with context %}
+{% block content %}
+{% include "admin/_tabs.html" %}
+{% if shown_link %}{{ links.shown(shown_link, base_url_set) }}{% endif %}
+
+<p class="section-lede">{{ rows|length|plural("account") }}, {{ admins|plural("active admin") }}. New people come in through <a href="/admin/invites">invites</a>.</p>
+
+{% if rows %}
+<div class="card card-flush">
+  <div class="table-wrap">
+    <table class="table table-stack users-table">
+      <thead>
+        <tr>
+          <th scope="col">Account</th>
+          <th scope="col">Role</th>
+          <th scope="col">Status</th>
+          <th scope="col">Last sign-in</th>
+          <th scope="col">Alerts to</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        {% set account = row.user %}
+        <tr id="user-{{ account.id }}">
+          <td class="primary">
+            <strong>{{ account.label }}</strong>{% if row.is_me %} <span class="badge badge-outline">you</span>{% endif %}
+            {% if account.name %}<span class="user-email small muted">{{ account.email }}</span>{% endif %}
+            <span class="user-meta tiny faint">Joined {{ account.created|day }}{% if row.only_admin %} · the only admin who can sign in{% endif %}</span>
+          </td>
+          <td data-label="Role">{% if account.is_admin %}<span class="badge badge-info">Admin</span>{% else %}<span class="badge badge-outline">Member</span>{% endif %}</td>
+          <td data-label="Status">
+            {% if row.status == "disabled" %}<span class="badge badge-bad">Disabled</span>
+            {% elif row.status == "no password" %}<span class="badge badge-warn">No password yet</span>
+            {% else %}<span class="badge badge-ok">Active</span>{% endif %}
+          </td>
+          <td data-label="Last sign-in">{% if account.last_login %}{{ ui.time(account.last_login) }}{% else %}<span class="muted">never</span>{% endif %}</td>
+          <td data-label="Alerts to">
+            <span class="cluster channel-list">
+              {% for label, working in row.channels %}
+              {% if working %}<span class="badge badge-info">{{ label }}</span>{% else %}<span class="badge badge-warn" title="The server has no settings for this channel any more, so nothing is sent">{{ label }} (not sent)</span>{% endif %}
+              {% else %}
+              <span class="muted">no channel</span>
+              {% endfor %}
+            </span>
+          </td>
+          <td class="actions" data-label="">
+            <div class="cluster admin-row-actions">
+              {% if account.is_admin %}
+              {% if not row.only_admin %}{{ ui.post_button("/admin/users/" ~ account.id ~ "/role", "Make member", css="btn btn-small", confirm=("Make yourself a member? You lose access to the admin pages." if row.is_me else "Make " ~ account.email ~ " a member? They lose access to the admin pages."), fields={"role": "member"}) }}{% endif %}
+              {% else %}
+              {{ ui.post_button("/admin/users/" ~ account.id ~ "/role", "Make admin", css="btn btn-small", confirm="Make " ~ account.email ~ " an admin? They can then manage users, invites and the scanner.", fields={"role": "admin"}) }}
+              {% endif %}
+              {% if account.disabled %}
+              {{ ui.post_button("/admin/users/" ~ account.id ~ "/enable", "Enable", css="btn btn-small") }}
+              {% else %}
+              {{ ui.post_button("/admin/users/" ~ account.id ~ "/password-link", "Reset link" if account.has_password else "Setup link", css="btn btn-small") }}
+              {% if not row.is_me and not row.only_admin %}{{ ui.post_button("/admin/users/" ~ account.id ~ "/disable", "Disable", css="btn btn-small btn-danger", confirm="Disable " ~ account.email ~ "? They are signed out at once, can't sign in and get no more alerts.") }}{% endif %}
+              {% endif %}
+            </div>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+{% else %}
+{{ ui.empty_state("No accounts", "Invite someone to create the first one.", "/admin/invites", "Invite someone") }}
+{% endif %}
+
+<div class="card stack-sm admin-help small">
+  <h2 class="section-title">What these do</h2>
+  <p><strong>Reset link</strong> (or <strong>Setup link</strong> for an account without a password): a link to choose a password, valid once for 48 hours. It is shown to you once, to send to the person yourself; using it signs them out everywhere.</p>
+  <p><strong>Disable</strong>: signs the person out at once; they can't sign in and get no alerts until the account is enabled again. Nothing of theirs is deleted.</p>
+  <p><strong>Make admin</strong>: admins see these pages, invite people and control the scanner. The last admin who can sign in can't be made a member or disabled.</p>
+</div>
+{% endblock %}

@@ -1,0 +1,25 @@
+{#- A new invite or password link, shown once (admin.OneTimeLink): the link to copy, who it is for and until when it
+    works. Import with {% import "admin/_link.html" as links with context %} and call links.shown(link, base_url_set). -#}
+{% import "_macros.html" as ui with context %}
+{% macro shown(link, base_url_set) -%}
+<section class="callout callout-info one-time-link" id="new-link" aria-labelledby="new-link-title">
+  <h2 class="section-title" id="new-link-title">
+    {%- if link.kind == "invite" %}New invite link{% elif link.purpose == "setup" %}New setup link{% else %}New password reset link{% endif -%}
+  </h2>
+  <p>
+    {% if link.kind == "invite" %}
+    For {{ link.email or "anyone with the link" }}{% if link.role == "admin" %}, as an admin{% endif %}.
+    {% if link.emailed %}It was emailed to {{ link.email }}; you can also send it yourself.{% else %}Send it to them yourself, e.g. in a private message.{% endif %}
+    {% else %}
+    For {{ link.email }}: it lets them {% if link.purpose == "setup" %}set their password{% else %}choose a new password, which signs them out everywhere{% endif %}.
+    {% endif %}
+    It works once, until {{ ui.time(link.expires, relative=false) }}.
+  </p>
+  <div class="copy-row">
+    <label class="visually-hidden" for="new-link-url">The link</label>
+    <input class="input" id="new-link-url" type="text" value="{{ link.url }}" readonly data-select-on-focus autocomplete="off" spellcheck="false">
+    <button class="btn btn-primary js-only" type="button" data-copy="#new-link-url">Copy</button>
+  </div>
+  <p class="small"><strong>It is shown only this once</strong>: the site keeps no copy it could show again. Anyone with the link can use it, so share it only with the person it is for.{% if not base_url_set %} BASE_URL isn't set, so the link uses the address of this page.{% endif %}</p>
+</section>
+{%- endmacro %}

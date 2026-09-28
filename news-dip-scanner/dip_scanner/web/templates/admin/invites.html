@@ -1,0 +1,114 @@
+{#- /admin/invites: create an invite (optionally emailed), the pending ones (revoke) and the earlier ones. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% import "admin/_link.html" as links with context %}
+{% block content %}
+{% include "admin/_tabs.html" %}
+{% if shown_link %}{{ links.shown(shown_link, base_url_set) }}{% endif %}
+
+<section class="card" id="invite" aria-labelledby="invite-title">
+  <h2 class="section-title" id="invite-title">Invite someone</h2>
+  <p class="section-lede">Nobody can sign up without an invite. Each link works once, for 7 days, and creates one account.</p>
+  {% if error %}<div class="flash flash-error" role="alert"><p>{{ error }}</p></div>{% endif %}
+  <form class="form" method="post" action="/admin/invites" novalidate>
+    {{ ui.csrf_field() }}
+    <div class="field-row">
+      {{ ui.field("email", "Their email (optional)", value=values.email, type="email", help="With an address, only that address can use the link. Without one, anyone who has the link can.", autocomplete="off", attrs={"autocapitalize": "none", "spellcheck": "false"}) }}
+      <div class="field">
+        <label for="f-role">Role</label>
+        <select class="select" id="f-role" name="role" aria-describedby="f-role-help">
+          {% for role in roles %}
+          <option value="{{ role }}"{% if role == values.role %} selected{% endif %}>{{ role|capitalize }}</option>
+          {% endfor %}
+        </select>
+        <p class="help" id="f-role-help">Admins also manage users, invites and the scanner.</p>
+      </div>
+    </div>
+    {% if can_email %}
+    <label class="check"><input type="checkbox" name="send_email" value="on"{% if values.send_email %} checked{% endif %}> <span>Email the link to that address as well (from the server's email settings)</span></label>
+    {% else %}
+    <p class="help">The server has no email settings (SMTP_HOST and a sender), so copy the link and send it yourself.</p>
+    {% endif %}
+    <div class="form-actions">
+      <button class="btn btn-primary" type="submit">Create invite link</button>
+    </div>
+  </form>
+</section>
+
+<section class="admin-section" id="pending" aria-labelledby="pending-title">
+  <h2 id="pending-title">Pending invites</h2>
+  {% if pending %}
+  <div class="card card-flush">
+    <div class="table-wrap">
+      <table class="table table-stack invites-table">
+        <thead>
+          <tr>
+            <th scope="col">For</th>
+            <th scope="col">Role</th>
+            <th scope="col">Created</th>
+            <th scope="col">Expires</th>
+            <th scope="col"><span class="visually-hidden">Actions</span></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in pending %}
+          {% set invite = row.invite %}
+          <tr>
+            <td class="primary">{{ invite.email or "Anyone with the link" }}</td>
+            <td data-label="Role">{% if invite.role == "admin" %}<span class="badge badge-info">Admin</span>{% else %}<span class="badge badge-outline">Member</span>{% endif %}</td>
+            <td data-label="Created"><span>{{ ui.time(invite.created) }}{% if row.created_by %} <span class="small muted">by {{ row.created_by }}</span>{% elif invite.created_by is none %} <span class="small muted">on the command line</span>{% endif %}</span></td>
+            <td data-label="Expires">{{ ui.time(invite.expires) }}</td>
+            <td class="actions" data-label="">{{ ui.post_button("/admin/invites/revoke", "Revoke", css="btn btn-small btn-danger", confirm="Revoke the invite for " ~ (invite.email or "anyone with the link") ~ "? Its link stops working at once.", fields={"invite": invite.token_hash}) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <p class="small muted">The site keeps only a fingerprint of each link, not the link, so a pending invite's link can't be shown again. If one was lost, revoke it and create a new invite.</p>
+  {% else %}
+  {{ ui.empty_state("No pending invites", "Create one above: the person gets a link to create their account.") }}
+  {% endif %}
+</section>
+
+<section class="admin-section" id="earlier" aria-labelledby="earlier-title">
+  <h2 id="earlier-title">Earlier invites</h2>
+  {% if others %}
+  <div class="card card-flush">
+    <div class="table-wrap">
+      <table class="table table-stack invites-table">
+        <thead>
+          <tr>
+            <th scope="col">For</th>
+            <th scope="col">Role</th>
+            <th scope="col">Status</th>
+            <th scope="col">Created</th>
+            <th scope="col">What happened</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in others %}
+          {% set invite = row.invite %}
+          <tr>
+            <td class="primary">{{ invite.email or "Anyone with the link" }}</td>
+            <td data-label="Role">{{ invite.role|capitalize }}</td>
+            <td data-label="Status"><span class="badge badge-{{ row.badge }}">{{ row.status|capitalize }}</span></td>
+            <td data-label="Created"><span>{{ ui.time(invite.created) }}{% if row.created_by %} <span class="small muted">by {{ row.created_by }}</span>{% elif invite.created_by is none %} <span class="small muted">on the command line</span>{% endif %}</span></td>
+            <td data-label="What happened"><span>
+              {%- if row.status == "used" %}Used {{ ui.time(invite.used_at) }}{% if row.used_by %} by {{ row.used_by }}{% endif %}
+              {%- elif row.status == "revoked" %}Revoked before it was used
+              {%- else %}Expired {{ ui.time(invite.expires) }} unused
+              {%- endif -%}
+            </span></td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% if hidden %}<p class="small muted">{{ hidden|plural("older invite isn't", "older invites aren't") }} listed.</p>{% endif %}
+  {% else %}
+  <p class="muted">None yet: used, revoked and expired invites are listed here.</p>
+  {% endif %}
+</section>
+{% endblock %}

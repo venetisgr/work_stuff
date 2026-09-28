@@ -1,0 +1,250 @@
+/* Dip scanner: the admin pages' own styles (base.html includes this after app.css). They only compose app.css's
+   tokens; light and dark come from there. No inline styles anywhere (the Content-Security-Policy forbids them). */
+
+/* --- tabs: Scanner / Users / Invites ------------------------------------------------------------------------------ */
+
+.admin-tabs {
+  display: flex;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-4);
+  border-bottom: 1px solid var(--line);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.admin-tabs::-webkit-scrollbar {
+  display: none;
+}
+
+.admin-tabs a:focus-visible {
+  outline-offset: -3px;
+}
+
+.admin-tabs a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--tap);
+  padding: 0 var(--space-4);
+  margin-bottom: -1px;
+  border-bottom: 3px solid transparent;
+  color: var(--muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.admin-tabs a:hover {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.admin-tabs a[aria-current="page"] {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+
+/* --- layout ------------------------------------------------------------------------------------------------------ */
+
+.admin-top {
+  margin-bottom: var(--space-5);
+}
+
+.admin-section {
+  margin-top: var(--space-6);
+}
+
+.admin-section > h2 {
+  font-size: 1.1875rem;
+  margin: 0 0 var(--space-3);
+}
+
+.admin-section > * + * {
+  margin-top: var(--space-3);
+}
+
+.admin-actions {
+  margin-top: var(--space-4);
+}
+
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 120px), 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-3);
+}
+
+.admin-help {
+  margin-top: var(--space-5);
+  color: var(--muted);
+}
+
+.admin-help strong {
+  color: var(--ink);
+}
+
+.card-note {
+  padding: var(--space-3) var(--space-4);
+  border-top: 1px solid var(--line);
+}
+
+.card-note p {
+  margin: 0;
+}
+
+.card-note p + p {
+  margin-top: var(--space-1);
+}
+
+/* --- cycles ------------------------------------------------------------------------------------------------------ */
+
+.cycle-list {
+  margin: 0;
+}
+
+.cycle-list > li {
+  padding: var(--space-3) 0;
+}
+
+.cycle-summary {
+  margin: var(--space-2) 0 var(--space-1);
+  font-size: 0.9375rem;
+  overflow-wrap: anywhere;
+}
+
+.cycle-notes {
+  margin-top: var(--space-2);
+  font-size: 0.875rem;
+}
+
+details.cycle-notes > summary {
+  font-weight: 600;
+  padding: 10px 0;
+  cursor: pointer;
+}
+
+.cycle-note-list {
+  margin: 0;
+  padding-left: 1.25rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.cycle-note-list li + li {
+  margin-top: var(--space-1);
+}
+
+/* --- tables ------------------------------------------------------------------------------------------------------ */
+
+.usage-table .total-row td {
+  font-weight: 700;
+  background: var(--surface-2);
+}
+
+.price-note {
+  max-width: 72ch;
+}
+
+.feed-note {
+  margin: var(--space-1) 0 0;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.feed-note.is-error {
+  color: var(--bad);
+}
+
+.user-email,
+.user-meta {
+  display: block;
+  overflow-wrap: anywhere;
+}
+
+.channel-list {
+  gap: var(--space-1);
+}
+
+.users-table td.actions,
+.invites-table td.actions {
+  white-space: normal;
+}
+
+.admin-row-actions {
+  justify-content: flex-end;
+}
+
+@media (max-width: 639.98px) {
+  .hide-narrow {
+    display: none;
+  }
+
+  .usage-table .total-row {
+    background: var(--surface-2);
+  }
+
+  .usage-table .total-row td {
+    background: transparent;
+  }
+
+  .admin-row-actions {
+    justify-content: flex-start;
+    padding-top: var(--space-2);
+  }
+
+  /* the stacked rows of the model-use and feed tables in two columns: their label-value pairs are short */
+  .usage-table.table-stack tr,
+  .feed-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: var(--space-5);
+  }
+
+  .usage-table.table-stack td,
+  .feed-table td {
+    width: calc(50% - var(--space-5) / 2);
+  }
+
+  .usage-table.table-stack td.primary,
+  .feed-table td.primary {
+    width: 100%;
+  }
+
+  /* a feed's status badge says what it is: no label, and the whole line for a long error state */
+  .feed-table td[data-label="Status"] {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .feed-table td[data-label="Status"]::before {
+    content: none;
+  }
+
+  /* "Last fetch 12 min ago" needs more room than "Articles 20" */
+  .feed-table td[data-label="Last fetch"] {
+    width: calc(60% - var(--space-5) / 2);
+    white-space: nowrap;
+  }
+
+  .feed-table td[data-label="Articles"] {
+    width: calc(40% - var(--space-5) / 2);
+  }
+}
+
+/* --- a link shown once ------------------------------------------------------------------------------------------- */
+
+.one-time-link {
+  margin-bottom: var(--space-5);
+}
+
+.one-time-link > * + * {
+  margin-top: var(--space-3);
+}
+
+.one-time-link p {
+  margin-bottom: 0;
+}
+
+/* The copy button needs app.js; without it the link is selected when focused, to copy by hand. */
+html:not(.js) .js-only {
+  display: none;
+}

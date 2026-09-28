@@ -1,8 +1,230 @@
-{#- A first admin page from the website's foundation; the admin pages replace it. -#}
+{#- /admin: the scanner's state and controls, what the model cost, the recent cycles and the feeds' health. -#}
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
 {% block content %}
-<div class="page-header"><h1>Admin</h1></div>
-{{ ui.status_strip(status) }}
-{{ ui.empty_state("More coming soon", "Users, invites, scanner controls and model spend will be here.") }}
+{% include "admin/_tabs.html" %}
+{{ ui.status_strip(status, calls_today=today.calls) }}
+
+<div class="grid-2 admin-top">
+  <section class="card" aria-labelledby="scanner-title">
+    <h2 class="section-title" id="scanner-title">Scanner</h2>
+    <p class="section-lede">
+      {% if status.state == "running" %}Every cycle fetches the feeds, has the model triage the new articles, checks which companies' shares fell and analyses those dips.
+      {% elif status.state == "paused" %}Paused: no news is checked and no alerts go out until you resume it. "Run a cycle now" still runs one.
+      {% elif status.state == "stalled" %}No cycle has finished for a while, although the scanner should be running. The log (<span class="mono">fly logs</span>) says why; a cycle may be stuck on a slow network request.
+      {% elif status.state == "disabled" %}The scanner doesn't run in this process (SCANNER_ENABLED=false or <span class="mono">serve --no-scanner</span>): the pages show what is already in the database.
+      {% elif status.can_restart %}It stopped on a setup problem (above). Fix it first, e.g. add credit with the provider or set the right key with <span class="mono">fly secrets set</span>, then start it again.
+      {% else %}It couldn't be set up in this process. Fix the problem above and restart the website.
+      {% endif %}
+    </p>
+    <dl class="kv">
+      <div><dt>Checks the news</dt><dd>every {{ status.interval_minutes|number }} min</dd></div>
+      {% if status.running_since %}<div><dt>Running since</dt><dd>{{ ui.time(status.running_since) }}</dd></div>{% endif %}
+      {% if status.cycle_started %}
+      <div><dt>A cycle is running</dt><dd>since {{ status.cycle_started|clock }}</dd></div>
+      {% elif status.next_cycle_at and status.state in ("running", "paused", "stalled") %}
+      <div><dt>Next cycle</dt><dd>{{ ui.time(status.next_cycle_at) }}</dd></div>
+      {% endif %}
+      <div><dt>Last cycle</dt><dd>{{ ui.time(status.last_cycle_at) }}{% if status.last_cycle and not status.last_cycle.ok %} <span class="badge badge-bad">failed</span>{% endif %}</dd></div>
+      {% if last_ok %}<div><dt>Last cycle that worked</dt><dd>{{ ui.time(last_ok.finished or last_ok.started) }}</dd></div>{% endif %}
+    </dl>
+    <div class="form-actions admin-actions">
+      {% if status.can_run_now %}{{ ui.post_button("/admin/scanner/run", "Run a cycle now", css="btn btn-primary") }}{% endif %}
+      {% if status.can_restart %}{{ ui.post_button("/admin/scanner/restart", "Start again", css="btn btn-primary") }}{% endif %}
+      {% if paused %}
+      {{ ui.post_button("/admin/scanner/resume", "Resume", css="btn btn-primary" if not status.can_run_now else "btn btn-secondary") }}
+      {% elif status.state != "disabled" %}
+      {{ ui.post_button("/admin/scanner/pause", "Pause", confirm="Pause the scanner? No news is checked and no alerts go out until you resume it.") }}
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card" aria-labelledby="spend-title">
+    <h2 class="section-title" id="spend-title">Model cost</h2>
+    <p class="section-lede">An estimate at list prices, in US dollars. Your provider's bill is what counts.</p>
+    <div class="admin-stats">
+      <div class="stat">
+        <span class="stat-label">Today (from 00:00 UTC)</span>
+        <span class="stat-value">{{ today.cost_text }}</span>
+        <span class="small muted">{{ today.calls|plural("call") }}</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">{{ week.label }}</span>
+        <span class="stat-value">{{ week.cost_text }}</span>
+        <span class="small muted">{{ week.calls|plural("call") }}</span>
+      </div>
+      {% if month %}
+      <div class="stat">
+        <span class="stat-label">A 30-day month</span>
+        <span class="stat-value">≈ {{ month.cost_text }}</span>
+        <span class="small muted">at the average of {{ month.days|plural("full day") }}</span>
+      </div>
+      {% endif %}
+    </div>
+    <p class="small"><a href="#model-use">Per step, model and day</a></p>
+  </section>
+</div>
+
+<section class="admin-section" id="cycles" aria-labelledby="cycles-title">
+  <h2 id="cycles-title">Recent cycles</h2>
+  {% if cycles %}
+  <div class="card">
+    <ol class="list cycle-list">
+      {% for item in cycles %}
+      {% set cycle = item.record %}
+      <li>
+        <div class="split">
+          <span class="cluster">
+            <strong>{{ ui.time(cycle.started, relative=false) }}</strong>
+            {% if cycle.ok %}<span class="badge badge-ok">OK</span>{% else %}<span class="badge badge-bad">Failed</span>{% endif %}
+          </span>
+          <span class="small muted">{% if item.duration %}took {{ item.duration }}{% else %}didn't finish{% endif %}</span>
+        </div>
+        <p class="cycle-summary">{{ item.summary }}</p>
+        {% if item.facts %}<p class="meta">{% for fact in item.facts %}<span>{{ fact }}</span>{% endfor %}</p>{% endif %}
+        {% if cycle.notes %}
+        <details class="disclosure cycle-notes">
+          <summary>{{ cycle.notes|length|plural("note") }}</summary>
+          <ul class="cycle-note-list">
+            {% for note in cycle.notes %}<li>{{ note }}</li>{% endfor %}
+          </ul>
+        </details>
+        {% endif %}
+      </li>
+      {% endfor %}
+    </ol>
+  </div>
+  {{ ui.pagination(page) }}
+  {% else %}
+  {{ ui.empty_state("No cycles yet", "Each cycle of the scanner is listed here with its summary and its notes on what was left out and why.") }}
+  {% endif %}
+</section>
+
+<section class="admin-section" id="model-use" aria-labelledby="usage-title">
+  <h2 id="usage-title">Model use and estimated cost</h2>
+  <div class="grid-2">
+    {% for period in (today, week) %}
+    <div class="card card-flush">
+      <div class="card-header">
+        <h3>{{ period.label }}</h3>
+        <span class="small muted">since {{ period.since|when }}</span>
+      </div>
+      {% if period.rows %}
+      <div class="table-wrap">
+        <table class="table table-stack usage-table">
+          <thead>
+            <tr>
+              <th scope="col">Step and model</th>
+              <th scope="col" class="num">Calls</th>
+              <th scope="col" class="num">Tokens in</th>
+              <th scope="col" class="num">Tokens out</th>
+              <th scope="col" class="num">Est. cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in period.rows %}
+            <tr>
+              <td class="primary">{{ row.step_label }} <span class="mono small muted">{{ row.model }}</span></td>
+              <td class="num" data-label="Calls">{{ row.calls|number }}</td>
+              <td class="num" data-label="Tokens in">{{ row.input_tokens|tokens }}</td>
+              <td class="num" data-label="Tokens out">{{ row.output_tokens|tokens }}</td>
+              <td class="num" data-label="Est. cost">{{ row.cost_text }}</td>
+            </tr>
+            {% endfor %}
+            <tr class="total-row">
+              <td class="primary">Total</td>
+              <td class="num" data-label="Calls">{{ period.calls|number }}</td>
+              <td class="num" data-label="Tokens in">{{ period.input_tokens|tokens }}</td>
+              <td class="num" data-label="Tokens out">{{ period.output_tokens|tokens }}</td>
+              <td class="num" data-label="Est. cost">{{ period.cost_text }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      {% if period.unmetered or period.unpriced %}
+      <div class="card-note small muted">
+        {% if period.unmetered %}<p>{{ period.unmetered|plural("call") }} came back without token counts: {{ "its" if period.unmetered == 1 else "their" }} tokens aren't in these figures.</p>{% endif %}
+        {% if period.unpriced %}<p>No price is known for {{ period.unpriced|join(", ") }}: {{ "its" if period.unpriced|length == 1 else "their" }} calls aren't in the cost.</p>{% endif %}
+      </div>
+      {% endif %}
+      {% else %}
+      <p class="card-note muted">No model calls.</p>
+      {% endif %}
+    </div>
+    {% endfor %}
+  </div>
+
+  <div class="card card-flush">
+    <div class="card-header"><h3>Per day (UTC)</h3></div>
+    <div class="table-wrap">
+      <table class="table usage-table day-table">
+        <thead>
+          <tr>
+            <th scope="col">Day</th>
+            <th scope="col" class="num">Calls</th>
+            <th scope="col" class="num hide-narrow">Tokens in</th>
+            <th scope="col" class="num hide-narrow">Tokens out</th>
+            <th scope="col" class="num">Est. cost</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for day in days %}
+          <tr>
+            <td>{{ day.day.strftime("%a %d %b") }}{% if loop.first %} <span class="small muted">(so far)</span>{% endif %}</td>
+            <td class="num">{{ day.calls|number }}</td>
+            <td class="num hide-narrow">{{ day.input_tokens|tokens }}</td>
+            <td class="num hide-narrow">{{ day.output_tokens|tokens }}</td>
+            <td class="num">{{ day.cost_text }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  <p class="small muted price-note">
+    Estimates at {{ prices.source }} per million tokens, checked on {{ prices.checked.strftime("%d %b %Y") }}:
+    {% for name, text in price_list %}<span class="mono">{{ name }}</span> {{ text }}{% if not loop.last %}; {% endif %}{% endfor %}.
+    Reasoning is billed as output. Prices change, cached input may cost less and an Azure deployment has its own prices: the provider's usage page has what you really pay. A "+" marks a day with calls to a model without a known price.
+  </p>
+</section>
+
+<section class="admin-section" id="feeds" aria-labelledby="feeds-title">
+  <h2 id="feeds-title">News feeds</h2>
+  <p class="section-lede">
+    {{ feeds|length|plural("enabled feed") }}{% if feed_problems %}, {{ feed_problems }} with problems{% endif %}.
+    {% if feeds_off %}{{ feeds_off|plural("more is", "more are") }} switched off in feeds.toml.{% endif %}
+    Articles are kept for 30 days.
+  </p>
+  {% if feeds %}
+  <div class="card card-flush">
+    <div class="table-wrap">
+      <table class="table table-stack feed-table">
+        <thead>
+          <tr>
+            <th scope="col">Feed</th>
+            <th scope="col">Status</th>
+            <th scope="col">Last fetch</th>
+            <th scope="col" class="num">Articles</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for feed in feeds %}
+          <tr>
+            <td class="primary">
+              <strong>{{ feed.name }}</strong> <span class="small faint">{{ feed.url|host }}</span>
+              {% if feed.error %}<p class="feed-note small{% if feed.state == 'failing' %} is-error{% endif %}">{{ feed.error }}</p>{% endif %}
+            </td>
+            <td data-label="Status"><span><span class="badge badge-{{ feed.badge }}">{{ feed.label }}</span>{% if feed.last_status %} <span class="small muted num">HTTP {{ feed.last_status }}</span>{% endif %}</span></td>
+            <td data-label="Last fetch">{{ ui.time(feed.last_fetch) }}</td>
+            <td class="num" data-label="Articles">{{ feed.articles|number }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% else %}
+  {{ ui.empty_state("No feeds", "feeds.toml has no enabled feeds, so the scanner has no news to read.") }}
+  {% endif %}
+</section>
 {% endblock %}

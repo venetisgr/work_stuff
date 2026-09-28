@@ -1,0 +1,9 @@
+{#- The admin pages' heading and tabs. admin_tab: "scanner", "users" or "invites". -#}
+<div class="page-header">
+  <h1>Admin</h1>
+</div>
+<nav class="admin-tabs" aria-label="Admin pages">
+  <a href="/admin"{% if admin_tab == "scanner" %} aria-current="page"{% endif %}>Scanner</a>
+  <a href="/admin/users"{% if admin_tab == "users" %} aria-current="page"{% endif %}>Users</a>
+  <a href="/admin/invites"{% if admin_tab == "invites" %} aria-current="page"{% endif %}>Invites</a>
+</nav>
