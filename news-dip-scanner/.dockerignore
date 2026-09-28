@@ -29,3 +29,6 @@ htmlcov/
 tests/
 docs/
 fly.toml
+
+# The Next.js front end: Vercel builds it, and its node_modules and .next alone are hundreds of MB
+frontend/

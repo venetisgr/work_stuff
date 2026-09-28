@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import os
 import re
 import shlex
+import shutil
 import socket
+import subprocess
 import tomllib
 from pathlib import Path
 
@@ -32,6 +35,8 @@ FLY_TOML = PROJECT / "fly.toml"
 DOCKERFILE = PROJECT / "Dockerfile"
 DOCKERIGNORE = PROJECT / ".dockerignore"
 DEPLOY_MD = PROJECT / "docs" / "DEPLOY.md"
+VERCEL_MD = PROJECT / "docs" / "VERCEL.md"
+FRONTEND = PROJECT / "frontend"
 WORKFLOW = REPOSITORY / ".github" / "workflows" / "news-dip-scanner.yml"
 
 # Fly.io's regions on 2026-09-28 (https://fly.io/docs/reference/regions/); otp (Bucharest) and the other former
@@ -173,6 +178,9 @@ def test_dockerignore_keeps_secrets_and_data_out_but_not_what_the_dockerfile_cop
 
     for secret in (".env", ".env.local", "data/scanner.sqlite3", "tests/test_web.py", "dip_scanner/__pycache__/x.pyc"):
         assert ignored(secret), secret
+    # the front end is Vercel's: a local `fly deploy` must not upload its node_modules to the builder
+    for path in ("frontend/package.json", "frontend/node_modules/next/package.json", "frontend/.next/BUILD_ID"):
+        assert ignored(path), path
     needed = (
         "Dockerfile",
         "pyproject.toml",
@@ -314,16 +322,15 @@ def test_workflow_structure():
     workflow = yaml.safe_load(workflow_text())
     triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 reads a bare `on` as true
     for event in ("pull_request", "push"):
-        # The Next.js front end (Vercel deploys it) alone neither tests nor restarts the scanner.
-        assert triggers[event]["paths"] == [
-            "news-dip-scanner/**",
-            "!news-dip-scanner/frontend/**",
-            ".github/workflows/news-dip-scanner.yml",
-        ]
+        assert triggers[event]["paths"] == ["news-dip-scanner/**", ".github/workflows/news-dip-scanner.yml"]
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {"contents": "read"}
 
+    changes = workflow["jobs"]["changes"]
+    assert set(changes["outputs"]) == {"app", "python", "frontend"}
+
     test = workflow["jobs"]["test"]
+    assert test["needs"] == "changes" and test["if"] == "needs.changes.outputs.python == 'true'"
     assert test["defaults"]["run"]["working-directory"] == "news-dip-scanner"
     python = next(step for step in test["steps"] if str(step.get("uses", "")).startswith("actions/setup-python"))
     assert str(python["with"]["python-version"]) == "3.12"
@@ -333,11 +340,21 @@ def test_workflow_structure():
     assert "ruff format --check ." in commands
     assert any(command.startswith("python -m pytest") for command in commands)
 
+    frontend = workflow["jobs"]["frontend"]
+    assert frontend["needs"] == "changes" and frontend["if"] == "needs.changes.outputs.frontend == 'true'"
+    assert frontend["defaults"]["run"]["working-directory"] == "news-dip-scanner/frontend"
+    node = next(step for step in frontend["steps"] if str(step.get("uses", "")).startswith("actions/setup-node"))
+    assert str(node["with"]["node-version"]) == "22"  # package.json's engines, and Vercel's Node.js version
+    assert node["with"]["cache-dependency-path"] == "news-dip-scanner/frontend/package-lock.json"
+    commands = [step.get("run", "") for step in frontend["steps"]]
+    assert commands[-5:] == ["npm ci", "npm run lint", "npm run typecheck", "npm test", "npm run build"]
+
     deploy = workflow["jobs"]["deploy"]
-    assert deploy["needs"] == "test"
+    assert deploy["needs"] == ["changes", "test"]
     condition = " ".join(deploy["if"].split())
     assert condition == (
-        "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
+        "github.ref == 'refs/heads/main' && needs.changes.outputs.app == 'true' && "
+        "(github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
     )
     assert deploy["env"]["FLY_API_TOKEN"] == "${{ secrets.FLY_API_TOKEN }}"
     assert deploy["concurrency"]["cancel-in-progress"] is False  # never cut a deploy off halfway
@@ -348,6 +365,37 @@ def test_workflow_structure():
     assert run["working-directory"] == "news-dip-scanner"
     assert run["run"].startswith("flyctl deploy --remote-only")
     assert "--ha=false" in run["run"]
+
+
+def run_changes(files: str, tmp_path: Path) -> dict[str, str]:
+    """The changes job's script on a list of changed files: its app, python and frontend outputs."""
+    yaml = pytest.importorskip("yaml")
+    if shutil.which("bash") is None:
+        pytest.skip("no bash")
+    script = yaml.safe_load(workflow_text())["jobs"]["changes"]["steps"][-1]["run"]
+    body = script[script.index("printf '%s\\n' \"$files\"") :]
+    output = tmp_path / "output"
+    env = {"PATH": os.environ.get("PATH", ""), "FILES": files, "GITHUB_OUTPUT": str(output)}
+    command = ["bash", "-eo", "pipefail", "-c", 'files="$FILES"\n' + body]  # the runner's bash options
+    subprocess.run(command, env=env, check=True, capture_output=True)
+    return dict(line.split("=", 1) for line in output.read_text().split())
+
+
+@pytest.mark.parametrize(
+    ("files", "expected"),
+    [
+        ("news-dip-scanner/dip_scanner/web/api.py", ("true", "true", "false")),
+        ("news-dip-scanner/frontend/src/lib/api.ts\nnews-dip-scanner/frontend/README.md", ("false", "false", "true")),
+        ("news-dip-scanner/frontend/contract/api-v1.schema.json", ("false", "true", "true")),
+        ("news-dip-scanner/README.md\nnews-dip-scanner/frontend/README.md", ("true", "true", "true")),
+        (".github/workflows/news-dip-scanner.yml", ("true", "true", "true")),
+        ("news-dip-scanner/frontend-notes.md", ("true", "true", "false")),
+    ],
+)
+def test_workflow_runs_and_deploys_only_what_changed(files, expected, tmp_path):
+    """A front-end change alone neither tests nor redeploys the Python app; a contract change tests both sides."""
+    outputs = run_changes(files, tmp_path)
+    assert (outputs["app"], outputs["python"], outputs["frontend"]) == expected
 
 
 # --- docs/DEPLOY.md ------------------------------------------------------------------------------------------------
@@ -363,18 +411,51 @@ def anchors(path: Path) -> set[str]:
     return {slug(line.lstrip("#")) for line in path.read_text(encoding="utf-8").splitlines() if line.startswith("#")}
 
 
-def test_deploy_guide_links_resolve():
-    text = DEPLOY_MD.read_text(encoding="utf-8")
+def assert_links_resolve(doc: Path) -> None:
+    """Every relative link of a Markdown file points at a file that exists, and at a heading of it that exists."""
+    text = doc.read_text(encoding="utf-8")
     for target in re.findall(r"\]\(([^)\s]+)\)", text):
         if target.startswith(("http://", "https://")):
             continue
         path, _, anchor = target.partition("#")
-        file = (DEPLOY_MD.parent / path).resolve() if path else DEPLOY_MD
-        if path.startswith("../../") and not (REPOSITORY / ".git").exists():
+        file = (doc.parent / path).resolve() if path else doc
+        if not file.is_relative_to(PROJECT) and not (REPOSITORY / ".git").exists():
             continue  # a file at the repository's root, and this copy isn't in the repository
-        assert file.exists(), f"DEPLOY.md links to a missing file: {target}"
+        assert file.exists(), f"{doc.name} links to a missing file: {target}"
         if anchor:
-            assert anchor in anchors(file), f"DEPLOY.md links to a missing heading: {target}"
+            assert anchor in anchors(file), f"{doc.name} links to a missing heading: {target}"
+
+
+def test_deploy_guide_links_resolve():
+    assert_links_resolve(DEPLOY_MD)
+
+
+@pytest.mark.parametrize("doc", [VERCEL_MD, FRONTEND / "README.md", FRONTEND / "e2e" / "README.md"])
+def test_front_end_guides_links_resolve(doc):
+    assert_links_resolve(doc)
+
+
+def test_vercel_guide_matches_the_front_end_and_the_fly_app():
+    """docs/VERCEL.md names the settings the front end and the Fly app really use."""
+    text = VERCEL_MD.read_text(encoding="utf-8")
+    vercel = json.loads((FRONTEND / "vercel.json").read_text(encoding="utf-8"))
+    assert vercel["regions"] == ["fra1"] and "`fra1`" in text  # Frankfurt, next to the Fly app
+    assert tomllib.loads(FLY_TOML.read_text(encoding="utf-8"))["primary_region"] == "fra"
+    package = json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))
+    assert package["engines"]["node"] == "22.x" and '"engines": {"node": "22.x"}' in text
+    assert "Root Directory" in text and "`news-dip-scanner/frontend`" in text
+    example = (FRONTEND / ".env.example").read_text(encoding="utf-8")
+    for name in ("DIP_API_ORIGIN", "DIP_PROXY_SECRET"):
+        assert f"`{name}`" in text and f"{name}=" in example
+    assert "NEXT_PUBLIC_" in text  # the warning never to expose them
+    for secret in ("PROXY_SECRET=", "BASE_URL=", "TRUSTED_ORIGINS="):
+        assert secret in text, secret
+    assert "Production branch" in text and "`main`" in text
+    assert "non-commercial" in text and "Deployment Protection" in text
+    # both guides point at each other, and the README at both
+    assert "(VERCEL.md)" in DEPLOY_MD.read_text(encoding="utf-8") and "(DEPLOY.md)" in text
+    readme = (PROJECT / "README.md").read_text(encoding="utf-8")
+    assert "(docs/VERCEL.md)" in readme and "(docs/DEPLOY.md)" in readme
 
 
 def test_readme_links_and_screenshots_resolve():

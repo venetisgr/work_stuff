@@ -1,20 +1,20 @@
-# news-dip-scanner: lint and test every pull request and push that touches the Python app, and deploy it to Fly.io
-# after a push to main, or by hand (Actions > news-dip-scanner > Run workflow, on main; on another branch it only
-# tests). Deploying needs the FLY_API_TOKEN repository secret (`fly tokens create deploy`); without it the deploy job
-# only says so. Changes to the Next.js front end alone (news-dip-scanner/frontend/, which Vercel deploys) don't run this
-# workflow, so they never restart the scanner on Fly.io. See news-dip-scanner/docs/DEPLOY.md.
+# news-dip-scanner: lint and test every pull request and push that touches the project, and deploy the Python app to
+# Fly.io after a push to main, or by hand (Actions > news-dip-scanner > Run workflow, on main; on another branch it
+# only tests). A change to the Next.js front end (news-dip-scanner/frontend/) runs its own checks; Vercel deploys it,
+# so a change to it alone never restarts the scanner on Fly.io. A change to the API contract
+# (frontend/contract/) runs both, since the Python tests check the API against it. Deploying needs the FLY_API_TOKEN
+# repository secret (`fly tokens create deploy`); without it the deploy job only says so. See
+# news-dip-scanner/docs/DEPLOY.md and docs/VERCEL.md.
 name: news-dip-scanner
 
 on:
   pull_request:
     paths:
       - "news-dip-scanner/**"
-      - "!news-dip-scanner/frontend/**"
       - ".github/workflows/news-dip-scanner.yml"
   push:
     paths:
       - "news-dip-scanner/**"
-      - "!news-dip-scanner/frontend/**"
       - ".github/workflows/news-dip-scanner.yml"
   workflow_dispatch:
 
@@ -28,8 +28,51 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  changes:
+    name: What changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      app: ${{ steps.diff.outputs.app }}
+      python: ${{ steps.diff.outputs.python }}
+      frontend: ${{ steps.diff.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      # app: the Python app (tested and deployed); python: its tests' inputs, which include the API contract;
+      # frontend: the Next.js app. A run by hand, a new branch or an unknown base checks everything.
+      - name: Compare with the base
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ] || ! git cat-file -e "${BASE:-none}^{commit}" 2>/dev/null; then
+            files=".github/workflows/news-dip-scanner.yml"
+          else
+            files=$(git diff --name-only "$BASE" HEAD)
+          fi
+          printf '%s\n' "$files"
+          has() { printf '%s\n' "$files" | grep -Eq "$1" && echo true || echo false; }
+          workflow=$(has '^\.github/workflows/news-dip-scanner\.yml$')
+          outside=$(printf '%s\n' "$files" | grep '^news-dip-scanner/' | grep -v '^news-dip-scanner/frontend/' || true)
+          app=$([ -n "$outside" ] || [ "$workflow" = true ] && echo true || echo false)
+          contract=$(has '^news-dip-scanner/frontend/contract/')
+          python=$([ "$app" = true ] || [ "$contract" = true ] && echo true || echo false)
+          frontend=$([ "$(has '^news-dip-scanner/frontend/')" = true ] || [ "$workflow" = true ] && echo true || echo false)
+          echo "app=$app python=$python frontend=$frontend"
+          {
+            echo "app=$app"
+            echo "python=$python"
+            echo "frontend=$frontend"
+          } >> "$GITHUB_OUTPUT"
+
   test:
     name: Lint and test
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -44,6 +87,7 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: news-dip-scanner/pyproject.toml
+      # dev brings pytest, ruff, jsonschema (the API's answers are checked against frontend/contract) and the SDKs
       - name: Install
         run: python -m pip install -e ".[dev,web]"
       - name: Ruff lint
@@ -53,13 +97,44 @@ jobs:
       - name: Tests
         run: python -m pytest -q
 
+  frontend:
+    name: Front end (Next.js)
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: news-dip-scanner/frontend
+    env:
+      NEXT_TELEMETRY_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: news-dip-scanner/frontend/package-lock.json
+      - name: Install
+        run: npm ci
+      - name: Lint
+        run: npm run lint
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Tests
+        run: npm test
+      - name: Build
+        run: npm run build
+
   deploy:
     name: Deploy to Fly.io
-    needs: test
-    # Only main is deployed: after a push to it, or when started by hand on it. Vercel's production branch is main too,
-    # so the front end and the API it calls go out from the same commits.
+    needs: [changes, test]
+    # Only main is deployed: after a push to it that changed the Python app, or when started by hand on it. Vercel's
+    # production branch is main too, so the front end and the API it calls go out from the same commits.
     if: >-
-      github.ref == 'refs/heads/main' &&
+      github.ref == 'refs/heads/main' && needs.changes.outputs.app == 'true' &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30

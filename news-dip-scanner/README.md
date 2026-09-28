@@ -11,7 +11,8 @@ decide.
 
 It runs from the command line, or as a small invite-only website for you and a few people you trust: one scanner (and
 one model bill) for everybody, and each person with their own watchlist, alert rules, alert channels, currency and time
-zone. The website deploys to Fly.io for about $4 a month plus the model.
+zone. The website runs on Fly.io for about $4 a month plus the models, with an optional Next.js front end on Vercel
+(free on its Hobby plan) as the address people use.
 
 **Contents:** [What it replicates](#what-it-replicates) · [How it works](#how-it-works) · [Setup](#setup) ·
 [Configuration](#configuration) · [Scanning Athens stocks](#scanning-athens-stocks) ·
@@ -682,15 +683,16 @@ scanner, and its model bill, is shared: each cycle serves everybody. Each person
 rules, alert channels, currency and time zone. The pages are made for a phone first, work without JavaScript and
 follow the system's light or dark mode; the footer of every page says that none of it is investment advice.
 
-![The idea page on a phone: verdict, chance of being higher, score, the price in HKD and about EUR, the 6-month chart with the idea's levels and the outcome so far](docs/screenshots/idea-mobile-light.png)
+![An idea on a phone, in the React front end: verdict, chance of being higher, score, the price in USD and about EUR, and the debate card, where GPT-5 changed its mind after Claude Sonnet 5's critique](docs/screenshots/idea-mobile-light.png)
 
-![The ideas dashboard on a desktop in dark mode: the scanner's status, a thesis change, the period and filters, and the ranked ideas with the reader's watchlist and alert rules marked](docs/screenshots/dashboard-desktop-dark.png)
+![The ideas on a desktop in dark mode, in the React front end: the period and filters, and the ranked ideas with the debate behind each, the reader's watchlist and alert rules marked and prices about EUR](docs/screenshots/dashboard-desktop-dark.png)
 
 ![The settings on a phone: alert rules, watchlist, the webhook channel, currency and time zone](docs/screenshots/settings-mobile-light.png)
 
 The screenshots come from a demo database: real news, prices and exchange rates of 28 September 2026, with a
-stand-in for the language model, so the analysis texts and verdicts are placeholders, not a model's judgement of
-these stocks.
+stand-in for the language models, so the analysis texts, debates and verdicts are placeholders, not a model's judgement
+of these stocks. The first two show the React pages of the [Vercel front door](#the-vercel-front-door), the third a
+page of the Fly app; the two halves share one look.
 
 | Page | What it shows |
 |---|---|
@@ -701,6 +703,9 @@ these stocks.
 | Track record (`/track`) | `dip-scanner track` for the last 30 days to 2 years, with the returns also in your currency, and the debate's model scoreboard once there were debates. Prices are downloaded at most once an hour. |
 | Settings (`/settings`) | Your alert rules, watchlist, channels, currency, time zone and name; a test alert; your password and your other signed-in devices. |
 | Admin (`/admin`) | For admins: the scanner (pause, resume, run a cycle now, start again after a setup problem), the recent cycles with their notes, the model's use today and in the last 7 days with its estimated cost (at the list prices under [Costs](#costs)), and the health of every feed. Users: roles, disabling, password links. Invites: create, revoke, see who used them. |
+
+Behind the [Vercel front door](#the-vercel-front-door) the ideas and an idea's page are its React versions, with the
+same content (the ideas as a table on a wide screen); every other page is the Fly app's own.
 
 "Analyse now" asks the model about one stock at once, whatever its price did, like `dip-scanner analyze`. Analyses
 run one at a time in the background; the page says how it is going and opens the idea when it is ready. A member can
@@ -735,16 +740,62 @@ the database keeps only a fingerprint of it. With `SMTP_*` set, the site can ema
 **Try it on your own computer.** Install it with `pip install -e ".[web]"`, put a `SECRET_KEY`,
 `BASE_URL=http://127.0.0.1:8080` and `COOKIE_SECURE=false` in `.env` (see [Website settings](#website-settings)),
 run `dip-scanner users add-admin you@example.com`, start `dip-scanner serve` and open the link it printed.
-`dip-scanner serve --no-scanner` serves the pages of an existing database without running cycles.
+`dip-scanner serve --no-scanner` serves the pages of an existing database without running cycles. With the front end
+in front of it, see [`frontend/README.md`](frontend/README.md) (and [`frontend/e2e/README.md`](frontend/e2e/README.md)
+for the end-to-end tests, which run both with stand-in models).
 
 ## Deploy to Fly.io
 
 The website is made to run on one [Fly.io](https://fly.io) Machine in Frankfurt (the nearest region to Greece), with
-the database on a Fly volume and HTTPS at `https://<your-app>.fly.dev` or your own domain, for about $3.85 a month
-plus the models. **[docs/DEPLOY.md](docs/DEPLOY.md) is the full step-by-step guide**, checked against Fly's
-documentation on 2026-09-28, with backups, restoring, updates, costs and troubleshooting. `fly.toml` sets the scanner
-up to [debate](#debate) every dip's analysis between OpenAI's and Anthropic's models, so it needs both keys. In short,
-with [flyctl](https://fly.io/docs/flyctl/install/) installed, in the `news-dip-scanner` folder:
+the database on a Fly volume, for about $3.85 a month plus the models, and with a [Next.js](https://nextjs.org) front
+end on [Vercel](https://vercel.com) as the only address people use (free on Vercel's Hobby plan). Fly runs the
+scanner, the database, the accounts and every rule; Vercel draws the ideas and each idea's page in React and passes
+everything else on to Fly:
+
+```
+ browser (an iPhone, a laptop)
+    │  https://dips.example.com, or https://<project>.vercel.app: the only address anybody uses
+    ▼
+ Vercel: Next.js (frontend/), functions in Frankfurt (fra1); preview deployments for every other branch
+    ├─ /  and  /ideas/<id>    React pages; their data from Fly's JSON API (/api/v1), read on the server with the
+    │                         visitor's session cookie
+    └─ every other path       passed through as it is: sign-in, invites, settings, news, track record, admin
+    │  + x-dip-proxy-secret (the Fly app answers nobody without it) and x-dip-client-ip (the visitor's address)
+    ▼
+ Fly.io: one Machine in Frankfurt (fra), https://<your-app>.fly.dev (of no use on its own)
+    FastAPI website + the scanner loop (news → triage → dips → debate → alerts) + SQLite on a 1 GB volume
+    ├─► OpenAI (triage, one debater) and Anthropic (the other debater); either can be the judge
+    ├─► Yahoo Finance, the SEC and ~20 news feeds
+    └─► each person's own Slack or Discord webhook (the alerts)
+```
+
+**[docs/DEPLOY.md](docs/DEPLOY.md)** (Fly, checked against Fly's documentation on 2026-09-28, with backups, restoring,
+updates, costs and troubleshooting) and **[docs/VERCEL.md](docs/VERCEL.md)** (the front door, checked against
+Vercel's and Next.js's on 2026-09-28) are the step-by-step guides: Fly first, on its own address, then Vercel in front
+of it. The site also works on Fly alone, without Vercel.
+
+### What you need
+
+- [ ] **A Fly.io account** with a payment card (about $3.85 a month for this app).
+- [ ] **A Vercel account** on the free Hobby plan, which is for personal, non-commercial use only: a site for you and a
+      few friends fits; charging them for it would need the Pro plan.
+- [ ] **An OpenAI API key and an Anthropic API key**, each with prepaid credit and a monthly spend limit set in the
+      provider's console (the debate costs two to five times as much per dip as one model: see [Costs](#costs)).
+- [ ] **A Slack or Discord incoming webhook** of your own (and each friend makes theirs), pasted on the website's
+      Settings page after signing in; the server needs no email or Telegram settings.
+- [ ] **GitHub:** a `main` branch made the default branch (and protected), and the `FLY_API_TOKEN` repository secret
+      (`fly tokens create deploy`): every push to `main` then deploys Fly, and Vercel deploys `main` too.
+- [ ] **Fly secrets:** `SECRET_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY` and `SEC_USER_AGENT`; then, for the front
+      door, `PROXY_SECRET`, `BASE_URL` (the Vercel address) and optionally `TRUSTED_ORIGINS` (preview deployments).
+- [ ] **Vercel project:** Root Directory `news-dip-scanner/frontend`, production branch `main`, and the environment
+      variables `DIP_API_ORIGIN` (`https://<your-app>.fly.dev`) and `DIP_PROXY_SECRET` (the same value as
+      `PROXY_SECRET`) for Production and Preview, marked Sensitive.
+- [ ] **Your admin account:** `fly ssh console -C "dip-scanner users add-admin you@example.com"`, the printed link to
+      set your password, and then invites for your friends from the admin page.
+
+### In short
+
+With [flyctl](https://fly.io/docs/flyctl/install/) installed, in the `news-dip-scanner` folder:
 
 ```bash
 fly auth signup                          # or fly auth login; Fly needs a payment card
@@ -757,25 +808,49 @@ fly scale count 1                        # exactly one Machine
 fly ssh console -C "dip-scanner users add-admin you@example.com"
 ```
 
-Open the link the last command prints to set your password, then invite people from the admin page. What to know:
+Open the link the last command prints to set your password. Then import the repository in Vercel (Root Directory
+`news-dip-scanner/frontend`, the two environment variables), and point Fly at it:
+
+```bash
+fly secrets set PROXY_SECRET=<DIP_PROXY_SECRET> BASE_URL=https://<the Vercel address> \
+  TRUSTED_ORIGINS='https://<project>-git-*-<team>.vercel.app'
+```
+
+From then on the `fly.dev` address answers only the front door. What to know:
 
 - **Exactly one Machine.** Two would run two scanners (twice the model bill, every alert twice) on two separate
   databases. `fly.toml` keeps the one Machine running when nobody visits (`auto_stop_machines = "off"`), and deploys
   use `--ha=false`.
 - **The files.** [`Dockerfile`](Dockerfile) (Python 3.12 with Anthropic's package, runs as a non-root user,
-  `DATA_DIR=/data`), [`fly.toml`](fly.toml) (region, volume, a `/healthz` check, 512 MB, the debate) and
+  `DATA_DIR=/data`), [`fly.toml`](fly.toml) (region, volume, a `/healthz` check, 512 MB, the debate),
+  [`frontend/vercel.json`](frontend/vercel.json) (the functions in Frankfurt) and
   [`.github/workflows/news-dip-scanner.yml`](../.github/workflows/news-dip-scanner.yml) at the repository's root:
-  ruff and the tests on every change, and a deploy of every push to `main` once a `FLY_API_TOKEN` secret (from `fly
-  tokens create deploy`) is set in GitHub.
+  ruff and the Python tests, and the front end's lint, type check, tests and build, each on the changes that touch
+  it, and a deploy to Fly of every push to `main` that changed the Python app once a `FLY_API_TOKEN` secret (from
+  `fly tokens create deploy`) is set in GitHub. Vercel builds and deploys the front end itself: `main` to production,
+  every other branch to a preview.
 - **Settings.** Secrets with `fly secrets set`, the rest under `[env]` in `fly.toml` (`DISPLAY_TZ` is
   `Europe/Athens` there, `LLM_PROVIDER` is `openai` for triage and `LLM_ANALYSIS_MODE` is `debate`). The image
   carries `scanner.toml` and `feeds.toml`; a copy in `/data` replaces them without a deploy.
 - **Alerts:** each person's own Slack or Discord webhook, set on the website's Settings page; the server needs no
   SMTP or Telegram settings for that (DEPLOY.md shows how to make a webhook).
-- **Your own domain:** `fly certs add dips.example.com`, a DNS record, and `BASE_URL` changed to match.
+- **Your own domain:** on Vercel (Settings, Domains, and a DNS record), with `BASE_URL` on Fly changed to match; or,
+  without the front door, `fly certs add dips.example.com`.
+- **Preview deployments** read and change the real data: they call the same Fly app. Keep them private with Vercel's
+  Deployment Protection (see [docs/VERCEL.md](docs/VERCEL.md#8-preview-deployments)).
 - **Backups:** Fly's daily volume snapshots (kept 14 days), plus `fly ssh console -C "dip-scanner backup"` and
   `fly ssh sftp get` to keep a copy of your own.
-- **Logs and health:** `fly logs`, and `/healthz` (`{"status":"ok","db":"ok","scanner":"running",...}`).
+- **Logs and health:** `fly logs`, and `/healthz` (`{"status":"ok","db":"ok","scanner":"running",...}`); Vercel's
+  project page has the front end's logs.
+
+### The Vercel front door
+
+The front end in [`frontend/`](frontend/) (Next.js 16, React 19, TypeScript, Tailwind CSS 4) renders the two pages
+people read most, the ideas and an idea, from the Fly app's JSON API, with the same header, footer, colours and badges
+as the Fly pages, so the two halves read as one site; every other path goes to the Fly app unchanged. There is one
+login, the Fly app's: its session cookie lives on the Vercel address and travels with every request. Pages move to
+React one at a time without anything else changing. [`frontend/README.md`](frontend/README.md) explains its parts, and
+[docs/VERCEL.md](docs/VERCEL.md) how to set it up.
 
 ## Security model
 
@@ -798,6 +873,10 @@ sends messages to addresses users give it and can spend the model budget, so:
   (compared in constant time); anything else gets a short page pointing at `BASE_URL`, so the `*.fly.dev` address is
   of no use on its own. Only a request with the secret may name the visitor's address (`x-dip-client-ip`), which the
   sign-in limits and the log then use; without it they would count every visitor as the front door's own address.
+  The front door itself sends Fly only an allow-list of the visitor's headers, drops any `x-dip-*` header a visitor
+  sends and never passes on Vercel's own (`x-vercel-*`, its OIDC token), keeps its two settings in server-only
+  environment variables (never in the pages' JavaScript), and gives its React pages a Content-Security-Policy with a
+  fresh nonce per request (no `unsafe-eval`, no inline styles) and the Fly pages' other headers.
 - **Preview deployments.** A `TRUSTED_ORIGINS` pattern lets the previews of one Vercel project post: it must be
   https, with the `*` inside the first part of the host between fixed text (project and team), and matches letters,
   digits and hyphens only. That is still looser than an exact address: someone who creates a Vercel team whose name
@@ -973,7 +1052,20 @@ ruff check . && ruff format --check .
 ```
 
 The tests use fake feeds, prices, SEC data, models and notifiers, so they run offline, without credentials and
-without sleeping.
+without sleeping. The JSON API's tests check every answer against the contract the front end is built on,
+[`frontend/contract/api-v1.schema.json`](frontend/contract/api-v1.schema.json).
+
+The front end (Node.js 22), in `frontend/`:
+
+```bash
+npm ci
+npm run lint && npm run typecheck && npm test && npm run build
+npm run dev:mock                   # the pages against a stand-in of the Fly app's API: http://localhost:3000
+npm run e2e                        # a real browser through next start and a real Fly app (frontend/e2e/README.md)
+```
+
+`npm test` checks the example answers in `frontend/contract/mocks` against the same schema, and with
+`CONTRACT_SAMPLES=<folder>` answers saved from a running Fly app too.
 
 | Module | Role |
 |---|---|
@@ -1005,3 +1097,4 @@ without sleeping.
 | `web/pages.py` / `web/admin.py` | The member and admin pages (templates in `web/templates`, styles and scripts in `web/static`) |
 | `web/charts.py` | The SVG price chart of the idea and ticker pages (light and dark, with a table view) |
 | `Dockerfile` / `fly.toml` / `docs/DEPLOY.md` | The image, the Fly.io app and the deployment guide; `.github/workflows/news-dip-scanner.yml` at the repository's root tests every change and deploys |
+| `frontend/` / `docs/VERCEL.md` | The Next.js front end on Vercel (React pages, the proxy to the Fly app, the API contract and its mocks, unit and end-to-end tests) and its guide |

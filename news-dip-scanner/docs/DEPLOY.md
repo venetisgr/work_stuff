@@ -7,8 +7,10 @@ language models are billed separately by their providers (see [Costs](../README.
 
 The setup described here, and the one `fly.toml` holds: OpenAI's small model triages the news, every dip's analysis is
 a debate between OpenAI's and Anthropic's analysis models (`LLM_ANALYSIS_MODE=debate`, see
-[Debate](../README.md#debate) in the README), alerts reach each person through their own Slack or Discord webhook, and
-GitHub Actions deploys every push to the `main` branch.
+[Debate](../README.md#debate) in the README), alerts reach each person through their own Slack or Discord webhook,
+GitHub Actions deploys every push to the `main` branch, and a Next.js front end on Vercel is the address people use
+([The Vercel front door](#the-vercel-front-door), and its own guide, [VERCEL.md](VERCEL.md)). Set up Fly first, on its
+own address, with the steps below; then Vercel.
 
 Everything below was checked against Fly's documentation on 2026-09-28 (the pages are listed at the
 [end](#what-was-checked-and-when)). Fly changes quickly: if a command answers differently, its `--help` and the linked
@@ -19,9 +21,9 @@ The files involved, in the `news-dip-scanner` folder except the workflow:
 | File | What it does |
 |---|---|
 | [`Dockerfile`](../Dockerfile) | Builds the image: Python 3.12, the package with its `web` and `anthropic` extras, `scanner.toml` and `feeds.toml` in `/app`, runs as the user `app` (not root), `DATA_DIR=/data`, `dip-scanner serve` on port 8080. |
-| [`.dockerignore`](../.dockerignore) | Keeps `.env`, `data/`, caches and tests out of the build (and off Fly's builder). |
+| [`.dockerignore`](../.dockerignore) | Keeps `.env`, `data/`, caches, tests and the front end (`frontend/`, Vercel's) out of the build (and off Fly's builder). |
 | [`fly.toml`](../fly.toml) | The app: region, the volume at `/data`, the HTTP service with its `/healthz` check, one Machine that never stops, 512 MB, and the settings that aren't secret (the debate among them). |
-| [`.github/workflows/news-dip-scanner.yml`](../../.github/workflows/news-dip-scanner.yml) | Tests every change, and deploys from `main` when a Fly token is set up. |
+| [`.github/workflows/news-dip-scanner.yml`](../../.github/workflows/news-dip-scanner.yml) | Tests every change (the Python app and the Next.js front end), and deploys the Python app from `main` when a Fly token is set up. |
 
 ## One Machine, always
 
@@ -257,13 +259,16 @@ single-name certificates of an organisation are free, then $0.10 a month each.
 
 ## 10. Deploy from GitHub Actions
 
-The workflow in `.github/workflows/news-dip-scanner.yml` runs ruff and the tests on every pull request and push that
-touches `news-dip-scanner/` (changes to the Next.js front end in `frontend/` alone don't count: Vercel deploys that),
-and after they pass it deploys the `main` branch:
+The workflow in `.github/workflows/news-dip-scanner.yml` checks every pull request and push that touches
+`news-dip-scanner/`, each part on the changes that concern it: ruff and the Python tests when the Python app (or the
+API contract in `frontend/contract/`, which its tests check the API against) changed, and the Next.js front end's
+lint, type check, tests and build when `frontend/` changed. After the Python checks pass it deploys the `main`
+branch:
 
-- on every push to `main`,
+- on every push to `main` that changed the Python app (a change to the front end alone is Vercel's to deploy, see
+  [VERCEL.md](VERCEL.md), and never restarts the scanner),
 - or when you start it by hand on `main`: Actions, news-dip-scanner, "Run workflow", branch `main` (on any other
-  branch it only runs the tests).
+  branch it only runs the checks).
 
 Other branches are never deployed: work on a branch, open a pull request, and merge it into `main` to release it.
 `main` is also the production branch of the Vercel front end, so both go out from the same commits. If the repository
@@ -275,8 +280,9 @@ git push -u origin main
 ```
 
 Then, in the repository on GitHub, Settings, General, "Default branch": switch it to `main`, so that pull requests
-target it. A branch protection rule (Settings, Branches) that requires the workflow's "Lint and test" check before
-merging keeps a failing change from reaching the site.
+target it. A branch protection rule (Settings, Branches) that requires the workflow's "Lint and test" and "Front end
+(Next.js)" checks before merging keeps a failing change from reaching the site (a check that didn't need to run
+counts as passed).
 
 It needs a deploy token, which can manage this one app and nothing else in your account:
 
@@ -414,10 +420,10 @@ without changing `fly.toml` lasts until the next deploy.
 
 ## The Vercel front door
 
-The site can have a front door on Vercel: the Next.js app in `frontend/` (its guide is `docs/VERCEL.md`) becomes the
-only address people use. It shows the ideas and each idea's page in React, with the data from this app's JSON API
-(`/api/v1`), and passes every other request (signing in, settings, news, track record, admin) on to this app. Every
-request it makes here carries a shared secret, and this app then answers nobody without it.
+The site can have a front door on Vercel: the Next.js app in `frontend/` (its guide is [VERCEL.md](VERCEL.md))
+becomes the only address people use. It shows the ideas and each idea's page in React, with the data from this app's
+JSON API (`/api/v1`), and passes every other request (signing in, settings, news, track record, admin) on to this app.
+Every request it makes here carries a shared secret, and this app then answers nobody without it.
 
 Set up and deploy the Vercel project first, with `DIP_API_ORIGIN` (this app's address,
 `https://my-dip-scanner.fly.dev`) and `DIP_PROXY_SECRET` (a new random secret, not `SECRET_KEY`):
