@@ -1,14 +1,15 @@
 # The website and the scanner in one container (`dip-scanner serve`), for Fly.io: see docs/DEPLOY.md.
 #
-#   docker build -t dip-scanner .                                  # OpenAI (the default provider)
-#   docker build -t dip-scanner --build-arg EXTRAS=anthropic .     # Anthropic Claude; "azure" for Azure AI Foundry
+#   docker build -t dip-scanner .                                  # OpenAI and Anthropic (the debate needs both)
+#   docker build -t dip-scanner --build-arg EXTRAS=anthropic,azure .   # plus Azure AI Foundry with Entra ID
 #
 # The database lives in DATA_DIR=/data, a Fly volume. scanner.toml and feeds.toml come with the image (in /app, the
 # working directory); a copy in /data is used instead (see "Changing the scanner's settings" in docs/DEPLOY.md).
 FROM python:3.12-slim
 
-# Optional extras for other language model providers, comma-separated: "anthropic", "azure" or "anthropic,azure".
-ARG EXTRAS=""
+# Extras for the language model providers besides OpenAI, comma-separated: "anthropic" (the default: fly.toml's
+# LLM_ANALYSIS_MODE=debate uses an Anthropic model), "anthropic,azure", or "" for OpenAI only.
+ARG EXTRAS="anthropic"
 
 # MALLOC_ARENA_MAX=2: each cycle fetches the feeds on 8 threads, and without it glibc's per-thread memory pools kept
 # the process about 75 MB larger (measured: 212 MB against 137 MB after 18 cycles).

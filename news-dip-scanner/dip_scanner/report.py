@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .fx import main_currency, same_money
-from .models import Article, Impact, Opportunity, from_iso, utc
+from .models import Analysis, Article, Debate, Impact, Opportunity, from_iso, utc
 
 if TYPE_CHECKING:
     from .fx import FxRates
@@ -261,6 +261,113 @@ def safe_url(url: object) -> str | None:
     return url
 
 
+# --- debates ---------------------------------------------------------------------------------------------------------
+
+MAX_CRITIQUE_SHOWN = 3  # critique points per model in the reports
+
+
+def model_display_name(label: str) -> str:
+    """A model for people, from "provider:model" or a bare model name: "openai:gpt-5" -> "GPT-5", "gpt-5-mini" ->
+    "GPT-5 mini", "anthropic:claude-sonnet-5" -> "Claude Sonnet 5", "claude-haiku-4-5" -> "Claude Haiku 4.5"; any
+    other name (an Azure deployment) as it is."""
+    name = label.split(":", 1)[1] if ":" in label else label
+    parts = name.strip().split("-")
+    if len(parts) > 1 and parts[0].lower() == "gpt":
+        return " ".join([f"GPT-{parts[1]}", *parts[2:]])
+    if len(parts) > 1 and parts[0].lower() == "claude":
+        words = [part.capitalize() for part in parts[1:] if not part.isdigit()]
+        version = ".".join(part for part in parts[1:] if part.isdigit() and len(part) < 8)  # not a snapshot date
+        if words:
+            return " ".join(["Claude", *words, *([version] if version else [])])
+    return name
+
+
+def debate_line(opp: Opportunity) -> str | None:
+    """The debate in one line for chat alerts and lists: "GPT-5 72% · Claude Sonnet 5 58% → 64% (medium agreement)",
+    each model's final chance up, then the outcome's; None without a debate."""
+    debate = opp.debate
+    if debate is None or not debate.participants:
+        return None
+    outcome = opp.analysis.probability_up_6m
+    if debate.mode == "single":
+        only = debate.participants[0]
+        return f"{model_display_name(only.model)} alone: {outcome}% (the other model failed)"
+    sides = " · ".join(
+        f"{model_display_name(side.model)} {side.final.probability_up_6m}%" for side in debate.participants
+    )
+    if debate.mode == "agreed":
+        how = "agreed"
+    elif debate.judge is None:
+        how = f"{debate.agreement or 'unknown'} agreement, no judge"
+    else:
+        how = f"{debate.agreement or 'unknown'} agreement"
+    return f"{sides} → {outcome}% ({how})"
+
+
+def debate_heading(debate: Debate) -> str:
+    """What kind of debate it was, in words, e.g. "medium agreement · judged by Claude Sonnet 5 after 1 rebuttal
+    round · favoured GPT-5"."""
+    if debate.mode == "single":
+        only = model_display_name(debate.participants[0].model) if debate.participants else "one model"
+        return f"only {only} answered" + (f": {debate.reason}" if debate.reason else "")
+    if debate.mode == "agreed":
+        return "the two models agreed, so their analyses were merged without a rebuttal or a judge"
+    rounds = _plural(debate.rounds, "rebuttal round")
+    if debate.judge is None:
+        parts = [f"{debate.agreement or 'unknown'} agreement", f"{rounds}, no judge's ruling"]
+        if debate.reason:
+            parts.append(debate.reason)
+        return " · ".join(parts)
+    favoured = model_display_name(debate.favoured) if debate.favoured else "neither"
+    return " · ".join(
+        [
+            f"{debate.agreement or 'unknown'} agreement",
+            f"judged by {model_display_name(debate.judge)} after {rounds}",
+            f"favoured {favoured}",
+        ]
+    )
+
+
+def position_cell(analysis: Analysis, currency: str) -> str:
+    """One position in a debate table: "Temporary fear · 72% · low $118.00"."""
+    return (
+        f"{verdict_label(analysis.verdict)} · {analysis.probability_up_6m}% · low "
+        f"{format_price(analysis.potential_low, currency)}"
+    )
+
+
+def _debate_rows(opp: Opportunity) -> list[tuple[str, str, str, str]]:
+    """(model, opening, final, changed mind) per participant."""
+    debate = opp.debate
+    assert debate is not None
+    rows = []
+    for side in debate.participants:
+        changed = "–" if debate.mode == "single" else ("yes" if side.changed_mind else "no")
+        who = model_display_name(side.model) + (f" (Analyst {side.label})" if debate.mode == "debate" else "")
+        rows.append((who, position_cell(side.opening, opp.currency), position_cell(side.final, opp.currency), changed))
+    return rows
+
+
+def _debate_markdown(opp: Opportunity) -> list[str]:
+    debate = opp.debate
+    assert debate is not None
+    lines = ["", f"**Debate:** {md_escape(debate_heading(debate))}"]
+    if debate.summary:
+        label = "The judge's summary" if debate.judge else "Summary"
+        lines += ["", f"**{label}:** {md_escape(debate.summary)}"]
+    lines += [
+        "",
+        "| Model | Opening | Final | Changed mind |",
+        "|---|---|---|---|",
+        *("| " + " | ".join(md_escape(cell) for cell in row) + " |" for row in _debate_rows(opp)),
+    ]
+    for side in debate.participants:
+        if side.critique:
+            lines += ["", f"**{md_escape(model_display_name(side.model))}'s critique**", ""]
+            lines += [f"- {md_escape(point)}" for point in side.critique[:MAX_CRITIQUE_SHOWN]]
+    return lines
+
+
 def md_escape(text: object) -> str:
     """Text for a Markdown line or table cell: whitespace collapsed; \\ ` * _ [ ] | < > backslash-escaped."""
     return _MD_SPECIAL.sub(r"\\\1", " ".join(str(text).split()))
@@ -348,6 +455,8 @@ def _opportunity_markdown(opp: Opportunity, newer: Opportunity | None = None) ->
         "|---|---|",
         *(f"| {label} | {md_escape(value)} |" for label, value in key_figures(opp)),
     ]
+    if opp.debate is not None:
+        lines += _debate_markdown(opp)
     for label, text in _paragraphs(opp):
         lines += ["", f"**{label}:** {md_escape(text)}"]
     for label, items in _lists(opp):
@@ -602,6 +711,8 @@ def _html_card(opp: Opportunity, newer: Opportunity | None = None) -> str:
             f'border-radius:6px;font-size:13px;"><strong>{_e(superseded_text(newer))}</strong></p>'
         )
     body.append(figures)
+    if opp.debate is not None:
+        body.append(_html_debate(opp))
     for label, text in _paragraphs(opp):
         body.append(f'<p style="margin:12px 0 0 0;"><strong>{_e(label)}:</strong> {_e(text)}</p>')
     for label, items in _lists(opp):
@@ -624,6 +735,38 @@ def _html_card(opp: Opportunity, newer: Opportunity | None = None) -> str:
         f'style="background:{_CARD};border:1px solid {_LINE};border-top:4px solid {colour};border-radius:8px;'
         f'margin:0 0 16px 0;"><tr><td style="padding:16px 20px;">' + "".join(body) + "</td></tr></table>"
     )
+
+
+def _html_debate(opp: Opportunity) -> str:
+    """The debate block of a card: how it went, the summary, each model's opening and final position, critiques."""
+    debate = opp.debate
+    assert debate is not None
+    cell = f"padding:5px 8px 5px 0;border-bottom:1px solid {_LINE};vertical-align:top;"
+    head = f"{cell}font-size:12px;color:{_MUTED};font-weight:600;text-align:left;"
+    headers = "".join(f'<th style="{head}">{name}</th>' for name in ("Model", "Opening", "Final", "Changed mind"))
+    rows = "".join(
+        "<tr>" + "".join(f'<td style="{cell}font-size:13px;">{_e(value)}</td>' for value in row) + "</tr>"
+        for row in _debate_rows(opp)
+    )
+    parts = [
+        _section_title("Debate"),
+        f'<p style="margin:0 0 6px 0;font-size:13px;color:{_MUTED};">{_e(debate_heading(debate))}</p>',
+    ]
+    if debate.summary:
+        label = "The judge's summary" if debate.judge else "Summary"
+        parts.append(f'<p style="margin:0 0 6px 0;"><strong>{_e(label)}:</strong> {_e(debate.summary)}</p>')
+    parts.append(
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" '
+        f'style="margin:4px 0 4px 0;"><tr>{headers}</tr>{rows}</table>'
+    )
+    for side in debate.participants:
+        if side.critique:
+            name = model_display_name(side.model)
+            parts.append(
+                f'<p style="margin:8px 0 0 0;font-size:13px;"><strong>{_e(name)}\'s critique</strong></p>'
+                + _html_list(_e(point) for point in side.critique[:MAX_CRITIQUE_SHOWN])
+            )
+    return "".join(parts)
 
 
 def _html_list(items) -> str:

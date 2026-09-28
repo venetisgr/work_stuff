@@ -6,7 +6,7 @@ from datetime import timedelta
 
 import pytest
 import requests
-from conftest import NOW, FakeResponse, FakeSession, make_analysis, make_opportunity
+from conftest import NOW, FakeResponse, FakeSession, make_analysis, make_debate, make_opportunity
 
 from dip_scanner.config import ConfigError, NotifySettings
 from dip_scanner.notify import (
@@ -600,3 +600,13 @@ def test_email_for_website_users_needs_no_email_to():
     assert email_missing(server) == ["EMAIL_TO"]
     assert email_missing(server, recipients=False) == []
     assert email_missing(NotifySettings(), recipients=False) == ["SMTP_HOST", "SMTP_FROM"]
+
+
+def test_short_alert_adds_a_line_for_a_debate():
+    """A debated analysis gets a second line in chat alerts: each model's final chance, then the outcome's."""
+    debated = make_opportunity(debate=make_debate(), analysis=make_analysis(probability_up_6m=64))
+    lines = short_alert([debated]).splitlines()
+    assert lines[1].startswith("- AMD (Advanced Micro Devices) · score 72.4 · 64% chance up in 6m")
+    assert lines[2] == "  Debate: GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)"
+    assert lines[3] == ALERT_FOOTER
+    assert "Debate" not in short_alert([make_opportunity()])

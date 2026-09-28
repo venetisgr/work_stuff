@@ -44,6 +44,7 @@ from .notify import build_notifiers
 from .pipeline import Scanner, thesis_change_line, usage_lines
 from .prices import PriceError, PriceFetchError, YahooPrices
 from .report import (
+    debate_line,
     display_zone,
     format_when,
     render_html,
@@ -474,6 +475,9 @@ def _run(args: argparse.Namespace, settings: Settings) -> int:
     for opp in sorted(result.opportunities, key=lambda opp: opp.score, reverse=True):
         alert = " (alert)" if opp in result.alerts else ""
         print(f"  {opp.ticker} ({opp.company}): score {opp.score:.1f}, {opp.analysis.verdict}{alert}")
+        debate = debate_line(opp)
+        if debate:
+            print(f"    debate: {debate}")
     for previous, opp in result.thesis_changes:
         print(f"Thesis change: {thesis_change_line(previous, opp)}")
     if result.usage_today:

@@ -43,6 +43,12 @@ was made while the session was running, the stock's return for the comparison th
 with_account_return() adds the return in the [account] currency (or a website user's): (1 + return) * rate at the end
 / rate at the report - 1, with the rate into that currency stored with the report when there is one, else the day's
 closing rate.
+
+model_scoreboard() scores the models of debated analyses (LLM_ANALYSIS_MODE=debate) once they have 6 months of
+results: for each model, its final positions' probability_up_6m against whether the stock was higher after 6 months
+(up_after_6m), as a Brier score, the mean squared difference between the probability (0-1) and the outcome (1 higher,
+0 not). 0 is perfect; always saying 50% scores 0.25. The same for its opening positions, and a row for the
+debate's outcome (the opportunity's own probability: the judge's ruling, or the merged or lone analysis).
 """
 
 from __future__ import annotations
@@ -57,7 +63,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .fx import rate_on, same_money
 from .models import VERDICTS, Opportunity, PriceBar, Split, utc
-from .report import display_date, format_pct, format_price, md_escape, superseded_by, verdict_label
+from .report import display_date, format_pct, format_price, md_escape, model_display_name, superseded_by, verdict_label
 
 log = logging.getLogger(__name__)
 
@@ -354,7 +360,68 @@ def summarize(outcomes: Sequence[Outcome]) -> dict:
         label: _group([o for o in outcomes if score_bucket(o.opportunity.score) == label])
         for label, _, _ in SCORE_BUCKETS
     }
+    summary["scoreboard"] = model_scoreboard(outcomes)
     return summary
+
+
+# --- the debate's models ---------------------------------------------------------------------------------------------
+
+FINAL_ROW = "final"  # model_scoreboard's row for the debate's outcome
+
+
+def brier(pairs: Sequence[tuple[float, bool]]) -> float | None:
+    """The Brier score of (probability in %, outcome) pairs: the mean of (probability / 100 - outcome)^2, outcome 1
+    when it happened; None without pairs."""
+    if not pairs:
+        return None
+    return statistics.fmean((probability / 100 - (1.0 if happened else 0.0)) ** 2 for probability, happened in pairs)
+
+
+def model_scoreboard(outcomes: Sequence[Outcome]) -> list[dict]:
+    """The debate's models scored on the debated opportunities (see the module docstring); [] when none was debated.
+
+    One row per model ("provider:model", sorted), then FINAL_ROW for the debate's outcome, each a dict of: model,
+    label (for people), debates (debated opportunities it took part in), scored (those with 6 months of results,
+    priced and without a price mismatch), waiting (the rest), brier (of its final positions; for FINAL_ROW the
+    outcome's), brier_opening (of its openings; None for FINAL_ROW), mean_probability (its final positions' mean, in
+    %), hit_rate (how many of the scored were higher after 6 months, in %). A figure over nothing is None ("–").
+    """
+    rows: dict[str, dict[str, list]] = {}
+    final: dict[str, list] = {"debates": [], "final": [], "opening": []}
+    for outcome in outcomes:
+        debate = outcome.opportunity.debate
+        if debate is None or not debate.participants or outcome.price_mismatch:
+            continue
+        scored = outcome.priced and outcome.up_after_6m is not None
+        for side in debate.participants:
+            row = rows.setdefault(side.model, {"debates": [], "final": [], "opening": []})
+            row["debates"].append(outcome)
+            if scored:
+                row["final"].append((side.final.probability_up_6m, outcome.up_after_6m))
+                row["opening"].append((side.opening.probability_up_6m, outcome.up_after_6m))
+        final["debates"].append(outcome)
+        if scored:
+            final["final"].append((outcome.opportunity.analysis.probability_up_6m, outcome.up_after_6m))
+    if not final["debates"]:
+        return []
+
+    def board(model: str, label: str, data: dict[str, list], *, openings: bool) -> dict:
+        pairs = data["final"]
+        return {
+            "model": model,
+            "label": label,
+            "debates": len(data["debates"]),
+            "scored": len(pairs),
+            "waiting": len(data["debates"]) - len(pairs),
+            "brier": brier(pairs),
+            "brier_opening": brier(data["opening"]) if openings else None,
+            "mean_probability": _mean([probability for probability, _ in pairs]),
+            "hit_rate": _rate(sum(1 for _, happened in pairs if happened), len(pairs)),
+        }
+
+    table = [board(model, model_display_name(model), rows[model], openings=True) for model in sorted(rows)]
+    table.append(board(FINAL_ROW, "After the debate", final, openings=False))
+    return table
 
 
 def _group(outcomes: list[Outcome]) -> dict:
@@ -505,6 +572,20 @@ def render_track_record(outcomes: Sequence[Outcome], summary: dict, *, missing: 
         lines += ["", "## By score", "", group_header[0].format(first="Score"), group_header[1]]
         lines += [_group_row(label, group) for label, group in by_score.items()]
 
+    scoreboard = summary.get("scoreboard") or []
+    if scoreboard:
+        lines += [
+            "",
+            "## Model scoreboard",
+            "",
+            "Debated opportunities with 6 months of results: each model's chance of being higher against what "
+            "happened. Brier score: 0 is perfect, 0.25 is what always saying 50% scores; lower is better.",
+            "",
+            "| Model | Debates | Scored | Brier (final) | Brier (opening) | Said on average | Higher after 6m |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        lines += [_scoreboard_row(row) for row in scoreboard]
+
     in_account = f"| In {md_escape(account)} " if account else ""
     lines += [
         "",
@@ -595,6 +676,22 @@ def _outcome_row(outcome: Outcome, newer: Opportunity | None = None, *, account:
         pct(outcome.max_gain_pct),
         pct(outcome.max_loss_pct),
         up,
+    ]
+    return "| " + " | ".join(cells) + " |"
+
+
+def _scoreboard_row(row: dict) -> str:
+    def number(value: float | None, pattern: str) -> str:
+        return "–" if value is None else pattern.format(value)
+
+    cells = [
+        md_escape(row.get("label") or row.get("model") or "?"),
+        str(row.get("debates", 0)),
+        str(row.get("scored", 0)),
+        number(row.get("brier"), "{:.3f}"),
+        number(row.get("brier_opening"), "{:.3f}"),
+        number(row.get("mean_probability"), "{:.0f}%"),
+        number(row.get("hit_rate"), "{:.0f}%"),
     ]
     return "| " + " | ".join(cells) + " |"
 

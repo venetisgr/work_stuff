@@ -29,7 +29,7 @@ from urllib.parse import unquote, urlparse
 
 import openai
 
-from .config import DEFAULT_MODELS, ConfigError, LLMSettings
+from .config import DEFAULT_MODELS, JUDGE_ALTERNATE, ConfigError, LLMSettings, model_entry
 
 if TYPE_CHECKING:
     import httpx2
@@ -622,12 +622,105 @@ def _mentions(exc: Exception, word: str) -> bool:
     return getattr(exc, "param", None) == word or word in _detail(exc)
 
 
-def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel]:
+# --- the debate's models (LLM_ANALYSIS_MODE=debate) -----------------------------------------------------------------
+
+# The setting each provider can't do without, for the debate's "missing key" message.
+_KEY_SETTINGS = {"openai": "OPENAI_API_KEY", "anthropic": "ANTHROPIC_API_KEY", "azure": "FOUNDRY_ENDPOINT"}
+
+
+@dataclass(frozen=True)
+class DebaterModel:
+    """A model of the debate: its "provider:model" label (LLM_DEBATERS, LLM_DEBATE_JUDGE) and the ChatModel."""
+
+    label: str
+    model: ChatModel
+
+    @property
+    def provider(self) -> str:
+        return self.label.split(":", 1)[0]
+
+    @property
+    def model_name(self) -> str:
+        return self.label.split(":", 1)[1]
+
+
+@dataclass(frozen=True)
+class DebatePanel:
+    """The analysis "model" of LLM_ANALYSIS_MODE=debate: the two debaters (LLM_DEBATERS order) and the judge, None
+    for "alternate" (the debaters' models take turns, see debate.py). The Scanner runs a debate when its analysis
+    model is a DebatePanel."""
+
+    debaters: tuple[DebaterModel, DebaterModel]
+    judge: DebaterModel | None = None
+
+    @property
+    def name(self) -> str:
+        """ "debate: gpt-5 vs claude-sonnet-5" (and ", judged by ..." with a fixed judge)."""
+        first, second = (debater.model_name for debater in self.debaters)
+        judged = f", judged by {self.judge.model_name}" if self.judge is not None else ""
+        return f"debate: {first} vs {second}{judged}"
+
+
+def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel | DebatePanel]:
     """The (triage, analysis) models for the configured provider; ConfigError says what's missing.
 
     Each step's reasoning effort is LLM_TRIAGE_REASONING_EFFORT / LLM_ANALYSIS_REASONING_EFFORT, else
     LLM_REASONING_EFFORT. The two steps share one model object when both the name and the effort match.
+
+    With LLM_ANALYSIS_MODE=debate the analysis "model" is a DebatePanel (build_debate_panel): triage still uses
+    LLM_PROVIDER's triage model, and LLM_PROVIDER's analysis model isn't built.
     """
+    triage_model, analysis_model = _provider_models(settings, analysis=settings.analysis_mode != "debate")
+    if settings.analysis_mode == "debate":
+        panel = build_debate_panel(settings)
+        log.debug("Analysing dips as a %s.", panel.name)
+        return triage_model, panel
+    assert analysis_model is not None
+    return triage_model, analysis_model
+
+
+def build_debate_panel(settings: LLMSettings) -> DebatePanel:
+    """The debaters of LLM_DEBATERS and the judge of LLM_DEBATE_JUDGE, each with LLM_ANALYSIS_REASONING_EFFORT (else
+    LLM_REASONING_EFFORT) like the single analysis model. A fixed judge that is one of the debaters shares its model.
+    A debater whose provider isn't set up (no key, no package) is a ConfigError naming the setting."""
+    effort = settings.analysis_reasoning_effort or settings.reasoning_effort
+    debaters = tuple(_debater(settings, entry, effort, role="LLM_DEBATERS") for entry in settings.debaters)
+    judge = None
+    if settings.debate_judge != JUDGE_ALTERNATE:
+        judge = next((debater for debater in debaters if debater.label == settings.debate_judge), None)
+        if judge is None:
+            judge = _debater(settings, settings.debate_judge, effort, role="LLM_DEBATE_JUDGE")
+    first, second = debaters
+    return DebatePanel(debaters=(first, second), judge=judge)
+
+
+def _debater(settings: LLMSettings, entry: str, effort: str | None, *, role: str) -> DebaterModel:
+    provider, name = model_entry(entry, role)
+    label = f"{provider}:{name}"
+    model_settings = replace(settings, reasoning_effort=effort)
+    try:
+        if provider == "openai":
+            if not settings.openai_api_key and not settings.openai_base_url:
+                raise ConfigError("Set OPENAI_API_KEY in .env.")
+            model: ChatModel = OpenAIChatModel(model_settings, name)
+        elif provider == "anthropic":
+            model = AnthropicChatModel(model_settings, name)
+        else:
+            model = AzureFoundryChatModel(model_settings, name)
+    except ConfigError as exc:
+        key = _KEY_SETTINGS[provider]
+        if str(exc).startswith(f"Set {key}"):
+            raise ConfigError(
+                f"LLM_ANALYSIS_MODE=debate uses {label} ({role}), but {key} isn't set. Set it in .env (on Fly.io: "
+                f"fly secrets set {key}=...), name other models in {role}, or set LLM_ANALYSIS_MODE=single to analyse "
+                "with LLM_PROVIDER's model alone."
+            ) from exc
+        raise ConfigError(f"LLM_ANALYSIS_MODE=debate uses {label} ({role}), which can't be set up: {exc}") from exc
+    return DebaterModel(label=label, model=model)
+
+
+def _provider_models(settings: LLMSettings, *, analysis: bool = True) -> tuple[ChatModel, ChatModel | None]:
+    """LLM_PROVIDER's (triage, analysis) models; the analysis one only when analysis is true (else None)."""
     provider = settings.provider
     if provider == "azure":
         if not settings.foundry_endpoint:
@@ -635,7 +728,7 @@ def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel]:
         fallback = settings.foundry_deployment or deployment_from_endpoint(settings.foundry_endpoint)
         triage_name = settings.triage_model or fallback
         analysis_name = settings.analysis_model or fallback
-        if not triage_name or not analysis_name:
+        if not triage_name or (analysis and not analysis_name):
             raise ConfigError(
                 "Set FOUNDRY_DEPLOYMENT in .env to your GPT deployment's name (used for both steps), or set "
                 "LLM_TRIAGE_MODEL and LLM_ANALYSIS_MODEL to two deployment names."
@@ -653,6 +746,10 @@ def build_models(settings: LLMSettings) -> tuple[ChatModel, ChatModel]:
         settings, reasoning_effort=settings.analysis_reasoning_effort or settings.reasoning_effort
     )
     triage_model = factory(triage_settings, triage_name)
+    if not analysis:
+        effort = triage_settings.reasoning_effort or "default"
+        log.debug("Using %s (effort %s) for triage (%s).", triage_model.name, effort, provider)
+        return triage_model, None
     shared = analysis_name == triage_name and analysis_settings.reasoning_effort == triage_settings.reasoning_effort
     analysis_model = triage_model if shared else factory(analysis_settings, analysis_name)
     log.debug(

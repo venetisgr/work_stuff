@@ -6,7 +6,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from conftest import NOW, make_article, make_impact, make_opportunity
+from conftest import NOW, make_article, make_debate, make_impact, make_opportunity
 
 from dip_scanner.feeds import FeedState, title_key
 from dip_scanner.store import DEFAULT_RECIPIENT, SCANNER_PAUSED, SCHEMA_VERSION, Store
@@ -376,6 +376,12 @@ def test_add_opportunity_sets_the_id_and_round_trips_exactly(store):
     assert store.last_opportunity("NVDA") is None
 
 
+def test_a_debated_opportunity_round_trips_through_the_store(store):
+    saved = store.add_opportunity(make_opportunity(debate=make_debate()))
+    assert store.get_opportunity(saved.id) == saved
+    assert store.get_opportunity(saved.id).debate.participants[0].critique[0].startswith("Uses a revenue figure")
+
+
 def test_opportunities_filters_and_newest_first(store):
     a = store.add_opportunity(make_opportunity(created=NOW - timedelta(days=3), score=80.0))
     b = store.add_opportunity(make_opportunity(ticker="NVDA", created=NOW - timedelta(days=1), score=55.0))
@@ -533,6 +539,31 @@ def test_model_calls_are_totalled_per_step_and_model(store):
 
     store.prune(older_than=NOW - timedelta(hours=24))
     assert sum(row.calls for row in store.model_usage(since=NOW - timedelta(days=10))) == 5
+
+
+def test_a_debate_is_one_analysis_and_its_steps_are_listed_in_order(store):
+    """A debate's five calls (two openings, two rebuttals, a ruling) share the ticker and the time: one analysis for
+    [scan] max_analyses_per_day. model_usage lists triage, then the openings, rebuttals and rulings."""
+    for step, model in (
+        ("analysis:judge", "claude-sonnet-5"),
+        ("analysis:rebuttal", "gpt-5"),
+        ("analysis:rebuttal", "claude-sonnet-5"),
+        ("analysis:opening", "gpt-5"),
+        ("analysis:opening", "claude-sonnet-5"),
+        ("triage", "gpt-5-mini"),
+    ):
+        store.record_model_call(when=NOW, step=step, model=model, ticker=None if step == "triage" else "AMD")
+    store.record_model_call(when=NOW, step="analysis", model="gpt-5", ticker="NVDA")  # a single model's
+    assert store.analyses_since(NOW - timedelta(hours=1)) == 2
+    assert [(row.step, row.model) for row in store.model_usage(since=NOW - timedelta(hours=1))] == [
+        ("triage", "gpt-5-mini"),
+        ("analysis", "gpt-5"),
+        ("analysis:opening", "claude-sonnet-5"),
+        ("analysis:opening", "gpt-5"),
+        ("analysis:rebuttal", "claude-sonnet-5"),
+        ("analysis:rebuttal", "gpt-5"),
+        ("analysis:judge", "claude-sonnet-5"),
+    ]
 
 
 def test_notice_times_and_failure_streaks_are_kept(store):

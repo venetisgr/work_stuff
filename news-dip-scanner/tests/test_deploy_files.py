@@ -2,8 +2,9 @@
 GitHub Actions workflow and docs/DEPLOY.md.
 
 What matters most: exactly one Machine that never stops (the scanner runs inside the website), the volume at DATA_DIR,
-the port the proxy talks to is the one `serve` listens on, the health check path answers 200 over plain HTTP, and the
-workflow deploys only from the default branch (or by hand) and only when the Fly token exists.
+the port the proxy talks to is the one `serve` listens on, the health check path answers 200 over plain HTTP, the
+deployment debates with OpenAI's and Anthropic's models (and the image can), and the workflow deploys only from main
+(after a push, or by hand) and only when the Fly token exists.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from dip_scanner import cli
-from dip_scanner.config import DATABASE_NAME, ScannerConfig, Settings, WebSettings
+from dip_scanner.config import DATABASE_NAME, ScannerConfig, Settings, WebSettings, load_settings
 from dip_scanner.web import server
 from dip_scanner.web.app import create_app
 from dip_scanner.web.control import STOP_TIMEOUT
@@ -138,7 +139,8 @@ def test_dockerfile_command_is_serve_on_the_exposed_port():
 
 
 def test_dockerfile_installs_the_web_extra_with_optional_extras_and_the_settings_files():
-    assert any(name == "ARG" and rest.startswith("EXTRAS") for name, rest in instructions())
+    (extras,) = [rest for name, rest in instructions() if name == "ARG" and rest.startswith("EXTRAS")]
+    assert extras == 'EXTRAS="anthropic"', "fly.toml's debate needs Anthropic's package by default"
     run = " ".join(rest for name, rest in instructions() if name == "RUN")
     assert "[web${EXTRAS:+,$EXTRAS}]" in run
     assert docker_env()["DATA_DIR"] == "/data"
@@ -235,6 +237,22 @@ def test_fly_toml_env_is_not_secret_and_valid():
     assert env["DISPLAY_TZ"] == "Europe/Athens"
 
 
+def test_fly_toml_debates_with_openai_and_anthropic_and_the_guide_sets_both_keys():
+    """The owner's deployment: triage with OpenAI's small model, every analysis a debate between OpenAI's and
+    Anthropic's models, so both keys are secrets and the image has Anthropic's package."""
+    env = fly()["env"]
+    settings = load_settings(env)
+    assert settings.llm.provider == "openai" and settings.llm.analysis_mode == "debate"
+    assert {entry.split(":")[0] for entry in settings.llm.debaters} == {"openai", "anthropic"}
+    assert "EXTRAS" not in fly().get("build", {}).get("args", {}), "the Dockerfile's default includes anthropic"
+    guide = DEPLOY_MD.read_text(encoding="utf-8")
+    secrets = guide[guide.index("fly secrets set \\") :]
+    secrets = secrets[: secrets.index("```")]
+    assert "OPENAI_API_KEY=" in secrets and "ANTHROPIC_API_KEY=" in secrets
+    # Alerts go through each user's own Slack or Discord webhook: no server mail or bot is needed.
+    assert "Slack" in guide and "Discord" in guide and "no SMTP" in guide
+
+
 def test_the_proxy_port_is_the_one_serve_listens_on():
     port = fly()["http_service"]["internal_port"]
     assert port == int(last("EXPOSE"))
@@ -284,7 +302,7 @@ def workflow_text() -> str:
 def test_workflow_text_gates_the_deploy():
     text = workflow_text()
     assert "workflow_dispatch:" in text
-    assert "format('refs/heads/{0}', github.event.repository.default_branch)" in text
+    assert "github.ref == 'refs/heads/main'" in text
     assert "FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}" in text
     assert "flyctl deploy --remote-only" in text
     assert re.search(r"superfly/flyctl-actions/setup-flyctl@[0-9a-f]{40}\b", text), "pin the third-party action"
@@ -296,7 +314,12 @@ def test_workflow_structure():
     workflow = yaml.safe_load(workflow_text())
     triggers = workflow.get("on", workflow.get(True))  # YAML 1.1 reads a bare `on` as true
     for event in ("pull_request", "push"):
-        assert set(triggers[event]["paths"]) == {"news-dip-scanner/**", ".github/workflows/news-dip-scanner.yml"}
+        # The Next.js front end (Vercel deploys it) alone neither tests nor restarts the scanner.
+        assert triggers[event]["paths"] == [
+            "news-dip-scanner/**",
+            "!news-dip-scanner/frontend/**",
+            ".github/workflows/news-dip-scanner.yml",
+        ]
     assert "workflow_dispatch" in triggers
     assert workflow["permissions"] == {"contents": "read"}
 
@@ -314,8 +337,7 @@ def test_workflow_structure():
     assert deploy["needs"] == "test"
     condition = " ".join(deploy["if"].split())
     assert condition == (
-        "github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && "
-        "github.ref == format('refs/heads/{0}', github.event.repository.default_branch))"
+        "github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')"
     )
     assert deploy["env"]["FLY_API_TOKEN"] == "${{ secrets.FLY_API_TOKEN }}"
     assert deploy["concurrency"]["cancel-in-progress"] is False  # never cut a deploy off halfway

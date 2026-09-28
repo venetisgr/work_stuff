@@ -419,6 +419,9 @@ def _money(value: float) -> str:
     return f"{value:.2f}" if abs(value) >= 1 else f"{value:.4g}"
 
 
+plain_price = _money  # the prompts' prices, for the debate's prompts too
+
+
 # --- score ---------------------------------------------------------------------------------------------------------
 
 
@@ -447,6 +450,33 @@ def score(analysis: Analysis, price: float) -> float:
 # --- one candidate -------------------------------------------------------------------------------------------------
 
 
+def case_fields(
+    candidate: Candidate,
+    *,
+    fundamentals: Fundamentals | None,
+    extra_news: list[Article],
+    now: datetime,
+    sec_ticker: str | None = None,
+) -> dict[str, str]:
+    """The format fields of the case every analysis prompt starts with (prompts.ANALYSIS_PROMPT's, which the debate's
+    prompts share): the price, fundamentals and news of a candidate."""
+    now = utc(now)
+    stats = candidate.stats
+    return {
+        "ticker": candidate.ticker,
+        "company": candidate.company,
+        "today": f"{now:%Y-%m-%d} ({now:%A})",
+        "price_block": price_block(stats),
+        "fundamentals_block": fundamentals_block(
+            candidate.ticker, fundamentals, today=now.date(), sec_ticker=sec_ticker
+        ),
+        "news_block": news_block(candidate.impacts, extra_news),
+        "dip_reasons": "; ".join(candidate.dip_reasons) or "manual analysis (no dip thresholds applied)",
+        "currency": stats.currency,
+        "price": _money(stats.price),
+    }
+
+
 def analyze_candidate(
     model: ChatModel,
     candidate: Candidate,
@@ -462,26 +492,27 @@ def analyze_candidate(
     Raises LLMError when the reply is unusable even after a corrective retry (LLMSetupError when no call can work).
     """
     now = utc(now)
-    stats = candidate.stats
-    prompt = prompts.ANALYSIS_PROMPT.format(
-        ticker=candidate.ticker,
-        company=candidate.company,
-        today=f"{now:%Y-%m-%d} ({now:%A})",
-        price_block=price_block(stats),
-        fundamentals_block=fundamentals_block(candidate.ticker, fundamentals, today=now.date(), sec_ticker=sec_ticker),
-        news_block=news_block(candidate.impacts, extra_news),
-        dip_reasons="; ".join(candidate.dip_reasons) or "manual analysis (no dip thresholds applied)",
-        currency=stats.currency,
-        price=_money(stats.price),
-    )
-    raw = complete_json(model, prompts.ANALYSIS_SYSTEM, prompt, validate=validate_analysis)
-    analysis = sanitize(raw, stats)
+    fields = case_fields(candidate, fundamentals=fundamentals, extra_news=extra_news, now=now, sec_ticker=sec_ticker)
+    analysis = ask_analysis(model, prompts.ANALYSIS_SYSTEM, prompts.ANALYSIS_PROMPT.format(**fields), candidate)
+    return to_opportunity(candidate, analysis, now=now, model=model.name)
+
+
+def ask_analysis(model: ChatModel, system: str, prompt: str, candidate: Candidate) -> Analysis:
+    """One model's analysis of a candidate: the reply validated (with one corrective retry) and sanitised."""
+    raw = complete_json(model, system, prompt, validate=validate_analysis)
+    analysis = sanitize(raw, candidate.stats)
     for warning in analysis.warnings:
-        log.info("%s: fixed the analysis: %s", candidate.ticker, warning)
+        log.info("%s: fixed the analysis of %s: %s", candidate.ticker, model.name, warning)
+    return analysis
+
+
+def to_opportunity(candidate: Candidate, analysis: Analysis, *, now: datetime, model: str, **extra: Any) -> Opportunity:
+    """A scored Opportunity from a candidate and its (final) analysis; extra sets more fields (the debate)."""
+    stats = candidate.stats
     opportunity = Opportunity(
         ticker=candidate.ticker,
         company=candidate.company,
-        created=now,
+        created=utc(now),
         price=stats.price,
         currency=stats.currency,
         score=score(analysis, stats.price),
@@ -490,8 +521,9 @@ def analyze_candidate(
         article_ids=list(dict.fromkeys(article.id for _, article in candidate.impacts)),
         headlines=_headlines(candidate.impacts),
         dip_reasons=list(candidate.dip_reasons),
-        model=model.name,
+        model=model,
         news_after_session=candidate.news_after_session,
+        **extra,
     )
     log.info(
         "%s: %s (%s confidence), %d%% chance up in 6 months, score %.1f.",

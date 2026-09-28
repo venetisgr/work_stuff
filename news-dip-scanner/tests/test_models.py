@@ -1,10 +1,10 @@
 import json
 import math
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from conftest import NOW, make_analysis, make_article, make_bars, make_opportunity, make_stats
+from conftest import NOW, make_analysis, make_article, make_bars, make_debate, make_opportunity, make_stats
 
 from dip_scanner.models import (
     CONFIDENCES,
@@ -12,12 +12,15 @@ from dip_scanner.models import (
     EVENT_TYPES,
     RELATIONS,
     VERDICTS,
+    Analysis,
     Fundamentals,
     Opportunity,
     analysis_from_dict,
     analysis_to_dict,
     article_from_dict,
     article_to_dict,
+    debate_from_dict,
+    debate_to_dict,
     from_iso,
     stats_from_dict,
     stats_to_dict,
@@ -347,3 +350,45 @@ def test_rate_to_and_in_currency_use_the_rates_stored_at_the_analysis():
     today = replace(opp, account_currency="CHF", fx_rate=0.8, fx_rate_today=True)
     assert today.rate_to("CHF") is None  # today's rate is never taken for the analysis's
     assert "fx_rate_today" not in opp.to_dict()
+
+
+# --- the debate ------------------------------------------------------------------------------------------------------
+
+
+def test_a_debate_round_trips_with_the_opportunity():
+    opp = make_opportunity(id=3, debate=make_debate())
+    data = json.loads(json.dumps(opp.to_dict()))
+    assert Opportunity.from_dict(data) == opp
+    debate = data["debate"]
+    assert set(debate) == {"mode", "reason", "rounds", "participants", "judge", "summary", "agreement", "favoured"}
+    first = debate["participants"][0]
+    assert set(first) == {"label", "model", "opening", "final", "critique", "concessions", "changed_mind"}
+    assert (first["label"], first["model"], first["changed_mind"]) == ("B", "openai:gpt-5", True)
+    assert first["final"]["verdict"] == "mixed" and first["opening"]["probability_up_6m"] == 72
+    assert set(first["opening"]) == {f.name for f in fields(Analysis)}
+
+
+def test_single_model_analyses_and_old_records_have_no_debate():
+    opp = make_opportunity()
+    assert opp.to_dict()["debate"] is None and Opportunity.from_dict(opp.to_dict()).debate is None
+    old = opp.to_dict()
+    del old["debate"]  # a record from before debates
+    assert Opportunity.from_dict(old) == opp
+
+
+def test_a_debate_that_cant_be_read_leaves_the_opportunity_readable(caplog):
+    data = make_opportunity(debate=make_debate()).to_dict()
+    data["debate"]["participants"][0]["opening"] = {"verdict": "mixed"}  # fields missing
+    assert Opportunity.from_dict(data).debate is None
+    assert "Couldn't read a stored debate" in caplog.text
+    assert debate_from_dict({"participants": []}) is None  # no mode
+    single = make_debate(mode="single", participants=[make_debate().participants[0]], judge=None, agreement=None)
+    assert debate_from_dict(debate_to_dict(single)) == single
+
+
+def test_a_participant_without_a_final_position_takes_its_opening():
+    data = debate_to_dict(make_debate())
+    del data["participants"][1]["final"], data["participants"][1]["critique"]
+    restored = debate_from_dict(data)
+    assert restored.participants[1].final == restored.participants[1].opening
+    assert restored.participants[1].critique == []

@@ -26,6 +26,15 @@ WEBHOOK_FORMATS = ("slack", "discord", "generic")
 # (triage model, analysis model) per provider. Azure has no default: deployment names are yours to choose.
 DEFAULT_MODELS = {"openai": ("gpt-5-mini", "gpt-5"), "anthropic": ("claude-haiku-4-5", "claude-sonnet-5")}
 
+# LLM_ANALYSIS_MODE: "single" asks one analysis model per dip (LLM_PROVIDER's); "debate" has two models (LLM_DEBATERS)
+# argue it out, with a judge where they disagree (see debate.py).
+ANALYSIS_MODES = ("single", "debate")
+# The two debaters when LLM_DEBATERS isn't set: each provider's default analysis model.
+DEFAULT_DEBATERS = (f"openai:{DEFAULT_MODELS['openai'][1]}", f"anthropic:{DEFAULT_MODELS['anthropic'][1]}")
+JUDGE_ALTERNATE = "alternate"  # LLM_DEBATE_JUDGE default: the debaters' models take turns, by ticker and date
+DEBATE_WHEN = ("disagree", "always")  # [debate] when
+MAX_DEBATE_ROUNDS = 3
+
 _TRUE = ("1", "true", "yes", "on")
 _FALSE = ("0", "false", "no", "off")
 
@@ -52,6 +61,12 @@ class LLMSettings:
     triage_reasoning_effort: str | None = None  # LLM_TRIAGE_REASONING_EFFORT
     analysis_reasoning_effort: str | None = None  # LLM_ANALYSIS_REASONING_EFFORT
     max_output_tokens: int | None = None  # LLM_MAX_OUTPUT_TOKENS
+    analysis_mode: str = "single"  # LLM_ANALYSIS_MODE: "single" | "debate"
+    # LLM_DEBATERS: the two debaters as "provider:model" (azure: "azure:<deployment>"), in the order given.
+    debaters: tuple[str, str] = DEFAULT_DEBATERS
+    # LLM_DEBATE_JUDGE: "alternate", or the "provider:model" that judges every debate (a bare provider in the
+    # variable names the debater of that provider).
+    debate_judge: str = JUDGE_ALTERNATE
 
 
 @dataclass(frozen=True)
@@ -145,6 +160,14 @@ def load_settings(env: Mapping[str, str] | None = None, *, problems: list[Config
             f"WEBHOOK_FORMAT must be one of {', '.join(WEBHOOK_FORMATS)} (got {get('WEBHOOK_FORMAT')!r})."
         )
 
+    analysis_mode = (get("LLM_ANALYSIS_MODE") or "single").lower()
+    if analysis_mode not in ANALYSIS_MODES:
+        raise ConfigError(
+            f"LLM_ANALYSIS_MODE must be one of {', '.join(ANALYSIS_MODES)} (got {get('LLM_ANALYSIS_MODE')!r})."
+        )
+    debaters = parse_debaters(get("LLM_DEBATERS"))
+    judge = parse_judge(get("LLM_DEBATE_JUDGE"), debaters)
+
     smtp_port = _positive_int(get("SMTP_PORT"), "SMTP_PORT")
     if smtp_port is not None and smtp_port > 65535:
         raise ConfigError(f"SMTP_PORT must be a port number between 1 and 65535 (got {smtp_port}).")
@@ -172,6 +195,9 @@ def load_settings(env: Mapping[str, str] | None = None, *, problems: list[Config
             triage_reasoning_effort=_lower(get("LLM_TRIAGE_REASONING_EFFORT")),
             analysis_reasoning_effort=_lower(get("LLM_ANALYSIS_REASONING_EFFORT")),
             max_output_tokens=_positive_int(get("LLM_MAX_OUTPUT_TOKENS"), "LLM_MAX_OUTPUT_TOKENS"),
+            analysis_mode=analysis_mode,
+            debaters=debaters,
+            debate_judge=judge,
         ),
         notify=NotifySettings(
             smtp_host=get("SMTP_HOST"),
@@ -197,6 +223,61 @@ def load_settings(env: Mapping[str, str] | None = None, *, problems: list[Config
             scanner_enabled=_bool(get("SCANNER_ENABLED"), "SCANNER_ENABLED", default=True),
         ),
     )
+
+
+def model_entry(value: str, setting: str) -> tuple[str, str]:
+    """(provider, model) of a "provider:model" entry of LLM_DEBATERS or LLM_DEBATE_JUDGE: "openai:gpt-5" ->
+    ("openai", "gpt-5"); the provider's case and aliases are forgiven ("Claude:claude-sonnet-5" -> anthropic)."""
+    provider, colon, model = value.strip().partition(":")
+    provider = provider.strip().lower()
+    provider = _PROVIDER_ALIASES.get(provider, provider)
+    model = model.strip()
+    if not colon or provider not in LLM_PROVIDERS or not model or any(char.isspace() for char in model):
+        raise ConfigError(
+            f"{setting} entries are provider:model, with a provider from {', '.join(LLM_PROVIDERS)}, e.g. "
+            f"{DEFAULT_DEBATERS[0]} or azure:my-deployment (got {value.strip()!r})."
+        )
+    return provider, model
+
+
+def parse_debaters(value: str | None) -> tuple[str, str]:
+    """LLM_DEBATERS: exactly two different "provider:model" entries, comma-separated; the defaults when unset."""
+    if value is None:
+        return DEFAULT_DEBATERS
+    entries = [entry for entry in value.split(",") if entry.strip()]
+    if len(entries) != 2:
+        raise ConfigError(
+            f"LLM_DEBATERS must name exactly two models, comma-separated, e.g. {','.join(DEFAULT_DEBATERS)} (got "
+            f"{value!r})."
+        )
+    first, second = (":".join(model_entry(entry, "LLM_DEBATERS")) for entry in entries)
+    if first == second:
+        raise ConfigError(f"LLM_DEBATERS names {first} twice; a debate needs two different models.")
+    return first, second
+
+
+def parse_judge(value: str | None, debaters: tuple[str, str]) -> str:
+    """LLM_DEBATE_JUDGE: "alternate" (the default), a provider (the debater of that provider) or "provider:model"."""
+    if value is None or value.strip().lower() == JUDGE_ALTERNATE:
+        return JUDGE_ALTERNATE
+    word = value.strip().lower()
+    provider = _PROVIDER_ALIASES.get(word, word)
+    if provider in LLM_PROVIDERS:
+        matching = [entry for entry in debaters if entry.split(":", 1)[0] == provider]
+        if len(matching) != 1:
+            which = "neither debater is" if not matching else "both debaters are"
+            raise ConfigError(
+                f"LLM_DEBATE_JUDGE={value.strip()} names a provider, but {which} from {provider} (LLM_DEBATERS: "
+                f"{', '.join(debaters)}); write the judge as provider:model, or use alternate."
+            )
+        return matching[0]
+    try:
+        return ":".join(model_entry(value, "LLM_DEBATE_JUDGE"))
+    except ConfigError:
+        raise ConfigError(
+            f"LLM_DEBATE_JUDGE must be alternate, a provider ({', '.join(LLM_PROVIDERS)}) or provider:model, e.g. "
+            f"{DEFAULT_DEBATERS[1]} (got {value.strip()!r})."
+        ) from None
 
 
 def _lower(value: str | None) -> str | None:
@@ -390,12 +471,28 @@ class AccountConfig:
 
 
 @dataclass(frozen=True)
+class DebateConfig:
+    """[debate]: how the two models of LLM_ANALYSIS_MODE=debate argue (ignored in single mode; see debate.py).
+
+    With when = "disagree" the rebuttals and the judge only run when the two openings disagree materially: different
+    verdicts, chances up more than max_probability_gap points apart, potential lows more than max_low_gap_pct of the
+    price apart, or one of them passing somebody's alert rules and the other not. Otherwise the openings are merged.
+    """
+
+    when: str = "disagree"  # "disagree" | "always"
+    rounds: int = 1  # rebuttal rounds before the judge (0: the judge reads the openings)
+    max_probability_gap: float = 15  # points of probability_up_6m
+    max_low_gap_pct: float = 10  # the potential lows' distance, in % of the price
+
+
+@dataclass(frozen=True)
 class ScannerConfig:
     scan: ScanConfig = field(default_factory=ScanConfig)
     dip: DipConfig = field(default_factory=DipConfig)
     universe: UniverseConfig = field(default_factory=UniverseConfig)
     alerts: AlertConfig = field(default_factory=AlertConfig)
     account: AccountConfig = field(default_factory=AccountConfig)
+    debate: DebateConfig = field(default_factory=DebateConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -404,6 +501,7 @@ _SECTIONS: dict[str, type] = {
     "universe": UniverseConfig,
     "alerts": AlertConfig,
     "account": AccountConfig,
+    "debate": DebateConfig,
 }
 # Codes Yahoo uses for hundredths of a currency (pence, cents, agorot) once uppercased; an account is in the main unit.
 _MINOR_ACCOUNT_CODES = {"GBX": "GBP", "ZAC": "ZAR", "ILA": "ILS"}
@@ -464,6 +562,10 @@ def _convert(value: Any, kind: str, where: str, path: Path) -> Any:
         if isinstance(value, list) and all(isinstance(item, str) for item in value):
             return tuple(item.strip() for item in value)
         raise ConfigError(f'{where} in {path} must be a list of strings, e.g. ["a", "b"] (got {value!r}).')
+    if kind == "str":
+        if isinstance(value, str):
+            return value.strip()
+        raise ConfigError(f"{where} in {path} must be a string (got {value!r}).")
     if kind == "str | None":
         if isinstance(value, str):
             return value.strip() or None
@@ -500,6 +602,8 @@ def _normalise(section: Any, path: Path) -> Any:
         return replace(section, verdicts=tuple(item.lower() for item in section.verdicts))
     if isinstance(section, AccountConfig):
         return replace(section, currency=_account_currency(section.currency, path))
+    if isinstance(section, DebateConfig):
+        return replace(section, when=section.when.lower())
     return section
 
 
@@ -558,7 +662,7 @@ def _suffix(value: str) -> str:
 
 
 def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
-    scan, dip, universe, alerts = config.scan, config.dip, config.universe, config.alerts
+    scan, dip, universe, alerts, debate = config.scan, config.dip, config.universe, config.alerts, config.debate
     checks = [
         (scan.interval_minutes > 0, "scan.interval_minutes must be greater than zero"),
         (scan.max_article_age_hours > 0, "scan.max_article_age_hours must be greater than zero"),
@@ -578,6 +682,13 @@ def _check_scanner_config(config: ScannerConfig, path: Path) -> None:
         (alerts.repeat_hours >= 0, "alerts.repeat_hours can't be negative"),
         (alerts.min_score_change >= 0, "alerts.min_score_change can't be negative"),
         (alerts.notice_after_cycles >= 1, "alerts.notice_after_cycles must be at least 1"),
+        (debate.when in DEBATE_WHEN, f'debate.when must be "disagree" or "always" (got {debate.when!r})'),
+        (
+            0 <= debate.rounds <= MAX_DEBATE_ROUNDS,
+            f"debate.rounds must be between 0 and {MAX_DEBATE_ROUNDS} (each round is two more model calls)",
+        ),
+        (0 <= debate.max_probability_gap <= 100, "debate.max_probability_gap must be between 0 and 100"),
+        (debate.max_low_gap_pct >= 0, "debate.max_low_gap_pct can't be negative"),
     ]
     for ok, message in checks:
         if not ok:

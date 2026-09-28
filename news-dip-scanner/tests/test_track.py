@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 
 import pytest
-from conftest import NOW, make_analysis, make_opportunity, make_stats
+from conftest import NOW, make_analysis, make_debate, make_opportunity, make_stats
 
 from dip_scanner.models import Opportunity, PriceBar, Split
 from dip_scanner.track import (
+    FINAL_ROW,
     HORIZON_DAYS,
     STATUSES,
     Outcome,
     benchmark_for,
+    brier,
     evaluate,
+    model_scoreboard,
     quote_day,
     render_track_record,
     score_bucket,
@@ -709,3 +713,90 @@ def test_a_users_currency_return_starts_from_the_rate_stored_for_that_currency()
     assert outcome.account_return_pct == pytest.approx(((150 / 142.5) * 0.74 / 0.73 - 1) * 100)
     missing = with_account_return(evaluate(make_opportunity(fx_rates={"EUR": 0.86}), GAIN, now=LATER), "GBP", rates)
     assert missing.account_return_pct == pytest.approx(((150 / 142.5) * 0.74 / 0.75 - 1) * 100)  # the day's close
+
+
+# --- the debate's model scoreboard ---------------------------------------------------------------------------------
+
+
+def debated(gpt: tuple[int, int], claude: tuple[int, int], outcome: int, *, up: bool | None, **fields) -> Outcome:
+    """An outcome of a debated opportunity: (opening, final) chances per model and the debate's own."""
+    base = make_debate()
+    gpt_side, claude_side = (
+        replace(side, opening=make_analysis(probability_up_6m=opening), final=make_analysis(probability_up_6m=final))
+        for side, (opening, final) in zip(base.participants, (gpt, claude), strict=True)
+    )
+    opp = make_opportunity(
+        debate=replace(base, participants=[gpt_side, claude_side]),
+        analysis=make_analysis(probability_up_6m=outcome),
+    )
+    values = {
+        "opportunity": opp,
+        "last_price": 150.0,
+        "return_pct": 5.3,
+        "max_gain_pct": 8.0,
+        "max_loss_pct": -3.0,
+        "entry_filled": None,
+        "target_hit": None,
+        "low_breached": None,
+        "days": 200 if up is not None else 40,
+        "status": "expired" if up is not None else "waiting_entry",
+        "up_after_6m": up,
+        **fields,
+    }
+    return Outcome(**values)
+
+
+def test_the_scoreboard_brier_scores_are_hand_computed():
+    outcomes = [
+        debated((80, 70), (50, 60), 64, up=True),
+        debated((40, 40), (20, 30), 35, up=False),
+        debated((90, 90), (90, 90), 90, up=None),  # 6 months haven't passed: waiting
+        debated((10, 10), (10, 10), 10, up=True, price_mismatch=True),  # left out entirely
+        Outcome(**{**vars(debated((50, 50), (50, 50), 50, up=True)), "opportunity": make_opportunity()}),  # no debate
+    ]
+    board = {row["model"]: row for row in model_scoreboard(outcomes)}
+    assert list(board) == ["anthropic:claude-sonnet-5", "openai:gpt-5", FINAL_ROW]
+
+    gpt = board["openai:gpt-5"]
+    # Finals 70% (higher) and 40% (not): ((0.7 - 1)² + (0.4 - 0)²) / 2 = (0.09 + 0.16) / 2
+    assert gpt["brier"] == pytest.approx(0.125)
+    # Openings 80% and 40%: ((0.8 - 1)² + 0.4²) / 2 = (0.04 + 0.16) / 2
+    assert gpt["brier_opening"] == pytest.approx(0.10)
+    assert (gpt["label"], gpt["debates"], gpt["scored"], gpt["waiting"]) == ("GPT-5", 3, 2, 1)
+    assert (gpt["mean_probability"], gpt["hit_rate"]) == (55.0, 50.0)
+
+    claude = board["anthropic:claude-sonnet-5"]
+    assert claude["brier"] == pytest.approx((0.4**2 + 0.3**2) / 2)  # 0.125
+    assert claude["brier_opening"] == pytest.approx((0.5**2 + 0.2**2) / 2)  # 0.145
+    assert claude["label"] == "Claude Sonnet 5"
+
+    final = board[FINAL_ROW]
+    assert final["brier"] == pytest.approx(((0.64 - 1) ** 2 + 0.35**2) / 2)  # 0.12605
+    assert final["brier_opening"] is None and final["label"] == "After the debate"
+    assert (final["debates"], final["scored"], final["waiting"]) == (3, 2, 1)
+
+
+def test_the_scoreboard_waits_for_six_months_and_is_empty_without_debates():
+    waiting = model_scoreboard([debated((70, 70), (60, 60), 65, up=None)])
+    assert all(row["brier"] is None and row["hit_rate"] is None and row["scored"] == 0 for row in waiting)
+    assert model_scoreboard([]) == []
+    assert model_scoreboard(sample_outcomes()) == []  # nothing debated
+    assert brier([]) is None
+    assert brier([(100, True), (0, False)]) == 0.0 and brier([(50, True), (50, False)]) == 0.25
+
+
+def test_the_track_record_shows_the_scoreboard_once_there_are_debates():
+    outcomes = [debated((80, 70), (50, 60), 64, up=True), debated((40, 40), (20, 30), 35, up=False)]
+    summary = summarize(outcomes)
+    assert [row["model"] for row in summary["scoreboard"]] == ["anthropic:claude-sonnet-5", "openai:gpt-5", "final"]
+    text = render_track_record(outcomes, summary)
+    assert "## Model scoreboard" in text and "0.25 is what always saying 50% scores" in text
+    assert "| GPT-5 | 2 | 2 | 0.125 | 0.100 | 55% | 50% |" in text
+    assert "| Claude Sonnet 5 | 2 | 2 | 0.125 | 0.145 | 45% | 50% |" in text
+    assert "| After the debate | 2 | 2 | 0.126 | – | 50% | 50% |" in text
+    waiting = render_track_record([debated((70, 70), (60, 60), 65, up=None)], summarize([]))
+    assert "## Model scoreboard" not in waiting  # the summary given has no scoreboard
+    early = [debated((70, 70), (60, 60), 65, up=None)]
+    assert "| GPT-5 | 1 | 0 | – | – | – | – |" in render_track_record(early, summarize(early))
+    plain = sample_outcomes()
+    assert "Model scoreboard" not in render_track_record(plain, summarize(plain))

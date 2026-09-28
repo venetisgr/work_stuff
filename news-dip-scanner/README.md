@@ -2,8 +2,9 @@
 
 Reads about 20 financial news feeds every few minutes and has a language model work out which listed companies each
 story affects. It then checks whether those shares actually fell, and asks a stronger model whether each drop is a
-temporary fear or real damage to the business. Every dip gets a chance of being higher in 6 months, a potential low,
-limit-order ideas and a score, and ends up in a ranked report and, optionally, an alert.
+temporary fear or real damage to the business, or has two models (OpenAI's and Anthropic's) argue it out before a
+judge. Every dip gets a chance of being higher in 6 months, a potential low, limit-order ideas and a score, and ends up
+in a ranked report and, optionally, an alert.
 
 It is a research and alerting tool. It never connects to a broker and never places orders: you do your own checks and
 decide.
@@ -15,7 +16,7 @@ zone. The website deploys to Fly.io for about $4 a month plus the model.
 **Contents:** [What it replicates](#what-it-replicates) · [How it works](#how-it-works) · [Setup](#setup) ·
 [Configuration](#configuration) · [Scanning Athens stocks](#scanning-athens-stocks) ·
 [Investing from a euro account](#investing-from-a-euro-account) · [Commands](#commands) · [Scoring](#scoring) ·
-[Costs](#costs) · [Running it every 5 minutes](#running-it-every-5-minutes) · [Web app](#web-app) ·
+[Debate](#debate) · [Costs](#costs) · [Running it every 5 minutes](#running-it-every-5-minutes) · [Web app](#web-app) ·
 [Deploy to Fly.io](#deploy-to-flyio) · [Security model](#security-model) · [Track record](#track-record) ·
 [Limitations](#limitations) · [Risks](#risks) · [Troubleshooting](#troubleshooting) · [Development](#development)
 
@@ -53,7 +54,8 @@ the scores mean anything. Step 5 stays with you. Nothing here verifies the claim
         │  a symbol without prices is looked up by company name (renamed: OPAP.AT -> ALWN.AT)
         │  dip = down ≥3% on the day, or ≥6% over 5 days, or ≥10% below the 20-day high
         ▼
- analysis (stronger model, one request per candidate, at most 8 per cycle and 40 a day)
+ analysis (stronger model, one request per candidate, at most 8 per cycle and 40 a day; or a debate: two models,
+        │  a rebuttal and a judge where they disagree, see Debate)
         │  input: price statistics + SEC quarterly figures (US) + flagged news + per-ticker headlines
         │         (Yahoo, Google News in English and, for Athens and 5 EU exchanges, the local language)
         │  output: verdict (temporary fear / mixed / fundamental / unclear), P(higher in 6 months),
@@ -85,6 +87,9 @@ Then fill in `.env`:
   - **Anthropic Claude**: `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY` (`pip install -e ".[anthropic]"`); the
     defaults are `claude-haiku-4-5` for triage and `claude-sonnet-5` for the analysis.
   - Any OpenAI-compatible server (Ollama, LM Studio, vLLM, a gateway) through `OPENAI_BASE_URL`.
+  - **Two models debating the analysis**: `LLM_ANALYSIS_MODE=debate`, with both `OPENAI_API_KEY` and
+    `ANTHROPIC_API_KEY` (`pip install -e ".[anthropic]"`); triage stays with `LLM_PROVIDER`'s small model. See
+    [Debate](#debate).
 - **`SEC_USER_AGENT`** (recommended): your name and email, e.g. `Jane Doe jane@example.com`. The SEC requires one.
   With it the analysis gets recent quarterly figures for US-listed companies, and the SEC 8-K feed works; without it
   that feed is skipped.
@@ -140,6 +145,8 @@ The settings you are most likely to change in `scanner.toml`:
 | `[alerts] system_notices` | true | Tell you through the same channels when the scanner stopped or can't work (see [Running it every 5 minutes](#running-it-every-5-minutes)). |
 | `[alerts] notice_after_cycles` | 6 | Cycles in a row with the model unavailable, or every feed failing, before such a notice. |
 | `[account] currency` | none | Your broker account's currency, e.g. `"EUR"`: reports and alerts show price, entry and target in it too, and `track` shows returns in it. |
+| `[debate] when`, `rounds` | disagree, 1 | With `LLM_ANALYSIS_MODE=debate`: rebuttals and a judge only when the two models' first analyses disagree (or always), and how many rebuttal rounds. See [Debate](#debate). |
+| `[debate] max_probability_gap` / `max_low_gap_pct` | 15 / 10 | The chances up (points) and potential lows (% of the price) further apart than this count as a disagreement. |
 
 Times in reports, alerts, summaries, notes and the log are UTC unless `DISPLAY_TZ` in `.env` names another IANA time
 zone (`Europe/Athens`, `Europe/Berlin`, `America/New_York`), shown with its abbreviation: `2026-09-25 18:00 EEST`. A
@@ -331,7 +338,7 @@ risks, catalysts, what to check before buying, and the headlines that flagged it
 price, entry and target also show their value in your currency, with the exchange rate used.
 
 Alerts go to every configured channel. Email and generic webhooks get the full report; Slack, Discord and Telegram
-get one line per opportunity. The rules:
+get one line per opportunity (and a second one for its [debate](#debate), if it had one). The rules:
 
 - **Retries**: an alert that couldn't be sent is retried for 24 hours, labelled "not sent earlier" with its age. It
   counts as delivered once any one channel took it, so a channel that was down at the time doesn't get it later.
@@ -408,6 +415,73 @@ zero-drift lognormal model: `price × exp(-1.645 × volatility × √0.5)`. The 
 about twice as often (roughly 1 in 10), and the price block says so. The model is told to use it, and the worst
 6-month drawdown in the price history, as anchors for its potential low.
 
+## Debate
+
+With `LLM_ANALYSIS_MODE=debate` two models analyse every dip instead of one, argue where they disagree, and a judge
+rules. By default they are OpenAI's `gpt-5` and Anthropic's `claude-sonnet-5`, and the [Fly.io
+deployment](#deploy-to-flyio) runs this way. Triage stays with one small model: it reads every headline all day, and a
+mistake there only costs a look at the wrong company.
+
+How one dip is debated (`dip_scanner/debate.py`):
+
+1. **Openings.** Both models get exactly the prompt a single analysis gets, at the same time, and each answer is
+   checked and fixed like a single analysis (see [Scoring](#scoring)).
+2. **Do they disagree?** Fixed rules, no model involved. The two first analyses disagree when their verdicts differ,
+   their chances of being higher are more than `[debate] max_probability_gap` (15) points apart, their potential lows
+   are more than `max_low_gap_pct` (10%) of the price apart, or one of them would alert somebody and the other
+   wouldn't (anyone's score, chance and verdict rules: `[alerts]`, and on the website each user's own). With `when =
+   "disagree"` (the default) two analyses that agree are merged and nothing else runs: the shared verdict, the
+   average chance (rounded) and target, the lower potential low, entry and confidence, one model's texts, and both
+   models' risks and checks.
+3. **Rebuttal** (`rounds`, 1 by default; 0 to 3). Each model sees its own analysis and the other's, which it only
+   knows as "the other analyst", and answers with its final analysis, a critique (up to 5 points where the other is
+   wrong, unsupported by the news and data given, or uses figures that aren't in them), its concessions and whether it
+   changed its mind. It is told to argue from the input only, not to defer to the other or to a consensus, not to split
+   the difference, and to change its position only for evidence it had missed.
+4. **Judge.** One model reads the case and the two final analyses with their critiques, and rules: the final
+   analysis, a summary of 2-4 sentences (how far they agreed, the crux, how it was settled), the agreement (high,
+   medium or low) and whose case held up better. It sees the two as "Analyst A" and "Analyst B", in an order fixed
+   per stock and day by a hash, so it can't tell which one is its own model. It is told to decide on the evidence and
+   the reasoning, not on confidence, length or majority, to give invented figures no weight, and to lower its
+   confidence and prefer "mixed" or "unclear" when the input can't settle the question. With `LLM_DEBATE_JUDGE`
+   `alternate` (the default) the two models take turns as judge, by another hash of stock and day, so neither side
+   always judges; `openai`, `anthropic` or any `provider:model` fixes the judge.
+5. **Guardrails** on the ruling, listed in the report like other fixed numbers: its chance stays within 5 points of
+   the two models' final chances, its potential low within 5% of the price of theirs, its confidence is at most "low"
+   when their final verdicts are opposite (temporary fear against fundamental damage) and at most "medium" when they
+   otherwise differ, and then the usual checks of [Scoring](#scoring) apply.
+
+**When a model fails.** When one of the two can't give its first analysis (a refused key, no credit, an outage, an
+unusable reply), the other's analysis stands alone, the report says so, and a notice such as "dip-scanner: Anthropic
+unavailable, analysing with OpenAI only" goes to the alert channels, at most once every 12 hours per provider: the
+scanner keeps running. A failed rebuttal keeps that model's earlier analysis, and a failed judge leaves the two final
+analyses merged by the rule above. Only when both models fail does the analysis fail, as a single model's would.
+
+**Settings.** In `.env` (on Fly.io, `fly.toml`'s `[env]`):
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `LLM_ANALYSIS_MODE` | `single` | `debate` turns the debate on (`single`: one analysis model, `LLM_PROVIDER`'s). |
+| `LLM_DEBATERS` | `openai:gpt-5,anthropic:claude-sonnet-5` | The two models as `provider:model` (`azure:<deployment>` for Azure AI Foundry). Each needs its provider's key: a missing one stops the scanner with a message naming it. |
+| `LLM_DEBATE_JUDGE` | `alternate` | Who rules: `alternate`, `openai` or `anthropic` (that debater's model), or any `provider:model`. |
+
+and `[debate]` in `scanner.toml` (see [Configuration](#configuration)). The debaters and the judge use
+`LLM_ANALYSIS_REASONING_EFFORT` like a single analysis model.
+
+**Use `when = "disagree"`.** When the two first analyses agree, a rebuttal and a ruling mostly restate them, and they
+cost three more calls. The debate earns its cost on the dips where the models read the news differently, which are
+the ones where a single model's confident call is least reliable. `when = "always"` debates every dip (see
+[Costs](#costs)).
+
+**What you see.** Reports and `dip-scanner analyze` add a Debate block after the key figures: how it went, the judge's
+summary, each model's first and final verdict, chance and potential low and whether it changed its mind, and each
+one's main critique points. Chat alerts add a line such as `Debate: GPT-5 72% · Claude Sonnet 5 58% → 64% (medium
+agreement)`: each model's final chance, then the outcome's. An analysis says whose it is ("debate: gpt-5 vs
+claude-sonnet-5, judged by claude-sonnet-5"). The day's model use in `run`, `watch` and on the admin page lists the
+openings, rebuttals and rulings per model, and [`dip-scanner track`](#track-record) scores each model once debated
+dips have 6 months of results. `[scan] max_analyses_per_day` and `ANALYZE_LIMIT_PER_USER` count dips analysed, not
+calls: a debate is one analysis, whatever it cost.
+
 ## Costs
 
 The request counts and prompt sizes below come from a live run of the feeds (2026-09-27); the output token counts are
@@ -430,7 +504,7 @@ assumptions, since no live model was run. All of it is an estimate, not a quote.
 - **Total**: roughly 0.25-0.6 million input tokens a day. Reasoning models also bill their thinking as output
   tokens, which is where most of the money goes.
 
-**What that costs a month.** With OpenAI's list prices for the default models, checked on 2026-09-27 (gpt-5-mini
+**What that costs a month.** With OpenAI's list prices for the default models, checked on 2026-09-28 (gpt-5-mini
 $0.25 per million input tokens and $2 per million output tokens, gpt-5 $1.25 and $10; prices change, check the
 provider's page), and the request counts above, 30 days of `watch` at the 5-minute interval:
 
@@ -447,6 +521,25 @@ claude-sonnet-5 at $2 and $10) come to about $18-95 a month for the same days. H
 take the effort setting), so that assumes a triage reply of about 300 output tokens every day; the difference is
 mostly Haiku's input, which costs four times gpt-5-mini's.
 
+**With the debate** (`LLM_ANALYSIS_MODE=debate`: gpt-5 against claude-sonnet-5, at Anthropic's list price of $2 per
+million input tokens and $10 per million output tokens, checked on 2026-09-28; triage as above). Every call's reply is
+counted like an analysis reply of that kind of day. The input is 3,500 tokens for a first analysis, 5,500 for a
+rebuttal (the case and both analyses) and 6,000 for the ruling (the case and both final analyses with their
+critiques), and each model judges half the time. A dip on which the two models agree costs two calls, about twice a
+single analysis ($0.08 instead of $0.04 on a typical day); a debated one five calls, about 5.4 times ($0.21). A month
+of 30 days, triage included, if half the dips are debated with `when = "disagree"`:
+
+| Day | One model (`single`) | Debate, `when = "disagree"` | Debate, `when = "always"` |
+|---|---:|---:|---:|
+| Quiet | about $8 (€7) | about $19 (€16) | about $25 (€22) |
+| Typical | about $27 (€24) | about $76 (€66) | about $105 (€93) |
+| Busy every day | about $86 (€75) | about $261 (€229) | about $368 (€323) |
+
+With `when = "disagree"` a typical month costs between about $46 (the models always agree) and $105 (they never do).
+Busy days cost most because of `[scan] max_analyses_per_day`, which counts dips, not calls: in debate mode, 20 instead
+of 40 halves the worst case. How often the two models disagree is unknown until they have run for a while: the admin
+page shows the cost per step (openings, rebuttals, rulings) and model, and a month estimate from the days so far.
+
 The six Greek feeds (see [Scanning Athens stocks](#scanning-athens-stocks)) add about 60% more articles to triage
 (148 of 396 on the Sunday measured, with slightly longer items, and Greek takes more tokens per character than
 English). Most of a triage request is the fixed prompt, so the cost is mostly more cycles with something new: at most
@@ -454,7 +547,8 @@ one request per cycle, 288 a day at the 5-minute interval instead of about 220, 
 typical days with the default OpenAI models.
 
 Next to the Reddit author's starting capital of €2,500, a year of typical days costs about €280, 11% of the account,
-and a year of busy ones about €900, 36%, before a single trade and before broker fees (see
+and a year of busy ones about €900, 36%, before a single trade and before broker fees; with the debate on
+disagreement, a year of typical days about €800, a third of the account (see
 [Investing from a euro account](#investing-from-a-euro-account)). The scanner has to find a lot of good trades to pay
 for itself on an account that size. To keep the bill down:
 
@@ -464,6 +558,8 @@ for itself on an account that size. To keep the bill down:
   helps with Claude, whose default is high; gpt-5's default is already medium).
 - Use a longer `[scan] interval_minutes` (15 minutes: about 96 triage requests a day) and a lower
   `[scan] max_analyses_per_day`.
+- With the debate, keep `[debate] when = "disagree"` and `rounds = 1`, or go back to `LLM_ANALYSIS_MODE=single`: it
+  costs two to five times as much per dip as one model.
 - Set a monthly spend limit or budget in the provider's console, and keep automatic recharge of prepaid credit off or
   low. When the money runs out, the scanner stops and sends a "dip-scanner stopped" notice (see
   [Running it every 5 minutes](#running-it-every-5-minutes)), instead of running up a bill.
@@ -636,16 +732,17 @@ run `dip-scanner users add-admin you@example.com`, start `dip-scanner serve` and
 
 The website is made to run on one [Fly.io](https://fly.io) Machine in Frankfurt (the nearest region to Greece), with
 the database on a Fly volume and HTTPS at `https://<your-app>.fly.dev` or your own domain, for about $3.85 a month
-plus the model. **[docs/DEPLOY.md](docs/DEPLOY.md) is the full step-by-step guide**, checked against Fly's
-documentation on 2026-09-28, with backups, restoring, updates, costs and troubleshooting. In short, with
-[flyctl](https://fly.io/docs/flyctl/install/) installed, in the `news-dip-scanner` folder:
+plus the models. **[docs/DEPLOY.md](docs/DEPLOY.md) is the full step-by-step guide**, checked against Fly's
+documentation on 2026-09-28, with backups, restoring, updates, costs and troubleshooting. `fly.toml` sets the scanner
+up to [debate](#debate) every dip's analysis between OpenAI's and Anthropic's models, so it needs both keys. In short,
+with [flyctl](https://fly.io/docs/flyctl/install/) installed, in the `news-dip-scanner` folder:
 
 ```bash
 fly auth signup                          # or fly auth login; Fly needs a payment card
 fly apps create my-dip-scanner           # then put the name in fly.toml: app = "my-dip-scanner"
 fly volumes create scanner_data --region fra --size 1 --snapshot-retention 14
 fly secrets set SECRET_KEY=... BASE_URL=https://my-dip-scanner.fly.dev OPENAI_API_KEY=sk-... \
-  SEC_USER_AGENT="Your Name you@example.com"
+  ANTHROPIC_API_KEY=sk-ant-... SEC_USER_AGENT="Your Name you@example.com"
 fly deploy --ha=false
 fly scale count 1                        # exactly one Machine
 fly ssh console -C "dip-scanner users add-admin you@example.com"
@@ -656,14 +753,16 @@ Open the link the last command prints to set your password, then invite people f
 - **Exactly one Machine.** Two would run two scanners (twice the model bill, every alert twice) on two separate
   databases. `fly.toml` keeps the one Machine running when nobody visits (`auto_stop_machines = "off"`), and deploys
   use `--ha=false`.
-- **The files.** [`Dockerfile`](Dockerfile) (Python 3.12, runs as a non-root user, `DATA_DIR=/data`),
-  [`fly.toml`](fly.toml) (region, volume, a `/healthz` check, 512 MB) and
+- **The files.** [`Dockerfile`](Dockerfile) (Python 3.12 with Anthropic's package, runs as a non-root user,
+  `DATA_DIR=/data`), [`fly.toml`](fly.toml) (region, volume, a `/healthz` check, 512 MB, the debate) and
   [`.github/workflows/news-dip-scanner.yml`](../.github/workflows/news-dip-scanner.yml) at the repository's root:
-  ruff and the tests on every change, and a deploy of the default branch once a `FLY_API_TOKEN` secret (from `fly
+  ruff and the tests on every change, and a deploy of every push to `main` once a `FLY_API_TOKEN` secret (from `fly
   tokens create deploy`) is set in GitHub.
 - **Settings.** Secrets with `fly secrets set`, the rest under `[env]` in `fly.toml` (`DISPLAY_TZ` is
-  `Europe/Athens` there). The image carries `scanner.toml` and `feeds.toml`; a copy in `/data` replaces them without
-  a deploy.
+  `Europe/Athens` there, `LLM_PROVIDER` is `openai` for triage and `LLM_ANALYSIS_MODE` is `debate`). The image
+  carries `scanner.toml` and `feeds.toml`; a copy in `/data` replaces them without a deploy.
+- **Alerts:** each person's own Slack or Discord webhook, set on the website's Settings page; the server needs no
+  SMTP or Telegram settings for that (DEPLOY.md shows how to make a webhook).
 - **Your own domain:** `fly certs add dips.example.com`, a DNS record, and `BASE_URL` changed to match.
 - **Backups:** Fly's daily volume snapshots (kept 14 days), plus `fly ssh console -C "dip-scanner backup"` and
   `fly ssh sftp get` to keep a copy of your own.
@@ -751,6 +850,12 @@ verdicts and probabilities mean anything before trusting them:
 - Tickers Yahoo no longer has prices for (delisted, renamed, taken over) are named in a "Left out" line: failed
   companies are often among them, so the figures may look better than what happened.
 - An opportunity with a later analysis of the same stock is marked "superseded", with the later verdict.
+- **Model scoreboard**: with the [debate](#debate), each model's chance of being higher is scored against what
+  happened once debated opportunities have 6 months of results, and so is the outcome of the debate. The Brier score
+  is the average of (probability - outcome)², with the probability from 0 to 1 and the outcome 1 when the price was
+  higher after 6 months, else 0: 0 is perfect, and saying 50% every time scores 0.25. Each model is scored on its
+  final analyses and, as a second figure, on its first ones (did the rebuttal help it?), next to its average chance
+  and how often the stock was higher. Until then the scoreboard shows "–".
 
 The original author reviewed open orders every couple of days. The scanner helps with that: a later analysis that
 undercuts an alert is sent as a "thesis change" notice, and `report` and `track` mark superseded ideas. Checking
@@ -758,8 +863,12 @@ your open orders against them is still yours to do.
 
 ## Limitations
 
-- **The prompts haven't been tested against a live model.** The tests use scripted models. Before relying on it, try
-  `dip-scanner analyze` on a few tickers you know and read the reasoning.
+- **The prompts haven't been tested against a live model.** The tests use scripted models, the debate's too. Before
+  relying on it, try `dip-scanner analyze` on a few tickers you know and read the reasoning (and, in debate mode, the
+  critiques and the ruling).
+- **Two models don't make a calibrated one.** The debate catches invented figures and one-sided readings of the news,
+  but both models read the same headlines and can share the same blind spot. Its chances are still estimates until
+  the [scoreboard](#track-record) says otherwise.
 - **RSS is slow and shallow.** Headlines reach public feeds minutes to hours after professional terminals, and many
   feeds carry a title and a line of summary only. By the time a dip is flagged, fast money has usually acted.
 - **Prices are daily bars from Yahoo Finance's unofficial chart API**, delayed and occasionally wrong or missing. It
@@ -819,6 +928,8 @@ money:
 | A feed fails in `feeds --check` | Some sites block cloud IP addresses; feeds.toml notes the ones known to. Switch it off or use an alternate. |
 | `No prices (unknown symbol ...)` in the notes | The triage gave a symbol Yahoo doesn't know, and Yahoo's search found no listing of that company on the same exchange (or couldn't be reached: then it is asked again next cycle). Companies that were taken over or delisted end here. The symbol is rechecked after 7 days. If you know the current symbol, add it to the watchlist. |
 | `Symbol renamed/resolved via Yahoo search ...: OPAP.AT -> ALWN.AT` | The triage's symbol has no prices and the company was found under another one, which was checked instead. If the match is wrong, add the triage's symbol, the one before the arrow, to `[universe] exclude`: its news is then skipped, and the found company's own news still counts. Excluding the found symbol drops all of that company's news. |
+| `Configuration problem: LLM_ANALYSIS_MODE=debate uses anthropic:claude-sonnet-5 (LLM_DEBATERS), but ANTHROPIC_API_KEY isn't set` | The debate needs a key for each debater's provider: set it, name other models in `LLM_DEBATERS`, or set `LLM_ANALYSIS_MODE=single`. |
+| `Debate of AMD: openai:gpt-5 failed, so anthropic:claude-sonnet-5 analysed it alone: ...` in the notes, or a notice "dip-scanner: OpenAI unavailable, analysing with Anthropic only" | One debater couldn't answer (the reason follows); the other analysed the dip alone, and the scanner goes on. Fix that provider's key, credit or spend limit, or wait for its outage to end. |
 | `Daily limit of 40 analyses reached ...` in the notes | `[scan] max_analyses_per_day` was used up in the last 24 hours; the named candidates are analysed once there is room. Raise it, or set 0 for no limit, if the bill allows. |
 | `Already analysed on the latest session's prices, so new news waits ...` | More news (often in the evening or at the weekend) about a ticker analysed on the same session's prices; it is analysed after the next session, 12 hours after the last analysis (`[scan] reanalyse_same_session_hours`) or when the price falls by another `min_drop_1d_pct`. |
 | A "dip-scanner stopped" notice | The reason is in it (the same message `run` prints). Fix that setting; `dip-scanner run --no-notify` checks it. |
@@ -853,11 +964,12 @@ without sleeping.
 | `detect.py` | Dip rules, severity and candidate selection |
 | `symbols.py` | The current symbol of a renamed company, from Yahoo's search by name |
 | `analyze.py` | The fear-vs-fundamentals analysis, number checks and the score |
+| `debate.py` | Two models debating the analysis: openings, the agreement check and merge, rebuttals, the anonymised judge, guardrails and fallbacks |
 | `report.py` / `notify.py` | Markdown/HTML/JSON reports, the news digest, and alerts |
-| `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing), rate-limited and scrubbed |
-| `track.py` | The track record, its benchmark indices and returns in the account currency |
+| `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing, a debater unavailable), rate-limited and scrubbed |
+| `track.py` | The track record, its benchmark indices, returns in the account currency and the debate's model scoreboard |
 | `fx.py` | Exchange rates from Yahoo Finance for `[account] currency` and users' currencies, and minor currency units (pence, cents, agorot) |
-| `llm.py` | OpenAI, Azure AI Foundry and Anthropic chat models, JSON replies |
+| `llm.py` | OpenAI, Azure AI Foundry and Anthropic chat models, JSON replies, the debate's models (`DebatePanel`) |
 | `config.py` / `models.py` | Settings and config files; the shared data types |
 | `recipients.py` | Who gets alerts: the command line's `.env` channels, and each website user with their own rules and channels |
 | `accounts.py` | The website's users, invites, sessions, password links, login limits, per-user settings and "Analyse now" jobs |

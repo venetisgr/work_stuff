@@ -6,7 +6,9 @@ log. Three kinds of notice go to every configured channel:
 
 - STOPPED: `run` or `watch` stopped on a setup problem (LLMSetupError or ConfigError), sent by the command line;
 - MODEL_UNAVAILABLE: the model couldn't be used for [alerts] notice_after_cycles cycles in a row;
-- FEEDS_FAILING: every feed failed for that many cycles in a row.
+- FEEDS_FAILING: every feed failed for that many cycles in a row;
+- DEBATER_UNAVAILABLE (one kind per provider, debater_notice_kind): with LLM_ANALYSIS_MODE=debate, one of the two
+  models failed and the other analysed a dip alone (debate.py), so the scanner goes on without the debate.
 
 Each kind goes out at most once every NOTICE_REPEAT (12 hours). The times are kept in the database, so cron runs (a
 new process every 5 minutes) don't repeat a notice either; one that no channel took is tried again after
@@ -37,6 +39,7 @@ log = logging.getLogger(__name__)
 STOPPED = "stopped"
 MODEL_UNAVAILABLE = "model_unavailable"
 FEEDS_FAILING = "feeds_failing"
+DEBATER_UNAVAILABLE = "debater_unavailable"
 NOTICE_REPEAT = timedelta(hours=12)
 NOTICE_RETRY = timedelta(hours=1)  # after an attempt no channel took
 FOOTER = "A notice of this kind is sent at most once every 12 hours. Set [alerts] system_notices = false to stop them."
@@ -124,6 +127,38 @@ def send_notice(
     if sent:
         log.info("Sent a system notice: %s", subject)
     return sent
+
+
+_PROVIDER_NAMES = {"openai": "OpenAI", "anthropic": "Anthropic", "azure": "Azure AI Foundry"}
+
+
+def provider_name(label: str) -> str:
+    """The service of a "provider:model" label for people: "openai:gpt-5" -> "OpenAI"."""
+    provider = label.split(":", 1)[0]
+    return _PROVIDER_NAMES.get(provider, provider)
+
+
+def debater_notice_kind(provider: str) -> str:
+    """The notice kind for a failed debater of a provider: each provider's is rate-limited on its own."""
+    return f"{DEBATER_UNAVAILABLE}:{provider}"
+
+
+def debater_notice_subject(failed: str, other: str | None) -> str:
+    """ "dip-scanner: OpenAI unavailable, analysing with Anthropic only" (failed and other are "provider:model")."""
+    alone = f", analysing with {provider_name(other)} only" if other else ""
+    return f"dip-scanner: {provider_name(failed)} unavailable{alone}"
+
+
+def debater_notice_lines(failed: str, other: str | None, ticker: str, reason: str, now: datetime) -> list[str]:
+    """The body of a DEBATER_UNAVAILABLE notice: which model failed on which dip, and what that means."""
+    alone = f"{other} analysed it alone" if other else "the other model analysed it alone"
+    return [
+        f"{provider_name(failed)} unavailable, analysing with {provider_name(other or '')} only: {failed} failed "
+        f"its analysis of {ticker} at {format_when(now)} ({one_line(reason)}), so {alone}, without the debate.",
+        "The scanner keeps running: each dip is still analysed, by one model instead of two, until the other answers "
+        "again (the reports say so for every analysis concerned). Check that provider's status page, its API key and "
+        "its credit or spend limit.",
+    ]
 
 
 def stopped_lines(command: str, reason: str, now: datetime) -> list[str]:

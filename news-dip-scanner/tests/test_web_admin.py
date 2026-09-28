@@ -461,7 +461,7 @@ def test_a_feed_that_needs_a_contact_user_agent_is_fetched_with_one(tmp_path):
 
 def test_the_price_table():
     prices = admin.MODEL_PRICES
-    assert prices.checked == date(2026, 9, 27)  # the README's "Costs" section: update both together
+    assert prices.checked == date(2026, 9, 28)  # the README's "Costs" section: update both together
     assert prices.price_of("gpt-5-mini") == (0.25, 2.00)
     assert prices.price_of("GPT-5") == (1.25, 10.00)
     assert prices.price_of("gpt-5-2025-08-07") == (1.25, 10.00)  # a dated snapshot
@@ -515,8 +515,28 @@ def test_model_use_today_and_this_week_with_an_estimated_cost(site):
     assert "Thu 24 Sep" in page and "Fri 25 Sep" in page and "(so far)" in page
     assert "Sat 19 Sep" in page and "Fri 18 Sep" not in page  # 7 UTC days
     assert "$1.00+" in page  # today had calls to a model without a price
-    assert "checked on 27 Sep 2026" in page and '<span class="mono">gpt-5-mini</span> $0.25 in, $2 out' in page
+    assert "checked on 28 Sep 2026" in page and '<span class="mono">gpt-5-mini</span> $0.25 in, $2 out' in page
     assert "An estimate at list prices, in US dollars." in page
+
+
+def test_a_debates_calls_are_priced_per_step_and_model(site):
+    today = NOW - timedelta(hours=2)
+    for step, model in (
+        ("analysis:opening", "gpt-5"),
+        ("analysis:opening", "claude-sonnet-5"),
+        ("analysis:rebuttal", "gpt-5"),
+        ("analysis:rebuttal", "claude-sonnet-5"),
+        ("analysis:judge", "claude-sonnet-5"),
+    ):
+        record_calls(site.store, today, step, model, 1, 100_000, 10_000)
+    page = site.admin().get("/admin").text
+    assert 'Debate: openings <span class="mono small muted">claude-sonnet-5</span>' in page
+    assert 'Debate: rebuttals <span class="mono small muted">gpt-5</span>' in page
+    assert 'Debate: judge <span class="mono small muted">claude-sonnet-5</span>' in page
+    # claude-sonnet-5 at $2 in and $10 out: 100k in and 10k out cost $0.30; gpt-5 at $1.25 and $10: $0.225.
+    assert '<td class="num" data-label="Est. cost">$0.30</td>' in page
+    assert "No price is known" not in page
+    assert [admin.UsageRow("analysis:judge", "x", 1, 0, 0, 0, None).step_label] == ["Debate: judge"]
 
 
 def test_no_model_use_yet(site):

@@ -65,7 +65,13 @@ _CYCLE_FACTS = (
     ("thesis_changes", "thesis change", "thesis changes"),
     ("model_calls", "model call", "model calls"),
 )
-_STEP_LABELS = {"triage": "Triage", "analysis": "Analysis"}
+_STEP_LABELS = {
+    "triage": "Triage",
+    "analysis": "Analysis",
+    "analysis:opening": "Debate: openings",
+    "analysis:rebuttal": "Debate: rebuttals",
+    "analysis:judge": "Debate: judge",
+}
 _WEBHOOK_LABELS = {"slack": "Slack", "discord": "Discord", "generic": "Webhook"}
 
 
@@ -101,10 +107,10 @@ class PriceTable:
         return (input_tokens * price[0] + output_tokens * price[1]) / 1_000_000
 
 
-# The list prices the README's "Costs" section quotes for the default models, checked on 2026-09-27. Update this and
-# the README together when the providers change their prices.
+# The list prices the README's "Costs" section quotes for the default models (the debate's included), checked on
+# 2026-09-28. Update this and the README together when the providers change their prices.
 MODEL_PRICES = PriceTable(
-    checked=date(2026, 9, 27),
+    checked=date(2026, 9, 28),
     prices={
         "gpt-5-mini": (0.25, 2.00),
         "gpt-5": (1.25, 10.00),

@@ -24,14 +24,25 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .analyze import analyze_candidate
-from .config import ConfigError, ScannerConfig, Settings
+from .config import AlertConfig, ConfigError, ScannerConfig, Settings
+from .debate import DebaterFailure, debate_candidate
 from .detect import dip_reasons, news_after_session, select_candidates, session_day, severity
 from .feeds import CONTACT_USER_AGENT_MISSING, fetch_all, needs_contact_user_agent, ticker_news, user_agent_for
 from .fundamentals import SecFundamentals
 from .fx import FxRates
-from .llm import ChatModel, LLMError, LLMSetupError, LLMUnavailableError, Usage
-from .models import Article, Candidate, Feed, Impact, ModelUsage, Opportunity, utc
-from .notices import FEEDS_FAILING, MODEL_UNAVAILABLE, one_line, scrub, secrets_of, send_notice
+from .llm import ChatModel, DebatePanel, LLMError, LLMSetupError, LLMUnavailableError, Usage
+from .models import Article, Candidate, Feed, Fundamentals, Impact, ModelUsage, Opportunity, utc
+from .notices import (
+    FEEDS_FAILING,
+    MODEL_UNAVAILABLE,
+    debater_notice_kind,
+    debater_notice_lines,
+    debater_notice_subject,
+    one_line,
+    scrub,
+    secrets_of,
+    send_notice,
+)
 from .notify import Notifier, NotifyError, TelegramNotifier, WebhookNotifier, short_alert
 from .prices import PriceError, PriceFetchError, YahooPrices
 from .recipients import Recipient
@@ -170,6 +181,9 @@ class MeteredModel:
 class Scanner:
     """Runs scan cycles with everything it needs passed in (so tests can pass fakes).
 
+    analysis_model is a ChatModel, or a llm.DebatePanel with LLM_ANALYSIS_MODE=debate: then every analysis (in a cycle,
+    `analyze` and the website's "Analyse now") is a two-model debate (debate.py) under [debate].
+
     Feeds that are disabled, or that need a contact User-Agent nobody configured (sec.gov without SEC_USER_AGENT),
     are left out once, here, with a warning, instead of failing every cycle. fx gives exchange rates for [account]
     currency (by default from the same Yahoo client as the prices).
@@ -190,7 +204,7 @@ class Scanner:
         feeds: list[Feed],
         store: Store,
         triage_model: ChatModel,
-        analysis_model: ChatModel,
+        analysis_model: ChatModel | DebatePanel,
         prices: YahooPrices,
         fundamentals: SecFundamentals | None,
         notifiers: list[Notifier],
@@ -359,7 +373,7 @@ class Scanner:
         fatal: Exception | None = None
         for index, candidate in enumerate(candidates):
             try:
-                opportunity = self._analyze(candidate, now, result=result, currencies=currencies)
+                opportunity = self._analyze(candidate, now, result=result, currencies=currencies, recipients=recipients)
             except LLMUnavailableError as exc:
                 left = ", ".join(c.ticker for c in candidates[index:])
                 result.notes.append(f"The analysis model is unavailable, left for the next cycle: {left} ({exc})")
@@ -597,10 +611,12 @@ class Scanner:
         context_news: bool | None = None,
         result: CycleResult | None = None,
         currencies: tuple[str, ...] | None = None,
+        recipients: list[Recipient] | None = None,
     ) -> Opportunity:
-        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model (its calls recorded). The
-        opportunity carries the exchange rates into currencies (by default [account] currency and the currencies
-        callable's), and [account] currency's as its fx_rate."""
+        """Gather per-ticker news and fundamentals for a candidate and ask the analysis model, or the debate's models
+        (their calls recorded). The opportunity carries the exchange rates into currencies (by default [account]
+        currency and the currencies callable's), and [account] currency's as its fx_rate. recipients: the cycle's
+        (None: asked for here when a debate needs their alert rules or a notice)."""
         if context_news is None:
             context_news = self.config.scan.context_news
         extra = []
@@ -611,17 +627,105 @@ class Scanner:
         # A preferred listing (ASML.AS) gets the SEC figures of the company's US listing (ASML).
         sec_ticker = self.config.universe.sec_symbol(candidate.ticker)
         fundamentals = self.fundamentals.get(sec_ticker) if self.fundamentals is not None else None
-        model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
-        try:
-            opportunity = analyze_candidate(
-                model, candidate, fundamentals=fundamentals, extra_news=extra, now=now, sec_ticker=sec_ticker
+        if isinstance(self.analysis_model, DebatePanel):
+            opportunity = self._debate(
+                self.analysis_model,
+                candidate,
+                now,
+                fundamentals=fundamentals,
+                extra=extra,
+                sec_ticker=sec_ticker,
+                result=result,
+                recipients=recipients,
             )
-        finally:
-            if result is not None:
-                result.model_calls += model.answered
+        else:
+            model = MeteredModel(self.analysis_model, self.store, step="analysis", when=now, ticker=candidate.ticker)
+            try:
+                opportunity = analyze_candidate(
+                    model, candidate, fundamentals=fundamentals, extra_news=extra, now=now, sec_ticker=sec_ticker
+                )
+            finally:
+                if result is not None:
+                    result.model_calls += model.answered
         if currencies is None:
             currencies = self._currencies(now)
         return self._with_benchmark_level(self._with_fx(opportunity, now, result, currencies), now)
+
+    def _debate(
+        self,
+        panel: DebatePanel,
+        candidate: Candidate,
+        now: datetime,
+        *,
+        fundamentals: Fundamentals | None,
+        extra: list[Article],
+        sec_ticker: str,
+        result: CycleResult | None,
+        recipients: list[Recipient] | None,
+    ) -> Opportunity:
+        """A candidate's analysis as a debate (debate.py): every call metered with its step, the recipients' alert
+        rules for the agreement check, and a failed debater noted and told to those who get system notices. Without
+        recipients (they couldn't be loaded) [alerts] and the notifiers passed in stand in for them."""
+        if recipients is None and result is None:  # a manual analysis; in a cycle they couldn't be loaded (noted)
+            recipients = self._recipients(now, CycleResult(started=now))
+        meters: list[MeteredModel] = []
+
+        def meter(model: ChatModel, step: str) -> ChatModel:
+            metered = MeteredModel(model, self.store, step=step, when=now, ticker=candidate.ticker)
+            meters.append(metered)
+            return metered
+
+        try:
+            outcome = debate_candidate(
+                panel,
+                candidate,
+                fundamentals=fundamentals,
+                extra_news=extra,
+                now=now,
+                sec_ticker=sec_ticker,
+                config=self.config.debate,
+                alert_rules=self._alert_rules(candidate.ticker, recipients),
+                meter=meter,
+            )
+        finally:
+            if result is not None:
+                result.model_calls += sum(metered.answered for metered in meters)
+        for failure in outcome.failures:
+            if result is not None:
+                result.notes.append(_failure_note(candidate.ticker, failure))
+            if failure.stage == "opening":
+                self._debater_notice(failure, candidate.ticker, now, recipients)
+        return outcome.opportunity
+
+    def _alert_rules(self, ticker: str, recipients: list[Recipient] | None) -> list[AlertConfig]:
+        """The alert rules the debate's agreement check compares the openings with: those of every recipient the
+        ticker could alert ([alerts] when there are none)."""
+        rules = [
+            recipient.alerts
+            for recipient in recipients or []
+            if not recipient.only_watchlist or ticker in recipient.watchlist
+        ]
+        return rules or [self.config.alerts]
+
+    def _debater_notice(
+        self, failure: DebaterFailure, ticker: str, now: datetime, recipients: list[Recipient] | None
+    ) -> None:
+        """Tell the recipients that get system notices that a debater failed and the other analyses alone (at most once
+        per provider every 12 hours, notices.send_notice). Never raises."""
+        if recipients is None:
+            notifiers = self.notifiers
+        else:
+            notifiers = [notifier for r in recipients if r.gets_notices for notifier in r.notifiers]
+        try:
+            self._notice(
+                debater_notice_kind(failure.provider),
+                now,
+                notifiers,
+                subject=debater_notice_subject(failure.label, failure.other),
+                lines=debater_notice_lines(failure.label, failure.other, ticker, str(failure.error), now),
+            )
+        except Exception:  # a notice must never cost the analysis
+            log.warning("Couldn't send the notice about the failed debater %s.", failure.label, exc_info=True)
 
     def _with_benchmark_level(self, opp: Opportunity, now: datetime) -> Opportunity:
         """The opportunity with its exchange's benchmark index and that index's level now, when the index's quote is
@@ -1073,6 +1177,16 @@ def cycle_stats(result: CycleResult) -> dict[str, int]:
         "recipients": result.recipients,
         "sent": result.sent,
     }
+
+
+def _failure_note(ticker: str, failure: DebaterFailure) -> str:
+    """A cycle note about a failed call of a debate."""
+    reason = one_line(failure.error, 200)
+    if failure.stage == "opening":
+        return f"Debate of {ticker}: {failure.label} failed, so {failure.other} analysed it alone: {reason}"
+    if failure.stage == "judge":
+        return f"Debate of {ticker}: the judge {failure.label} failed, so the positions were merged by rule: {reason}"
+    return f"Debate of {ticker}: {failure.label}'s rebuttal failed, so its earlier position stands: {reason}"
 
 
 def _is_chat(notifier: object) -> bool:

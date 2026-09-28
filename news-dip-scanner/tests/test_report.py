@@ -6,11 +6,12 @@ from html import unescape
 from html.parser import HTMLParser
 
 import pytest
-from conftest import NOW, make_analysis, make_article, make_impact, make_opportunity, make_stats
+from conftest import NOW, make_analysis, make_article, make_debate, make_impact, make_opportunity, make_stats
 
 from dip_scanner.models import Opportunity
 from dip_scanner.report import (
     DISCLAIMER,
+    debate_line,
     display_zone,
     display_zone_as,
     for_currency,
@@ -24,6 +25,7 @@ from dip_scanner.report import (
     in_account,
     md_escape,
     md_link,
+    model_display_name,
     relative_to,
     render_html,
     render_markdown,
@@ -566,3 +568,92 @@ def test_for_currency_uses_the_stored_rate_else_todays_labelled_as_such():
     assert (failed.account_currency, failed.fx_rate) == ("CHF", None) and format_money(1.0, failed) == "$1.00"
     assert for_currency(opp, "CHF").fx_rate is None  # without fx nothing is fetched
     assert for_currency(opp, None, fx=fx).account_currency is None and len(fx.calls) == 1
+
+
+# --- debates ---------------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("label", "expected"),
+    [
+        ("openai:gpt-5", "GPT-5"),
+        ("gpt-5-mini", "GPT-5 mini"),
+        ("openai:gpt-5.1", "GPT-5.1"),
+        ("anthropic:claude-sonnet-5", "Claude Sonnet 5"),
+        ("claude-haiku-4-5", "Claude Haiku 4.5"),
+        ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5"),
+        ("claude-3-5-sonnet", "Claude Sonnet 3.5"),
+        ("azure:my-deployment", "my-deployment"),
+        ("o3", "o3"),
+    ],
+)
+def test_model_display_names(label, expected):
+    assert model_display_name(label) == expected
+
+
+def test_the_debate_line_for_chat_alerts():
+    judged = make_opportunity(debate=make_debate(), analysis=make_analysis(probability_up_6m=64))
+    assert debate_line(judged) == "GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)"
+    agreed = make_opportunity(debate=make_debate(mode="agreed", judge=None, agreement="high", favoured=None))
+    assert debate_line(agreed) == "GPT-5 66% · Claude Sonnet 5 58% → 68% (agreed)"
+    merged = make_opportunity(debate=make_debate(judge=None, favoured=None, reason="The judge failed: timeout"))
+    assert debate_line(merged) == "GPT-5 66% · Claude Sonnet 5 58% → 68% (medium agreement, no judge)"
+    alone = make_debate(mode="single", participants=make_debate().participants[:1], judge=None, agreement=None)
+    assert debate_line(make_opportunity(debate=alone)) == "GPT-5 alone: 68% (the other model failed)"
+    assert debate_line(make_opportunity()) is None
+
+
+def test_reports_show_the_debate_after_the_key_figures():
+    opp = make_opportunity(debate=make_debate(), model="debate: gpt-5 vs claude-sonnet-5, judged by claude-sonnet-5")
+    markdown = render_markdown([opp], title="Dips", generated=NOW)
+    debate = markdown.index("**Debate:**")
+    assert markdown.index("| Confidence | Medium |") < debate < markdown.index("**What the market fears:**")
+    assert (
+        "**Debate:** medium agreement · judged by Claude Sonnet 5 after 1 rebuttal round · favoured GPT-5" in markdown
+    )
+    assert "**The judge's summary:** They agree the drop is partly sentiment" in markdown
+    assert "| Model | Opening | Final | Changed mind |" in markdown
+    assert "| GPT-5 (Analyst B) | Temporary fear · 72% · low $118.00 | Mixed · 66% · low $115.00 | yes |" in markdown
+    assert "| Claude Sonnet 5 (Analyst A) | Mixed · 58% · low $110.00 | Mixed · 58% · low $110.00 | no |" in markdown
+    assert "**GPT-5's critique**\n\n- Uses a revenue figure the input doesn't give" in markdown
+    assert "- 4th" not in markdown  # the top 3 points per model
+    assert "_Analysis by debate: gpt-5 vs claude-sonnet-5, judged by claude-sonnet-5;" in markdown
+
+    page = render_html([opp], title="Dips", generated=NOW)
+    text = unescape(page)
+    assert "Debate</p>" in page and "medium agreement · judged by Claude Sonnet 5" in text
+    assert "The judge's summary:" in text and "Temporary fear · 72% · low $118.00" in text
+    assert "GPT-5's critique" in text and "4th" not in text
+
+
+def test_the_debate_block_for_merged_and_lone_analyses():
+    agreed = make_debate(
+        mode="agreed", judge=None, favoured=None, agreement="high", summary="Both analysts called it Mixed."
+    )
+    markdown = render_markdown([make_opportunity(debate=agreed)], title="Dips", generated=NOW)
+    assert "**Debate:** the two models agreed, so their analyses were merged without a rebuttal or a judge" in markdown
+    assert "**Summary:** Both analysts called it Mixed." in markdown
+    assert "| GPT-5 | Temporary fear" in markdown  # no Analyst labels without a judge
+
+    alone = make_debate(
+        mode="single",
+        participants=make_debate().participants[:1],
+        judge=None,
+        agreement=None,
+        favoured=None,
+        summary=None,
+        reason="anthropic:claude-sonnet-5 failed, so openai:gpt-5 analysed it alone: no credit",
+    )
+    markdown = render_markdown([make_opportunity(debate=alone)], title="Dips", generated=NOW)
+    assert "**Debate:** only GPT-5 answered: anthropic:claude-sonnet-5 failed, so openai:gpt-5" in markdown
+    assert "| GPT-5 | Temporary fear · 72% · low $118.00 | Mixed · 66% · low $115.00 | – |" in markdown
+
+
+def test_debate_texts_are_escaped():
+    debate = make_debate(summary="<script>alert(1)</script> [x](javascript:alert(1))")
+    debate.participants[0].critique[0] = "<img src=x onerror=alert(1)>"
+    opp = make_opportunity(debate=debate)
+    markdown = render_markdown([opp], title="Dips", generated=NOW)
+    assert "\\<script\\>" in markdown and "- \\<img src=x" in markdown and "\\[x\\]" in markdown
+    page = render_html([opp], title="Dips", generated=NOW)
+    assert "<script>" not in page and "<img" not in page

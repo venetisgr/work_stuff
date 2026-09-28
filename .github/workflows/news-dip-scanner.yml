@@ -1,17 +1,20 @@
-# news-dip-scanner: lint and test every pull request and push that touches it, and deploy it to Fly.io after a push to
-# the repository's default branch, or by hand (Actions > news-dip-scanner > Run workflow, for the branch you pick).
-# Deploying needs the FLY_API_TOKEN repository secret (`fly tokens create deploy`); without it the deploy job only
-# says so. See news-dip-scanner/docs/DEPLOY.md.
+# news-dip-scanner: lint and test every pull request and push that touches the Python app, and deploy it to Fly.io
+# after a push to main, or by hand (Actions > news-dip-scanner > Run workflow, on main; on another branch it only
+# tests). Deploying needs the FLY_API_TOKEN repository secret (`fly tokens create deploy`); without it the deploy job
+# only says so. Changes to the Next.js front end alone (news-dip-scanner/frontend/, which Vercel deploys) don't run this
+# workflow, so they never restart the scanner on Fly.io. See news-dip-scanner/docs/DEPLOY.md.
 name: news-dip-scanner
 
 on:
   pull_request:
     paths:
       - "news-dip-scanner/**"
+      - "!news-dip-scanner/frontend/**"
       - ".github/workflows/news-dip-scanner.yml"
   push:
     paths:
       - "news-dip-scanner/**"
+      - "!news-dip-scanner/frontend/**"
       - ".github/workflows/news-dip-scanner.yml"
   workflow_dispatch:
 
@@ -53,10 +56,11 @@ jobs:
   deploy:
     name: Deploy to Fly.io
     needs: test
-    # Only from the default branch (whatever it is called), or when started by hand.
+    # Only main is deployed: after a push to it, or when started by hand on it. Vercel's production branch is main too,
+    # so the front end and the API it calls go out from the same commits.
     if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     concurrency:

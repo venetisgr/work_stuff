@@ -106,3 +106,16 @@ notice_after_cycles = 6
 # too ("$132.00 ≈ €115.93") for stocks that trade in another currency, at Yahoo Finance's rate at the analysis, and
 # `dip-scanner track` shows returns in it next to the local ones, exchange-rate moves included. Unset: no conversion.
 # currency = "EUR"
+
+[debate]
+# Only with LLM_ANALYSIS_MODE=debate in .env: two models (LLM_DEBATERS) analyse each dip independently, then argue.
+# "disagree" (recommended) runs the rebuttals and the judge only when the two first analyses disagree materially:
+# different verdicts, chances up more than max_probability_gap points apart, potential lows more than
+# max_low_gap_pct of the price apart, or one of them passing somebody's alert rules and the other not. Otherwise
+# they are merged without more calls (two calls a dip instead of five). "always" debates every dip.
+when = "disagree"
+# Rebuttal rounds before the judge: 0 to 3. Each round is two more model calls; 0 lets the judge read the first
+# analyses.
+rounds = 1
+max_probability_gap = 15
+max_low_gap_pct = 10

@@ -21,7 +21,17 @@ import requests
 from requests.structures import CaseInsensitiveDict
 
 from dip_scanner.llm import Usage
-from dip_scanner.models import Analysis, Article, Candidate, Impact, Opportunity, PriceBar, PriceStats
+from dip_scanner.models import (
+    Analysis,
+    Article,
+    Candidate,
+    Debate,
+    Impact,
+    Opportunity,
+    Participant,
+    PriceBar,
+    PriceStats,
+)
 from dip_scanner.report import set_display_zone
 
 NOW = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
@@ -361,6 +371,39 @@ def make_analysis(**overrides: Any) -> Analysis:
     }
     values.update(overrides)
     return Analysis(**values)
+
+
+def make_debate(**overrides: Any) -> Debate:
+    """A judged debate: GPT-5 (Analyst B) moved from a temporary fear at 72% to mixed at 66% after Claude Sonnet 5's
+    critique; Claude (Analyst A) kept its mixed 58%; Claude judged, with medium agreement, favouring GPT-5."""
+    gpt = Participant(
+        label="B",
+        model="openai:gpt-5",
+        opening=make_analysis(probability_up_6m=72),
+        final=make_analysis(verdict="mixed", probability_up_6m=66, potential_low=115.0),
+        critique=["Uses a revenue figure the input doesn't give", "Ignores the heavy volume", "Too cautious", "4th"],
+        concessions=["The guidance cut is real"],
+        changed_mind=True,
+    )
+    claude = Participant(
+        label="A",
+        model="anthropic:claude-sonnet-5",
+        opening=make_analysis(verdict="mixed", probability_up_6m=58, potential_low=110.0, confidence="low"),
+        final=make_analysis(verdict="mixed", probability_up_6m=58, potential_low=110.0, confidence="low"),
+        critique=["Too optimistic about the recovery"],
+    )
+    values: dict[str, Any] = {
+        "mode": "debate",
+        "reason": None,
+        "rounds": 1,
+        "participants": [gpt, claude],
+        "judge": "anthropic:claude-sonnet-5",
+        "summary": "They agree the drop is partly sentiment; the crux is the guidance cut, which the news supports.",
+        "agreement": "medium",
+        "favoured": "openai:gpt-5",
+    }
+    values.update(overrides)
+    return Debate(**values)
 
 
 def make_candidate(**overrides: Any) -> Candidate:

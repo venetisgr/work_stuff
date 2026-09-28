@@ -764,3 +764,78 @@ def test_build_models_for_azure_uses_deployment_names():
 def test_build_models_says_what_is_missing(settings, message):
     with pytest.raises(ConfigError, match=message):
         build_models(settings)
+
+
+# --- the debate's models (LLM_ANALYSIS_MODE=debate) ------------------------------------------------------------------
+
+
+def debate_settings(**overrides) -> LLMSettings:
+    values = {
+        "provider": "openai",
+        "openai_api_key": "sk-test",
+        "anthropic_api_key": "sk-ant-test",
+        "analysis_mode": "debate",
+    }
+    return LLMSettings(**{**values, **overrides})
+
+
+def test_build_models_in_debate_mode_returns_the_panel_and_keeps_triage():
+    triage, panel = build_models(debate_settings())
+    assert isinstance(triage, OpenAIChatModel) and triage.name == "gpt-5-mini"
+    assert isinstance(panel, llm.DebatePanel)
+    first, second = panel.debaters
+    assert (first.label, first.provider, first.model_name) == ("openai:gpt-5", "openai", "gpt-5")
+    assert isinstance(first.model, OpenAIChatModel) and first.model.name == "gpt-5"
+    assert (second.label, second.provider) == ("anthropic:claude-sonnet-5", "anthropic")
+    assert isinstance(second.model, AnthropicChatModel) and second.model.name == "claude-sonnet-5"
+    assert panel.judge is None  # alternate: the debaters take turns
+    assert panel.name == "debate: gpt-5 vs claude-sonnet-5"
+
+
+def test_the_debaters_and_the_judge_use_the_analysis_effort():
+    triage, panel = build_models(debate_settings(triage_reasoning_effort="low", analysis_reasoning_effort="high"))
+    assert triage._reasoning_effort == "low"
+    first, second = panel.debaters
+    assert (first.model._reasoning_effort, second.model._effort) == ("high", "high")
+
+    _, panel = build_models(debate_settings(debate_judge="anthropic:claude-opus-5", reasoning_effort="medium"))
+    assert panel.judge.label == "anthropic:claude-opus-5" and panel.judge.model._effort == "medium"
+    assert panel.name == "debate: gpt-5 vs claude-sonnet-5, judged by claude-opus-5"
+
+
+def test_a_fixed_judge_that_is_a_debater_shares_its_model():
+    _, panel = build_models(debate_settings(debate_judge="openai:gpt-5"))
+    assert panel.judge is panel.debaters[0]
+
+
+def test_debaters_of_any_provider_and_order(monkeypatch):
+    settings = debate_settings(
+        debaters=("anthropic:claude-sonnet-5", "azure:my-gpt"), foundry_endpoint="my-resource", foundry_api_key="k"
+    )
+    _, panel = build_models(settings)
+    assert [debater.label for debater in panel.debaters] == ["anthropic:claude-sonnet-5", "azure:my-gpt"]
+    assert isinstance(panel.debaters[1].model, AzureFoundryChatModel) and panel.debaters[1].model.name == "my-gpt"
+
+
+def test_a_debater_without_its_key_is_a_config_error_that_names_it(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))  # no ~/.config/anthropic profile either
+    with pytest.raises(ConfigError) as error:
+        build_models(debate_settings(anthropic_api_key=None))
+    message = str(error.value)
+    expected = "LLM_ANALYSIS_MODE=debate uses anthropic:claude-sonnet-5 (LLM_DEBATERS), but ANTHROPIC_API_KEY isn't set"
+    assert expected in message
+    assert "fly secrets set ANTHROPIC_API_KEY=..." in message and "LLM_ANALYSIS_MODE=single" in message
+
+    # Triage is built first, so without the OpenAI key its own message comes first; a debater's names the debate.
+    with pytest.raises(ConfigError, match="Set OPENAI_API_KEY"):
+        build_models(debate_settings(openai_api_key=None))
+    with pytest.raises(ConfigError, match=r"uses openai:gpt-5 \(LLM_DEBATERS\), but OPENAI_API_KEY isn't set"):
+        build_models(debate_settings(provider="anthropic", openai_api_key=None))
+    with pytest.raises(ConfigError, match=r"uses azure:x \(LLM_DEBATE_JUDGE\), but FOUNDRY_ENDPOINT isn't set"):
+        build_models(debate_settings(debate_judge="azure:x"))
+
+
+def test_a_debater_without_its_package_says_which(monkeypatch):
+    monkeypatch.setitem(sys.modules, "anthropic", None)  # makes the import fail
+    with pytest.raises(ConfigError, match=r"uses anthropic:claude-sonnet-5 .* can't be set up: .*\[anthropic\]"):
+        build_models(debate_settings())

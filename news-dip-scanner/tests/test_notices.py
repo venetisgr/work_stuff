@@ -12,6 +12,9 @@ from dip_scanner.notices import (
     NOTICE_REPEAT,
     NOTICE_RETRY,
     STOPPED,
+    debater_notice_kind,
+    debater_notice_lines,
+    debater_notice_subject,
     scrub,
     secrets_of,
     send_notice,
@@ -144,3 +147,36 @@ def test_the_websites_secret_key_is_a_secret_too():
     settings = Settings(web=WebSettings(secret_key=key))
     assert key in secrets_of(settings)
     assert scrub(f"failed with {key} in it", secrets_of(settings)) == "failed with *** in it"
+
+
+def test_the_debater_notice_names_the_providers_and_what_it_means():
+    assert debater_notice_kind("anthropic") == "debater_unavailable:anthropic" != debater_notice_kind("openai")
+    subject = debater_notice_subject("anthropic:claude-sonnet-5", "openai:gpt-5")
+    assert subject == "dip-scanner: Anthropic unavailable, analysing with OpenAI only"
+    assert debater_notice_subject("azure:my-gpt", None) == "dip-scanner: Azure AI Foundry unavailable"
+    lines = debater_notice_lines(
+        "openai:gpt-5", "anthropic:claude-sonnet-5", "AMD", "OpenAI says the account has no quota left.", NOW
+    )
+    assert lines[0] == (
+        "OpenAI unavailable, analysing with Anthropic only: openai:gpt-5 failed its analysis of AMD at 2026-09-25 "
+        "15:00 UTC (OpenAI says the account has no quota left.), so anthropic:claude-sonnet-5 analysed it alone, "
+        "without the debate."
+    )
+    assert "The scanner keeps running" in lines[1]
+
+
+def test_debater_notices_are_rate_limited_per_provider(tmp_path):
+    class Channel:
+        name = "fake"
+
+        def __init__(self):
+            self.sent = []
+
+        def send(self, subject, markdown, html):
+            self.sent.append(subject)
+
+    channel = Channel()
+    with Store(tmp_path / "db.sqlite3") as store:
+        for provider, when in (("anthropic", NOW), ("anthropic", NOW + timedelta(hours=1)), ("openai", NOW)):
+            send_notice([channel], store, kind=debater_notice_kind(provider), subject=provider, lines=["x"], now=when)
+    assert channel.sent == ["anthropic", "openai"]

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, tzinfo
 from typing import Any
+
+log = logging.getLogger(__name__)
 
 RELATIONS = ("direct", "indirect")
 DIRECTIONS = ("negative", "positive", "mixed", "neutral")
@@ -26,6 +29,10 @@ EVENT_TYPES = (
 )
 VERDICTS = ("temporary_fear", "mixed", "fundamental", "unclear")
 CONFIDENCES = ("low", "medium", "high")
+# How a debated analysis came about (Debate.mode): "debate" (rebuttals and/or a judge), "agreed" (the two openings
+# agreed, so they were merged without a judge) or "single" (one debater failed; the other's analysis stands alone).
+DEBATE_MODES = ("debate", "agreed", "single")
+AGREEMENTS = ("high", "medium", "low")
 
 # Keys of each row in Fundamentals.quarters / Fundamentals.annual, in display order.
 FUNDAMENTAL_METRICS = (
@@ -257,6 +264,33 @@ class Analysis:
 
 
 @dataclass(frozen=True)
+class Participant:
+    """One of the two models of a debate, with its position before and after the rebuttals."""
+
+    label: str  # "A" / "B": how the judge saw it (the order is fixed per ticker and day, see debate.py)
+    model: str  # "provider:model", e.g. "openai:gpt-5"
+    opening: Analysis  # its first, independent analysis
+    final: Analysis  # its position after the last rebuttal round (the opening when there was none)
+    critique: list[str] = field(default_factory=list)  # where it says the other analyst is wrong (last round)
+    concessions: list[str] = field(default_factory=list)  # what it accepts from the other analyst (last round)
+    changed_mind: bool = False  # it revised its position in a rebuttal
+
+
+@dataclass(frozen=True)
+class Debate:
+    """How a debated analysis (LLM_ANALYSIS_MODE=debate) came about. Opportunity.analysis is the outcome."""
+
+    mode: str  # DEBATE_MODES
+    reason: str | None  # why "single" (the failed debater and its error), or why there was no judge's ruling
+    rounds: int  # rebuttal rounds that ran
+    participants: list[Participant]  # exactly two in LLM_DEBATERS order, or one in mode "single"
+    judge: str | None  # "provider:model" of the judge; None when no judge ruled
+    summary: str | None  # the judge's debate_summary, or a generated line when the positions were merged
+    agreement: str | None  # AGREEMENTS: the judge's, "high" when the openings agreed, None in mode "single"
+    favoured: str | None  # "provider:model" of the analyst the judge favoured; None for neither (or no judge)
+
+
+@dataclass(frozen=True)
 class Opportunity:
     ticker: str
     company: str
@@ -292,6 +326,9 @@ class Opportunity:
     # True when fx_rate is today's rate, fetched for display because none was stored at the analysis
     # (report.for_currency); shown as "at today's rate". Never stored.
     fx_rate_today: bool = False
+    # The two models' debate behind the analysis (LLM_ANALYSIS_MODE=debate); None for a single model's analysis and
+    # for records from before debates.
+    debate: Debate | None = None
 
     def rate_to(self, currency: str | None) -> float | None:
         """The exchange rate into currency stored at the analysis (units of it per unit of currency as quoted), or
@@ -349,6 +386,7 @@ class Opportunity:
             "benchmark": self.benchmark,
             "benchmark_level": self.benchmark_level,
             "fx_rates": dict(self.fx_rates),
+            "debate": None if self.debate is None else debate_to_dict(self.debate),
         }
 
     @classmethod
@@ -374,6 +412,7 @@ class Opportunity:
             benchmark=data.get("benchmark") or None,
             benchmark_level=_positive_or_none(data.get("benchmark_level")),
             fx_rates=_rates(data.get("fx_rates")),
+            debate=debate_from_dict(data.get("debate")),
         )
 
 
@@ -457,6 +496,48 @@ def analysis_from_dict(data: dict) -> Analysis:
     for name in ("risks", "catalysts", "checks", "warnings"):
         values[name] = [str(item) for item in values.get(name) or []]
     return Analysis(**values)
+
+
+def debate_to_dict(debate: Debate) -> dict:
+    """Debate as a JSON-safe dict: its fields, with each participant's opening and final as analysis dicts."""
+    return asdict(debate)
+
+
+def debate_from_dict(data: Any) -> Debate | None:
+    """The inverse of debate_to_dict; None for None (a single model's analysis, an old record) and for a record that
+    can't be read (logged: the opportunity itself still loads). Unknown keys are ignored."""
+    if data is None:
+        return None
+    try:
+        participants = [
+            Participant(
+                label=str(item.get("label") or ""),
+                model=str(item.get("model") or ""),
+                opening=analysis_from_dict(item["opening"]),
+                final=analysis_from_dict(item.get("final") or item["opening"]),
+                critique=[str(point) for point in item.get("critique") or []],
+                concessions=[str(point) for point in item.get("concessions") or []],
+                changed_mind=bool(item.get("changed_mind", False)),
+            )
+            for item in data.get("participants") or []
+        ]
+        return Debate(
+            mode=str(data["mode"]),
+            reason=_text_or_none(data.get("reason")),
+            rounds=int(data.get("rounds") or 0),
+            participants=participants,
+            judge=_text_or_none(data.get("judge")),
+            summary=_text_or_none(data.get("summary")),
+            agreement=_text_or_none(data.get("agreement")),
+            favoured=_text_or_none(data.get("favoured")),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        log.warning("Couldn't read a stored debate, showing the analysis without it: %s", exc)
+        return None
+
+
+def _text_or_none(value: Any) -> str | None:
+    return str(value) if value not in (None, "") else None
 
 
 def article_to_dict(article: Article) -> dict:

@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS analysis_failures (
 CREATE TABLE IF NOT EXISTS model_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created TEXT NOT NULL,   -- the time of the cycle (or manual analysis) that made the call
-    step TEXT NOT NULL,      -- 'triage' or 'analysis'
+    step TEXT NOT NULL,      -- 'triage', 'analysis', or a debate's 'analysis:opening' / 'rebuttal' / 'judge'
     model TEXT NOT NULL,
     ticker TEXT,             -- the analysed ticker (analysis only)
     input_tokens INTEGER,    -- NULL when the service didn't report them
@@ -854,14 +854,17 @@ class Store:
             )
 
     def model_usage(self, *, since: datetime) -> list[ModelUsage]:
-        """The model calls since the given time, totalled per step and model (triage first)."""
+        """The model calls since the given time, totalled per step and model: triage, then analysis (a debate's
+        openings, rebuttals and judge in that order)."""
         rows = self._query(
             """
             SELECT step, model, COUNT(*) AS calls,
                    COALESCE(SUM(input_tokens), 0) AS input_tokens, COALESCE(SUM(output_tokens), 0) AS output_tokens,
                    SUM(input_tokens IS NULL OR output_tokens IS NULL) AS unmetered
             FROM model_calls WHERE created >= ?
-            GROUP BY step, model ORDER BY step = 'analysis', step, model
+            GROUP BY step, model
+            ORDER BY CASE step WHEN 'triage' THEN 0 WHEN 'analysis' THEN 1 WHEN 'analysis:opening' THEN 2
+                     WHEN 'analysis:rebuttal' THEN 3 WHEN 'analysis:judge' THEN 4 ELSE 5 END, step, model
             """,
             (_ts(since),),
         )
@@ -879,10 +882,11 @@ class Store:
 
     def analyses_since(self, since: datetime) -> int:
         """How many analyses the model answered since the given time (a corrective retry is part of its analysis,
-        and a reply that turned out unusable counts too: it was paid for)."""
+        and a reply that turned out unusable counts too: it was paid for). A debate is one analysis however many
+        calls it made: its calls share the ticker and the time."""
         rows = self._query(
             "SELECT COUNT(*) FROM (SELECT DISTINCT ticker, created FROM model_calls "
-            "WHERE step = 'analysis' AND created >= ?)",
+            "WHERE (step = 'analysis' OR step LIKE 'analysis:%') AND created >= ?)",
             (_ts(since),),
         )
         return int(rows[0][0])

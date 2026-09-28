@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from conftest import FakeChatModel, FakeSession, chart_json, make_article, make_impact, make_opportunity
-from test_pipeline import ANALYSIS, CYCLE, MARKETWATCH_URL, SEC_URL, routes, triage_reply
+from test_pipeline import ANALYSIS, CYCLE, MARKETWATCH_URL, SEC_URL, debate_panel, routes, triage_reply
 
 from dip_scanner import cli
 from dip_scanner.config import DATABASE_NAME
@@ -392,6 +392,30 @@ def test_run_does_one_cycle_and_prints_the_summary(workdir, web, models, capsys)
         [opp] = store.opportunities()
         # --no-notify: shown here, and not pushed by a later notifying run either.
         assert opp.ticker == "AMD" and store.unnotified() == []
+
+
+def test_run_in_debate_mode_prints_the_debate_and_each_steps_use(workdir, web, capsys, monkeypatch):
+    panel = debate_panel()
+    monkeypatch.setattr(cli, "build_models", lambda settings: (FakeChatModel(triage_reply), panel))
+
+    assert cli.main(["run", "--no-notify"]) == 0
+
+    out = capsys.readouterr().out
+    assert "    debate: GPT-5 75% · Claude Sonnet 5 55% → 70% (medium agreement)" in out
+    assert "  analysis:opening with gpt-5: 1 call, 3.5k tokens in, 900 out" in out
+    assert "  analysis:rebuttal with claude-sonnet-5: 1 call" in out and "  analysis:judge with " in out
+
+
+def test_debate_mode_without_the_second_key_is_a_config_error(workdir, capsys, monkeypatch):
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_PROFILE", "ANTHROPIC_CONFIG_DIR"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(workdir))  # no ~/.config/anthropic profile either
+    (workdir / ".env").write_text("OPENAI_API_KEY=sk-test\nLLM_ANALYSIS_MODE=debate\n", encoding="utf-8")
+    assert cli.main(["run", "--no-notify"]) == 2
+    assert (
+        "Configuration problem: LLM_ANALYSIS_MODE=debate uses anthropic:claude-sonnet-5 (LLM_DEBATERS), but "
+        "ANTHROPIC_API_KEY isn't set." in capsys.readouterr().err
+    )
 
 
 def test_run_without_an_api_key_is_a_config_error(workdir, capsys):

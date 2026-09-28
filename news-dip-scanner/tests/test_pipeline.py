@@ -22,6 +22,7 @@ from conftest import (
     make_opportunity,
 )
 
+from dip_scanner import prompts
 from dip_scanner.config import (
     AccountConfig,
     AlertConfig,
@@ -31,8 +32,9 @@ from dip_scanner.config import (
     Settings,
     UniverseConfig,
 )
+from dip_scanner.debate import judge_index
 from dip_scanner.fundamentals import SecFundamentals
-from dip_scanner.llm import LLMError, LLMSetupError, LLMUnavailableError
+from dip_scanner.llm import DebatePanel, DebaterModel, LLMError, LLMSetupError, LLMUnavailableError
 from dip_scanner.models import Feed
 from dip_scanner.notify import NotifyError, WebhookNotifier
 from dip_scanner.pipeline import CycleResult, Scanner, alert_subject, seconds_until_next, usage_lines
@@ -1224,3 +1226,141 @@ def test_no_system_notices_without_notifications(build, how):
     scanner.run_cycle(CYCLE)
     assert notifier.sent == []
     assert scanner.store.bump_streak("feeds_failing") == 2  # counted all the same
+
+
+# --- the debate (LLM_ANALYSIS_MODE=debate) -------------------------------------------------------------------------
+
+GPT, CLAUDE = "openai:gpt-5", "anthropic:claude-sonnet-5"
+DEBATE_RULING = {
+    **ANALYSIS,
+    "probability_up_6m": 70,
+    "debate_summary": "They disagree on whether the guidance cut is lasting; the input supports a temporary fear.",
+    "agreement": "medium",
+    "favoured": "A",
+}
+
+
+def debater(opening, *, name: str, usage=(3_500, 900)) -> FakeChatModel:
+    """A fake debater: its opening, a rebuttal that keeps it, and DEBATE_RULING when it judges."""
+
+    def answer(system: str, prompt: str, json_mode: bool):
+        if system == prompts.ANALYSIS_SYSTEM or isinstance(opening, BaseException):
+            return opening
+        if system == prompts.DEBATE_REBUTTAL_SYSTEM:
+            return {**opening, "critique": ["Unsupported by the input"], "concessions": [], "changed_mind": False}
+        return DEBATE_RULING
+
+    return FakeChatModel(answer, name=name, usage=usage)
+
+
+def debate_panel(gpt=None, claude=None) -> DebatePanel:
+    gpt = gpt or debater(ANALYSIS, name="gpt-5")
+    claude = claude or debater({**ANALYSIS, "verdict": "mixed", "probability_up_6m": 55}, name="claude-sonnet-5")
+    return DebatePanel(debaters=(DebaterModel(GPT, gpt), DebaterModel(CLAUDE, claude)))
+
+
+def test_a_debate_cycle_meters_every_step_and_counts_one_analysis(build):
+    triage_model = FakeChatModel(triage_reply, name="fake-triage", usage=(1_200, 150))
+    scanner = build(triage_model=triage_model, analysis_model=debate_panel(), config=QUIET)
+
+    result = scanner.run_cycle(CYCLE)
+
+    [opp] = result.opportunities
+    judge = (GPT, CLAUDE)[judge_index("AMD", CYCLE.date())].split(":")[1]
+    assert opp.model == f"debate: gpt-5 vs claude-sonnet-5, judged by {judge}"
+    assert opp.debate.mode == "debate" and opp.analysis.probability_up_6m == 70
+    assert scanner.store.get_opportunity(opp.id) == opp  # the debate is stored with it
+    assert result.model_calls == 1 + 5
+    rows = [(row.step, row.model, row.calls) for row in result.usage_today]
+    assert rows == [
+        ("triage", "fake-triage", 1),
+        ("analysis:opening", "claude-sonnet-5", 1),
+        ("analysis:opening", "gpt-5", 1),
+        ("analysis:rebuttal", "claude-sonnet-5", 1),
+        ("analysis:rebuttal", "gpt-5", 1),
+        ("analysis:judge", judge, 1),
+    ]
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=1)) == 1  # one dip, however many calls
+    latest = result.report_paths[3].read_text(encoding="utf-8")
+    assert "**Debate:** medium agreement · judged by" in latest
+    assert "| GPT-5 (Analyst " in latest and "| Claude Sonnet 5 (Analyst " in latest
+    assert "They disagree on whether the guidance cut is lasting" in latest
+
+
+def test_the_daily_limit_counts_debates_as_one_analysis_each(build):
+    config = ScannerConfig(scan=ScanConfig(context_news=False, max_analyses_per_day=2))
+    session = FakeSession({CHART_PREFIX: fixture_json("yahoo_chart_amd.json")})
+    scanner = build(session=session, feeds=[], analysis_model=debate_panel(), config=config, sec_user_agent=None)
+    for step in ("analysis:opening", "analysis:opening", "analysis:rebuttal", "analysis:rebuttal", "analysis:judge"):
+        scanner.store.record_model_call(when=CYCLE - timedelta(hours=2), step=step, model="gpt-5", ticker="X1")
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=24)) == 1
+    for ticker, magnitude in (("BIG", 5), ("MID", 3)):
+        seed(scanner, ticker, magnitude=magnitude)
+
+    result = scanner.run_cycle(CYCLE)
+
+    assert [opp.ticker for opp in result.opportunities] == ["BIG"]  # one of two left: the debate of X1 was one
+    assert any(note.startswith("Daily limit of 2 analyses reached") and "MID" in note for note in result.notes)
+    assert scanner.store.analyses_since(CYCLE - timedelta(hours=24)) == 2
+
+
+@pytest.mark.parametrize(("min_score", "mode"), [(65, "debate"), (95, "agreed")])
+def test_the_agreement_check_uses_the_recipients_alert_rules(build, min_score, mode):
+    """Two openings that differ only in whether they pass the alert rules: with the default rules only one passes, so
+    they are debated; with rules neither passes, they are merged."""
+    gpt = debater({**ANALYSIS, "probability_up_6m": 75, "confidence": "high"}, name="gpt-5")
+    claude = debater({**ANALYSIS, "probability_up_6m": 64, "confidence": "medium"}, name="claude-sonnet-5")
+    config = ScannerConfig(scan=ScanConfig(context_news=False), alerts=AlertConfig(min_score=min_score))
+    scanner = build(analysis_model=debate_panel(gpt, claude), config=config)
+    [opp] = scanner.run_cycle(CYCLE).opportunities
+    assert opp.debate.mode == mode
+    assert len(gpt.calls) + len(claude.calls) == (5 if mode == "debate" else 2)
+
+
+def test_one_debater_down_is_noted_and_told_once_and_the_scanner_goes_on(build):
+    notifier = FakeNotifier()
+    claude = debater(LLMSetupError("Anthropic rejected the credentials (401: invalid x-api-key)."), name="claude")
+    scanner = build(analysis_model=debate_panel(claude=claude), notifiers=[notifier], config=QUIET)
+
+    result = scanner.run_cycle(CYCLE)
+
+    [opp] = result.opportunities
+    assert opp.debate.mode == "single" and opp.model == "gpt-5 alone (claude-sonnet-5 unavailable)"
+    assert (
+        "Debate of AMD: anthropic:claude-sonnet-5 failed, so openai:gpt-5 analysed it alone: Anthropic rejected the "
+        "credentials (401: invalid x-api-key)." in result.notes
+    )
+    notices = [(subject, markdown) for subject, markdown, _ in notifier.sent if "unavailable" in subject]
+    [(subject, markdown)] = notices
+    assert subject == "dip-scanner: Anthropic unavailable, analysing with OpenAI only"
+    assert (
+        "Anthropic unavailable, analysing with OpenAI only: anthropic:claude-sonnet-5 failed its analysis of AMD"
+        in (markdown)
+    )
+    assert "The scanner keeps running" in markdown
+
+    # A manual analysis an hour later falls back again, without a second notice within 12 hours.
+    again = scanner.analyze_ticker("AMD", now=CYCLE + timedelta(hours=1))
+    assert again.debate.mode == "single"
+    assert len([subject for subject, _, _ in notifier.sent if "unavailable" in subject]) == 1
+
+
+def test_manual_analyses_debate_too(build):
+    """`dip-scanner analyze` and the website's "Analyse now" (scanner.analyze_ticker) use the debate as well."""
+    scanner = build(analysis_model=debate_panel(), config=QUIET)
+    opp = scanner.analyze_ticker("AMD", now=CYCLE)
+    assert opp.debate is not None and opp.debate.mode == "debate"
+    steps = {row.step for row in scanner.store.model_usage(since=CYCLE - timedelta(hours=1))}
+    assert steps == {"analysis:opening", "analysis:rebuttal", "analysis:judge"}
+
+
+def test_both_debaters_down_leaves_the_candidates_for_the_next_cycle(build):
+    down = LLMUnavailableError("overloaded (529)")
+    panel = debate_panel(debater(down, name="gpt-5"), debater(down, name="claude-sonnet-5"))
+    scanner = build(analysis_model=panel, config=QUIET)
+    result = scanner.run_cycle(CYCLE)
+    assert result.opportunities == []
+    assert any(
+        note.startswith("The analysis model is unavailable, left for the next cycle: AMD") for note in result.notes
+    )
+    assert scanner.store.analysis_failures("AMD") is None  # no backoff for an outage

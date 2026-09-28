@@ -27,7 +27,7 @@ import requests
 
 from .config import WEBHOOK_FORMATS, ConfigError, NotifySettings
 from .models import Opportunity, utc
-from .report import format_money, format_pct, format_price, format_when, safe_url, verdict_label
+from .report import debate_line, format_money, format_pct, format_price, format_when, safe_url, verdict_label
 
 log = logging.getLogger(__name__)
 
@@ -605,7 +605,9 @@ def short_alert(opps: list[Opportunity], *, now: datetime | None = None) -> str:
       target $168.00 (+17.9% from price, +27.3% from entry) · low $118.00 · Temporary fear, medium confidence
 
     (on one line), and a reminder that the numbers are an uncalibrated model estimate and not investment advice.
-    Price, entry and target carry their value in the [account] currency when it differs ("$132.00 ≈ €115.93").
+    Price, entry and target carry their value in the [account] currency when it differs ("$132.00 ≈ €115.93"). A
+    debated analysis adds a line under its own, e.g. "  Debate: GPT-5 72% · Claude Sonnet 5 58% → 64% (medium
+    agreement)" (report.debate_line).
     Given now, opportunities analysed before it (alerts that couldn't be sent earlier) say how old they are.
     """
     if not opps:
@@ -637,5 +639,8 @@ def short_alert(opps: list[Opportunity], *, now: datetime | None = None) -> str:
             hours = (utc(now) - utc(opp.created)).total_seconds() / 3600
             parts.append(f"not sent earlier: analysed {hours:.1f}h ago ({format_when(opp.created)})")
         lines.append("- " + " · ".join(parts))
+        debate = debate_line(opp)
+        if debate:
+            lines.append(f"  Debate: {debate}")
     lines.append(ALERT_FOOTER)
     return "\n".join(lines)

@@ -9,11 +9,13 @@ import pytest
 from dotenv import dotenv_values
 
 from dip_scanner.config import (
+    DEFAULT_DEBATERS,
     DEFAULT_MODELS,
     PROJECT_ROOT,
     AccountConfig,
     AlertConfig,
     ConfigError,
+    DebateConfig,
     DipConfig,
     LLMSettings,
     NotifySettings,
@@ -583,6 +585,7 @@ def test_the_shipped_scanner_config_and_the_readme_name_every_setting(tmp_path):
         "universe": UniverseConfig,
         "alerts": AlertConfig,
         "account": AccountConfig,
+        "debate": DebateConfig,
     }
     for section, cls in sections.items():
         assert f"[{section}]" in text
@@ -594,6 +597,12 @@ def test_the_shipped_scanner_config_and_the_readme_name_every_setting(tmp_path):
     # So are the settings for a euro investor, and the display time zone.
     for setting in ("`[account] currency`", "`[universe] preferred_listings`", "`DISPLAY_TZ`"):
         assert setting in readme, setting
+    # And the debate's, with its environment settings and the recommendation.
+    for setting in ("`[debate] when`", "`[debate] max_probability_gap`", "`max_low_gap_pct`", "`rounds`"):
+        assert setting in readme, setting
+    for name in ("LLM_ANALYSIS_MODE", "LLM_DEBATERS", "LLM_DEBATE_JUDGE"):
+        assert f"| `{name}` |" in readme, name
+    assert '**Use `when = "disagree"`.**' in readme
     # The commented examples in scanner.toml are valid settings.
     examples = "\n".join(line.removeprefix("# ") for line in text.splitlines() if re.match(r"# [a-z_]+ = ", line))
     for number, line in enumerate(examples.splitlines()):
@@ -728,3 +737,106 @@ def test_the_website_extra_and_its_files_are_packaged():
         if path.is_file() and not path.name.startswith(".")
     }
     assert web / "static" / "favicon.svg" in files and files <= shipped
+
+
+# --- the debate ---
+
+
+def test_the_debate_is_off_unless_asked_for_and_its_defaults():
+    llm = load_settings({}).llm
+    assert (llm.analysis_mode, llm.debaters, llm.debate_judge) == ("single", DEFAULT_DEBATERS, "alternate")
+    defaults = (f"openai:{DEFAULT_MODELS['openai'][1]}", f"anthropic:{DEFAULT_MODELS['anthropic'][1]}")
+    assert defaults == DEFAULT_DEBATERS
+    assert load_settings({"LLM_ANALYSIS_MODE": " Debate "}).llm.analysis_mode == "debate"
+    with pytest.raises(ConfigError, match="LLM_ANALYSIS_MODE must be one of single, debate"):
+        load_settings({"LLM_ANALYSIS_MODE": "panel"})
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("openai:gpt-5,anthropic:claude-sonnet-5", ("openai:gpt-5", "anthropic:claude-sonnet-5")),
+        (" Claude:claude-opus-5 , OPENAI:gpt-5.1 ", ("anthropic:claude-opus-5", "openai:gpt-5.1")),
+        ("foundry:my-deployment,openai:gpt-5", ("azure:my-deployment", "openai:gpt-5")),
+        ("openai:gpt-5,openai:o3,", ("openai:gpt-5", "openai:o3")),
+    ],
+)
+def test_llm_debaters_are_two_provider_model_entries(value, expected):
+    assert load_settings({"LLM_DEBATERS": value}).llm.debaters == expected
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("openai:gpt-5", "must name exactly two models"),
+        ("openai:gpt-5,anthropic:claude-sonnet-5,openai:o3", "must name exactly two models"),
+        ("gpt-5,claude-sonnet-5", "entries are provider:model"),
+        ("mistral:large,openai:gpt-5", "entries are provider:model"),
+        ("openai:,anthropic:claude-sonnet-5", "entries are provider:model"),
+        ("openai:gpt 5,anthropic:claude-sonnet-5", "entries are provider:model"),
+        ("openai:gpt-5,OpenAI:gpt-5", "names openai:gpt-5 twice"),
+    ],
+)
+def test_wrong_llm_debaters_say_what_to_write(value, message):
+    with pytest.raises(ConfigError, match=message):
+        load_settings({"LLM_DEBATERS": value})
+
+
+@pytest.mark.parametrize(
+    ("judge", "expected"),
+    [
+        (None, "alternate"),
+        ("Alternate", "alternate"),
+        ("openai", "openai:gpt-5"),
+        ("anthropic", "anthropic:claude-sonnet-5"),
+        ("claude", "anthropic:claude-sonnet-5"),
+        ("anthropic:claude-opus-5", "anthropic:claude-opus-5"),
+        ("azure:judge-deployment", "azure:judge-deployment"),
+    ],
+)
+def test_llm_debate_judge_values(judge, expected):
+    env = {} if judge is None else {"LLM_DEBATE_JUDGE": judge}
+    assert load_settings(env).llm.debate_judge == expected
+
+
+@pytest.mark.parametrize(
+    ("env", "message"),
+    [
+        ({"LLM_DEBATE_JUDGE": "gpt-5"}, "must be alternate, a provider"),
+        ({"LLM_DEBATE_JUDGE": "whoever"}, "must be alternate, a provider"),
+        ({"LLM_DEBATE_JUDGE": "azure"}, "neither debater is from azure"),
+        (
+            {"LLM_DEBATE_JUDGE": "openai", "LLM_DEBATERS": "openai:gpt-5,openai:o3"},
+            "both debaters are from openai",
+        ),
+    ],
+)
+def test_wrong_llm_debate_judge_values_say_what_to_write(env, message):
+    with pytest.raises(ConfigError, match=message):
+        load_settings(env)
+
+
+def test_the_debate_section_of_scanner_toml(tmp_path):
+    config = load_scanner_config(
+        _write(tmp_path, '[debate]\nwhen = "Always"\nrounds = 2\nmax_probability_gap = 20\nmax_low_gap_pct = 7.5\n')
+    )
+    assert config.debate == DebateConfig(when="always", rounds=2, max_probability_gap=20, max_low_gap_pct=7.5)
+    assert load_scanner_config(_write(tmp_path, "[debate]\n", "empty.toml")).debate == DebateConfig()
+
+
+@pytest.mark.parametrize(
+    ("text", "message"),
+    [
+        ('when = "sometimes"', 'debate.when must be "disagree" or "always"'),
+        ("when = 1", "debate.when .* must be a string"),
+        ("rounds = 4", "debate.rounds must be between 0 and 3"),
+        ("rounds = -1", "debate.rounds must be between 0 and 3"),
+        ("rounds = 1.5", "debate.rounds .* must be a whole number"),
+        ("max_probability_gap = 101", "debate.max_probability_gap must be between 0 and 100"),
+        ("max_low_gap_pct = -1", "debate.max_low_gap_pct can't be negative"),
+        ('judge = "openai"', "Unknown setting 'judge' in \\[debate\\]"),
+    ],
+)
+def test_wrong_debate_settings_are_errors(tmp_path, text, message):
+    with pytest.raises(ConfigError, match=message):
+        load_scanner_config(_write(tmp_path, f"[debate]\n{text}\n"))

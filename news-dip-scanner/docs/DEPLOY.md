@@ -3,7 +3,12 @@
 This puts the website and the scanner (`dip-scanner serve`) on [Fly.io](https://fly.io): one small virtual machine
 (a Fly Machine) in Frankfurt, running around the clock, with the database on a 1 GB disk (a Fly volume) and HTTPS at
 `https://<your-app>.fly.dev` or your own domain. Fly costs about $3.85 a month for this (see [Costs](#costs)); the
-language model is billed separately by its provider (see [Costs](../README.md#costs) in the README).
+language models are billed separately by their providers (see [Costs](../README.md#costs) in the README).
+
+The setup described here, and the one `fly.toml` holds: OpenAI's small model triages the news, every dip's analysis is
+a debate between OpenAI's and Anthropic's analysis models (`LLM_ANALYSIS_MODE=debate`, see
+[Debate](../README.md#debate) in the README), alerts reach each person through their own Slack or Discord webhook, and
+GitHub Actions deploys every push to the `main` branch.
 
 Everything below was checked against Fly's documentation on 2026-09-28 (the pages are listed at the
 [end](#what-was-checked-and-when)). Fly changes quickly: if a command answers differently, its `--help` and the linked
@@ -13,10 +18,10 @@ The files involved, in the `news-dip-scanner` folder except the workflow:
 
 | File | What it does |
 |---|---|
-| [`Dockerfile`](../Dockerfile) | Builds the image: Python 3.12, the package with its `web` extra, `scanner.toml` and `feeds.toml` in `/app`, runs as the user `app` (not root), `DATA_DIR=/data`, `dip-scanner serve` on port 8080. |
+| [`Dockerfile`](../Dockerfile) | Builds the image: Python 3.12, the package with its `web` and `anthropic` extras, `scanner.toml` and `feeds.toml` in `/app`, runs as the user `app` (not root), `DATA_DIR=/data`, `dip-scanner serve` on port 8080. |
 | [`.dockerignore`](../.dockerignore) | Keeps `.env`, `data/`, caches and tests out of the build (and off Fly's builder). |
-| [`fly.toml`](../fly.toml) | The app: region, the volume at `/data`, the HTTP service with its `/healthz` check, one Machine that never stops, 512 MB. |
-| [`.github/workflows/news-dip-scanner.yml`](../../.github/workflows/news-dip-scanner.yml) | Tests every change, and deploys from the default branch when a Fly token is set up. |
+| [`fly.toml`](../fly.toml) | The app: region, the volume at `/data`, the HTTP service with its `/healthz` check, one Machine that never stops, 512 MB, and the settings that aren't secret (the debate among them). |
+| [`.github/workflows/news-dip-scanner.yml`](../../.github/workflows/news-dip-scanner.yml) | Tests every change, and deploys from `main` when a Fly token is set up. |
 
 ## One Machine, always
 
@@ -37,8 +42,11 @@ is the price of never running two scanners.
 
 - **A Fly.io account with a payment card.** The free trial gives 2 hours of Machine time or 7 days, whichever comes
   first, and trial Machines stop after 5 minutes: not enough for a scanner that runs all day.
-- **An API key for the language model** (see [Setup](../README.md#setup) in the README). The website starts without
-  one and says that the scanner is stopped, so you can also add it later.
+- **API keys for OpenAI and Anthropic**: an OpenAI key from https://platform.openai.com/api-keys and an Anthropic key
+  from https://console.anthropic.com/settings/keys, each with prepaid credit and a monthly spend limit (see
+  [Costs](../README.md#costs) in the README: the debate costs about two to five times as much per dip as one model).
+  The website starts without them and says that the scanner is stopped, so you can also add them later. With only an
+  OpenAI key, remove `LLM_ANALYSIS_MODE = "debate"` from `fly.toml` (one model analyses each dip).
 - This repository on your computer, and a terminal in the `news-dip-scanner` folder.
 
 ## 1. Install flyctl and sign in
@@ -104,14 +112,15 @@ image or the repository. First make a secret key for the website:
 python3 -c "import secrets; print(secrets.token_urlsafe(48))"
 ```
 
-Then set it, the site's address and your model key in one go (before the first deploy they are only stored; after it,
-every change restarts the Machine):
+Then set it, the site's address and the two model keys in one go (before the first deploy they are only stored; after
+it, every change restarts the Machine):
 
 ```bash
 fly secrets set \
   SECRET_KEY=paste-the-generated-key \
   BASE_URL=https://my-dip-scanner.fly.dev \
-  OPENAI_API_KEY=sk-... \
+  OPENAI_API_KEY=sk-proj-... \
+  ANTHROPIC_API_KEY=sk-ant-... \
   SEC_USER_AGENT="Your Name you@example.com"
 ```
 
@@ -123,16 +132,24 @@ names, never the values.
 |---|---|---|
 | `SECRET_KEY` | yes | Signs the sign-in forms and the site's short messages; at least 32 characters. Sessions don't depend on it: changing it only makes a sign-in page that is open at that moment ask to be reloaded. |
 | `BASE_URL` | yes | The site's address, without a trailing slash: links in invites and password emails point at it, and form posts from any other address are refused. |
-| `OPENAI_API_KEY` | for the scanner | Or another provider: `LLM_PROVIDER=anthropic` and `ANTHROPIC_API_KEY`, plus `EXTRAS = "anthropic"` under `[build.args]` in `fly.toml` so the image includes Anthropic's package; Azure AI Foundry likewise (see `.env.example`). |
+| `OPENAI_API_KEY` | for the scanner | Triage (`gpt-5-mini`) and one of the two debaters (`gpt-5`). |
+| `ANTHROPIC_API_KEY` | for the debate | The other debater (`claude-sonnet-5`). Without it the scanner stops with a message naming it; the image already has Anthropic's package. Other models or providers: `LLM_DEBATERS` and `LLM_DEBATE_JUDGE` under `[env]` (see `.env.example`). |
 | `SEC_USER_AGENT` | recommended | US quarterly figures and the SEC feed. |
-| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | optional | Lets users choose email alerts, and emails invites. |
-| `TELEGRAM_BOT_TOKEN` | optional | Lets users choose Telegram alerts (each gives their own chat id). |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM` | not needed | Only if users should be able to choose email alerts, or invites should be emailed. |
+| `TELEGRAM_BOT_TOKEN` | not needed | Only if users should be able to choose Telegram alerts. |
 | `WEBHOOK_URL`, `EMAIL_TO`, `TELEGRAM_CHAT_ID`... | optional | The command line's own channels (see `.env.example`): they get every alert under `scanner.toml`'s `[alerts]` rules, and the "scanner stopped" notices. On the website each user sets up their own channels instead, and admins get those notices through theirs. |
 
-Settings that aren't secret go under `[env]` in `fly.toml` (they need a deploy to change): `DISPLAY_TZ` is set there to
-`Europe/Athens` already (users choose their own time zone on the website), and it is the place for
+Settings that aren't secret go under `[env]` in `fly.toml` (they need a deploy to change). It already has
+`DISPLAY_TZ = "Europe/Athens"` (users choose their own time zone on the website), `LLM_PROVIDER = "openai"` (triage)
+and `LLM_ANALYSIS_MODE = "debate"`, and it is the place for `LLM_DEBATERS`, `LLM_DEBATE_JUDGE`,
 `ANALYZE_LIMIT_PER_USER`, `SCANNER_ENABLED` or `LLM_TRIAGE_REASONING_EFFORT=low` (see [Costs](../README.md#costs)).
-A secret wins over an `[env]` entry of the same name. Leave `COOKIE_SECURE` alone: on Fly the site is always HTTPS.
+How the debate runs (only on disagreement, the number of rebuttal rounds) is set in `scanner.toml`'s `[debate]`. A
+secret wins over an `[env]` entry of the same name. Leave `COOKIE_SECURE` alone: on Fly the site is always HTTPS.
+
+**Alerts need no secrets here.** Each person (you included) sets up their own Slack or Discord webhook on the
+website's Settings page, and the alerts go straight to their phone through the Slack or Discord app: no SMTP server or
+Telegram bot is needed (see [step 8](#8-invite-people)). The `SMTP_*` and `TELEGRAM_*` settings only add email and
+Telegram as further choices.
 
 ## 5. Deploy
 
@@ -195,6 +212,24 @@ There is no sign-up page. Each person then sets up their watchlist, alert rules,
 channels under Settings, and "Send test alert" checks the channels. The Users page disables accounts, changes roles
 and makes password links for people who forgot theirs.
 
+**Alerts on the phone through Slack or Discord.** The usual channel is a webhook of one's own, which posts into a
+Slack or Discord channel; the Slack or Discord app on the phone then shows each alert as a notification. Each person
+makes one (Slack's steps checked against its documentation on 2026-09-28; Discord's help centre refused automated
+reading, so its labels are as guides quoting it give them):
+
+- **Slack:** at https://api.slack.com/apps?new_app=1 create an app ("From scratch", any name, your workspace), open
+  **Incoming Webhooks**, switch on **Activate Incoming Webhooks**, click **Add New Webhook to Workspace**, pick the
+  channel (a private one, or a direct message to yourself) and **Authorize**. Copy the URL, which starts with
+  `https://hooks.slack.com/services/`.
+- **Discord:** in a server where you may manage webhooks (your own), open the channel's **Edit Channel**, then
+  **Integrations**, **Webhooks**, **New Webhook** (or **Create Webhook**), and **Copy Webhook URL**. It starts with
+  `https://discord.com/api/webhooks/`.
+
+On the website: Settings, the webhook channel, paste the URL, choose Slack or Discord as the format, save, then "Send
+test alert". The URL is a secret (anyone who has it can post to that channel): the site stores it for that person
+only, and never shows it in a notice or a log. Admins get the "dip-scanner stopped" and "unavailable" notices through
+their own channels the same way.
+
 ## 9. Your own domain (optional)
 
 ```bash
@@ -222,11 +257,25 @@ single-name certificates of an organisation are free, then $0.10 a month each.
 ## 10. Deploy from GitHub Actions
 
 The workflow in `.github/workflows/news-dip-scanner.yml` runs ruff and the tests on every pull request and push that
-touches `news-dip-scanner/`, and after they pass it deploys:
+touches `news-dip-scanner/` (changes to the Next.js front end in `frontend/` alone don't count: Vercel deploys that),
+and after they pass it deploys the `main` branch:
 
-- on a push to the repository's default branch (it asks GitHub which branch that is, so nothing needs changing when
-  the default branch changes; in this repository it was `claude/sharepoint-summarization-llm-oobov5` on 2026-09-28),
-- or when you start it by hand: Actions, news-dip-scanner, "Run workflow", which deploys the branch you pick.
+- on every push to `main`,
+- or when you start it by hand on `main`: Actions, news-dip-scanner, "Run workflow", branch `main` (on any other
+  branch it only runs the tests).
+
+Other branches are never deployed: work on a branch, open a pull request, and merge it into `main` to release it.
+`main` is also the production branch of the Vercel front end, so both go out from the same commits. If the repository
+has no `main` yet, create it from the branch you deploy today and push it:
+
+```bash
+git switch -c main
+git push -u origin main
+```
+
+Then, in the repository on GitHub, Settings, General, "Default branch": switch it to `main`, so that pull requests
+target it. A branch protection rule (Settings, Branches) that requires the workflow's "Lint and test" check before
+merging keeps a failing change from reaching the site.
 
 It needs a deploy token, which can manage this one app and nothing else in your account:
 
@@ -355,7 +404,7 @@ The image carries `scanner.toml` and `feeds.toml` (in `/app`). There are two way
 
 ## 15. Updating
 
-Push to the default branch (GitHub Actions deploys after the tests pass), or run `fly deploy --ha=false` here. The
+Merge or push to `main` (GitHub Actions deploys after the tests pass), or run `fly deploy --ha=false` here. The
 Machine stops (the scanner finishes or abandons its cycle within about 10 seconds), the new version starts, and
 database changes are applied automatically when it opens the database. `fly version upgrade` updates flyctl itself.
 
@@ -378,17 +427,21 @@ Fly's prices on 2026-09-28, for Frankfurt (15% above the US East price), 30 days
 
 The euro figure uses 1 EUR = 1.1386 USD, like the README. For comparison: 256 MB would be $2.24 but is too small (see
 below), 1 GB $6.57. Fly bills by the second, so a Machine stopped for part of the month costs less, but this one is
-meant to run all the time. The model is billed by its provider: roughly $8 to $86 a month with the default OpenAI
-models (see [Costs](../README.md#costs)).
+meant to run all the time. The models are billed by their providers: with the debate on disagreement, as `fly.toml`
+sets it up, and half the dips debated, roughly $19 a month when the news is quiet, $76 on typical days and $261 when
+every day is busy enough to reach the daily limit of 40 analyses (see [Costs](../README.md#costs), which also shows
+how to bring it down).
 
 **Why 512 MB.** Measured on 2026-09-28 with this image (Python 3.12, limited to 1 CPU): the website and the scanner on
 the real feeds, with a stand-in model that sent up to 8 tickers a cycle to analysis (24 analyses in all, with their
 prices, SEC figures and context news fetched for real, reports written and alerts worked out), and every kind of page
 loaded over 2,000 times. The process used 117 MB after the first cycle and levelled off at about 170 MB after 7 cycles
 (the highest reading was 169 MB): it keeps memory it has used once, so the figure grows over the first cycles and then
-stays. Without `MALLOC_ARENA_MAX=2` (set in the `Dockerfile`) it levelled off about 75 MB higher. A 256 MB Machine
-leaves about 210 MB for the app, too little; 512 MB leaves room for busy moments, and `swap_size_mb = 512` in `fly.toml`
-catches a spike instead of the kernel stopping the process.
+stays. Without `MALLOC_ARENA_MAX=2` (set in the `Dockerfile`) it levelled off about 75 MB higher. The debate adds
+Anthropic's package, which took about 27 MB more once loaded (measured on 2026-09-28: 64 MB before importing it and
+creating a client, 91 MB after), so expect about 200 MB. A 256 MB Machine leaves about 210 MB for the app, too little;
+512 MB leaves room for busy moments, and `swap_size_mb = 512` in `fly.toml` catches a spike instead of the kernel
+stopping the process.
 
 ## Troubleshooting
 
@@ -397,6 +450,8 @@ catches a spike instead of the kernel stopping the process.
 | `fly deploy` says the volume `scanner_data` doesn't exist, or can't be mounted | Create it in `primary_region` (step 3). A volume in another region doesn't count. |
 | The deploy fails its health check, and `fly logs` says `Configuration problem: SECRET_KEY ...` | Set `SECRET_KEY` (step 4); it must be at least 32 characters. |
 | The site says "Stopped: Configuration problem: Set OPENAI_API_KEY in .env ..." | On Fly that means the secret: `fly secrets set OPENAI_API_KEY=...` (it restarts the Machine). For "no credit" and other account problems, fix them at the provider, then "Start again" on the admin page. |
+| "Stopped: Configuration problem: LLM_ANALYSIS_MODE=debate uses anthropic:claude-sonnet-5 (LLM_DEBATERS), but ANTHROPIC_API_KEY isn't set" | `fly secrets set ANTHROPIC_API_KEY=...`; or, to analyse with OpenAI alone, remove `LLM_ANALYSIS_MODE` from `fly.toml`'s `[env]` and deploy. |
+| A notice "dip-scanner: Anthropic unavailable, analysing with OpenAI only" (or the other way round) | One of the two debaters failed (a rejected key, no credit, an outage); the other analyses each dip alone meanwhile and the scanner keeps running. The notice names the error; fix it at that provider. At most one such notice per provider every 12 hours. |
 | Forms answer "This form was sent from another site, so it was refused." | You are on another address than `BASE_URL` (e.g. the `fly.dev` one after moving to your own domain). Use the `BASE_URL` address, or correct the secret. |
 | Links in invites point to the wrong address | `BASE_URL` (step 4, or step 9). The links already sent keep the old address. |
 | `fly machine list` shows two Machines | `fly scale count 1`, then remove the spare volume (step 6). |
@@ -416,7 +471,7 @@ catches a spike instead of the kernel stopping the process.
   limits (see [Security model](../README.md#security-model) in the README, which lists the rest of the site's
   safeguards).
 - Anyone with the deploy token can deploy code that reads the app's secrets: keep `FLY_API_TOKEN` in GitHub's secrets
-  only, and let GitHub Actions deploy only from the default branch or by hand (the workflow does both).
+  only. The workflow deploys `main` only, so protect `main` (step 10) and review what is merged into it.
 - Backups contain password hashes and users' settings: keep downloaded copies private.
 
 ## What was checked, and when
@@ -443,5 +498,11 @@ validation and the strict check for unknown keys passed); `fly config validate` 
 - Prices (Machines, volumes, snapshots, certificates, data transfer, the free trial):
   https://fly.io/docs/about/pricing/ and https://fly.io/docs/about/free-trial/
 - Installing flyctl: https://fly.io/docs/flyctl/install/
+- Slack incoming webhooks (creating the app, "Incoming Webhooks", "Add New Webhook to Workspace", the URL's form):
+  https://docs.slack.dev/messaging/sending-messages-using-incoming-webhooks/
+- Discord webhooks (Edit Channel, Integrations, Webhooks, Copy Webhook URL):
+  https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks, as quoted by
+  https://hookdeck.com/webhooks/platforms/how-to-get-started-with-discord-webhooks (Discord's page answered 403 to
+  automated reading)
 - From Fly's community forum (not in the docs): the volume's mount point is given to the image's user, and `fly ssh
   console` starts in the image's `WORKDIR`, https://community.fly.io/t/1773 and https://community.fly.io/t/13144
