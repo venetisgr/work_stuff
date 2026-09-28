@@ -20,7 +20,7 @@ import {
 } from "@/components/IdeaSections";
 import PriceChart from "@/components/PriceChart";
 import { SiteShell } from "@/components/SiteShell";
-import { Pct, TimeAgo, VerdictBadge } from "@/components/ui";
+import { Pct, PriceText, TimeAgo, VerdictBadge } from "@/components/ui";
 import { getIdea, getMe } from "@/lib/api";
 import { ApiRequestError } from "@/lib/api-core";
 import { formatDay, formatPercent, formatPrice, formatScore, formatApprox, MONTHS } from "@/lib/format";
@@ -179,7 +179,7 @@ function Hero({ detail, me, now }: { detail: IdeaDetail; me: Me; now: number }) 
         </div>
         <div className="flex min-w-0 flex-col gap-0.5">
           <span className="text-[0.8125rem] text-muted">Price at the analysis</span>
-          <span className="num text-[1.375rem] font-bold">{formatPrice(idea.price.amount, idea.currency)}</span>
+          <PriceText className="text-[1.375rem] font-bold" text={formatPrice(idea.price.amount, idea.currency)} />
           {approx ? <span className="num approx text-sm">{approx}</span> : null}
           <span className="text-sm">
             <span className="whitespace-nowrap">

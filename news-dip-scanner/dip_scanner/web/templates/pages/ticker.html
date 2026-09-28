@@ -12,7 +12,7 @@
     </div>
     {% if stats %}
     <div class="price-block">
-      <span class="price-now num">{{ stats.price|price(stats.currency) }}</span>
+      <span class="price-now">{{ ui.price_text(stats.price, stats.currency) }}</span>
       <span class="small">{{ ui.pct(stats.change_1d_pct) }} today</span>
     </div>
     {% endif %}
@@ -30,9 +30,9 @@
     <div><dt>5 days</dt><dd>{{ ui.pct(stats.change_5d_pct) }}</dd></div>
     <div><dt>20 days</dt><dd>{{ ui.pct(stats.change_20d_pct) }}</dd></div>
     <div><dt>From the 20-day high</dt><dd>{{ ui.pct(stats.drawdown_20d_pct) }}</dd></div>
-    <div><dt>52-week range</dt><dd class="num">{{ stats.low_52w|price(stats.currency) }} – {{ stats.high_52w|price(stats.currency) }}</dd></div>
+    <div><dt>52-week range</dt><dd>{{ ui.price_text(stats.low_52w, stats.currency) }} – {{ ui.price_text(stats.high_52w, stats.currency) }}</dd></div>
     <div><dt>Volatility</dt><dd>{{ stats.volatility_pct|percent(1) }} a year</dd></div>
-    <div><dt>Statistical 6-month low</dt><dd class="num">{{ stats.stat_low_6m|price(stats.currency) }}</dd></div>
+    <div><dt>Statistical 6-month low</dt><dd>{{ ui.price_text(stats.stat_low_6m, stats.currency) }}</dd></div>
   </dl>
   {% else %}
   <p class="callout small">{{ price_problem }}</p>

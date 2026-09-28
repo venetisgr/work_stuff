@@ -262,3 +262,26 @@ def test_render_svg_on_its_own():
     svg = render_svg(closes(5), currency="USD", layout=NARROW, chart_id="x")
     root = parse(svg)
     assert root.get("aria-labelledby") == "x-title x-desc"
+
+
+def test_long_price_axis_labels_widen_the_gutter_instead_of_losing_digits():
+    # Samsung in won: "300,000" at the left of a 44-unit gutter would start past the drawing's edge ("00,000" on a
+    # phone). Each tick label must fit between x=0 and the plot, which starts right of the widest one.
+    won = [(day, round(close * 1800, 2)) for day, close in closes()]
+    result = chart(points=won, currency="KRW", levels=[Level("target", "Target", 300_000.0)], marker_value=None)
+    for svg, layout in ((result.wide, WIDE), (result.narrow, NARROW)):
+        root = parse(svg)
+        ticks = [t for t in root.iter(f"{SVG}text") if t.get("class") == "chart-tick" and "," in (t.text or "")]
+        assert ticks and any(len(t.text) >= 7 for t in ticks), [t.text for t in ticks]
+        grid_left = {float(line.get("x1")) for line in root.iter(f"{SVG}line") if line.get("class") == "chart-grid"}
+        assert len(grid_left) == 1 and grid_left.pop() > layout.left
+        for tick in ticks:
+            assert float(tick.get("x")) - len(tick.text) * layout.font * 0.6 >= 0, (layout.name, tick.text)
+
+
+def test_short_price_axis_labels_keep_the_usual_gutter():
+    result = chart()
+    for svg, layout in ((result.wide, WIDE), (result.narrow, NARROW)):
+        root = parse(svg)
+        grid_left = {float(line.get("x1")) for line in root.iter(f"{SVG}line") if line.get("class") == "chart-grid"}
+        assert grid_left == {float(layout.left)}

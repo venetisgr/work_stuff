@@ -29,7 +29,22 @@ export function VerdictBadge({ verdict, label }: { verdict: string; label?: stri
   return <span className={`badge verdict-${verdict}`}>{label ?? verdictLabel(verdict)}</span>;
 }
 
-/** "$132.00 ≈ €115.93": the ≈ part may wrap onto its own line on a phone. */
+/**
+ * A price as formatPrice writes it, for a narrow column: "272,750.00 KRW" may break between the number and its
+ * currency code on a phone, never inside the number, so a price in won or yen can't run into the column beside it.
+ * A price with a sign ("$132.00") stays one piece. The twin of the Fly app's ui.price_text macro.
+ */
+export function PriceText({ text, className = "" }: { text: string; className?: string }) {
+  const cut = text.lastIndexOf(" ");
+  if (cut <= 0) return <span className={`num ${className}`.trim()}>{text}</span>;
+  return (
+    <span className={className || undefined}>
+      <span className="num">{text.slice(0, cut)}</span> <span className="num">{text.slice(cut + 1)}</span>
+    </span>
+  );
+}
+
+/** "$132.00 ≈ €115.93": the ≈ part may wrap onto its own line on a phone, and a long price before its code. */
 export function Money({
   value,
   currency,
@@ -46,7 +61,7 @@ export function Money({
   const approx = approxCurrency ? formatApprox(value.approx, approxCurrency) : "";
   return (
     <span className={`${stacked ? "inline-flex flex-col items-end" : ""} ${className}`}>
-      <span className="num">{formatPrice(value.amount, currency)}</span>
+      <PriceText text={formatPrice(value.amount, currency)} />
       {approx ? (
         <>
           {stacked ? null : " "}

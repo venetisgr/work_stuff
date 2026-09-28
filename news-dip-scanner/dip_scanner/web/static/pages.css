@@ -1186,6 +1186,16 @@ li.ladder-row + li.ladder-row {
   align-items: flex-end;
 }
 
+/* A long price ("270,000.00 KRW") goes under the stock's name on a phone instead of over it: the name keeps at least
+   10rem, and the price wraps to its own line when both don't fit. */
+.ticker-hero .idea-hero-head {
+  flex-wrap: wrap;
+}
+
+.ticker-hero .idea-name {
+  flex: 1 1 10rem;
+}
+
 .price-now {
   font-size: 1.5rem;
   font-weight: 700;
@@ -1301,6 +1311,14 @@ li.ladder-row + li.ladder-row {
 
   .table-stack.outcomes td {
     width: calc(50% - var(--space-5) / 2);
+  }
+
+  /* in half a row a long label ("Athens General") wraps rather than pushing its figure out of the card (the cell's
+     .num keeps the figure itself on one line) */
+  .table-stack.outcomes td::before,
+  .table-stack.scoreboard-table td::before {
+    flex: 0 1 auto;
+    white-space: normal;
   }
 
   .table-stack.outcomes td.primary {

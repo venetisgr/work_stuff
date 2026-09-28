@@ -6,7 +6,7 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { formatDay, formatPercent, formatPrice, formatScore, formatWhen, plural } from "@/lib/format";
 import type { HistoryItem, IdeaDetail, Level, Outcome } from "@/lib/types";
-import { ExternalLink, Pct, ScoreBadge, TimeAgo, VerdictBadge } from "./ui";
+import { ExternalLink, Pct, PriceText, ScoreBadge, TimeAgo, VerdictBadge } from "./ui";
 
 export function LevelsCard({ detail, className = "" }: { detail: IdeaDetail; className?: string }) {
   const { idea } = detail;
@@ -127,7 +127,7 @@ export function OutcomeCard({ detail, className = "" }: { detail: IdeaDetail; cl
         <>
           <dl className="m-0 mb-3 grid grid-cols-2 gap-x-4 gap-y-3 min-[480px]:grid-cols-3 lg:grid-cols-2">
             <Kv label="Last close" note={formatDay(outcome.last_day)}>
-              <span className="num">{formatPrice(outcome.last_price, currency)}</span>
+              <PriceText text={formatPrice(outcome.last_price, currency)} />
             </Kv>
             <Kv label="Since the report">
               <Pct value={outcome.return_pct} />

@@ -24,6 +24,13 @@
 <span class="money"><span class="num">{{ value|price(opp.currency) }}</span>{% if other %} <span class="num approx">{{ other }}</span>{% endif %}</span>
 {%- endmacro %}
 
+{#- A price in its own currency ("272,750.00 KRW"), for a big figure in a narrow column: on a phone it may break between
+    the number and a currency code, never inside the number, so a price in won or yen can't run into its neighbour. -#}
+{% macro price_text(value, currency) -%}
+{% set text = value|price(currency) %}{% set cut = text.rfind(" ") %}
+{%- if cut > 0 %}<span class="num">{{ text[:cut] }}</span> <span class="num">{{ text[cut + 1:] }}</span>{% else %}<span class="num">{{ text }}</span>{% endif %}
+{%- endmacro %}
+
 {#- A signed percentage, green when above zero and red below. -#}
 {% macro pct(value) -%}
 {#- coloured by the value as shown: a -0.04% move reads "+0.0%" and gets no colour -#}

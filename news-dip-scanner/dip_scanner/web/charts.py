@@ -317,7 +317,7 @@ def render_svg(
     ]
     widest = max(_text_width(f"{label} {amount}".strip(), font) for _, label, amount, _ in labels)
     right = int(min(layout.width * 0.42, widest + 16))
-    plot_left, plot_right = layout.left, layout.width - right
+    plot_right = layout.width - right
     plot_top, plot_bottom = layout.top, layout.height - layout.bottom
 
     values = [close for _, close in points] + [level.value for level in levels]
@@ -327,6 +327,10 @@ def render_svg(
     room = max(3, int((plot_bottom - plot_top) / (font * 3)))
     ticks, decimals = nice_ticks(y_low, y_high, count=room + 1)
     ticks = [tick for tick in ticks if y_low <= tick <= y_high]
+    # The price axis's labels end 6 units left of the plot: a long one ("300,000" in won) widens the gutter instead
+    # of losing its first digits past the drawing's edge.
+    widest_tick = max((_text_width(tick_text(tick, currency, decimals), font) for tick in ticks), default=0.0)
+    plot_left = max(layout.left, math.ceil(widest_tick + 10))
 
     span = (end - start).days
 

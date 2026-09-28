@@ -124,7 +124,7 @@
     </div>
     <div class="stat">
       <span class="stat-label">Price at the analysis</span>
-      <span class="stat-value num">{{ opp.price|price(opp.currency) }}</span>
+      <span class="stat-value">{{ ui.price_text(opp.price, opp.currency) }}</span>
       {% if opp.price|approx(opp) %}<span class="approx num">{{ opp.price|approx(opp) }}</span>{% endif %}
       <span class="small"><span class="nowrap">{{ ui.pct(opp.stats.change_1d_pct) }} 1 day</span> · <span class="nowrap">{{ ui.pct(opp.stats.change_5d_pct) }} 5 days</span></span>
     </div>

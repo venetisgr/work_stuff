@@ -1,11 +1,14 @@
 /**
  * Screenshots of every page through the front door, React and Fly alike, on a phone (390×844) and a desktop
  * (1280×800), light and dark, so the two halves can be compared side by side. Only with E2E_SHOTS=<folder>. Each page
- * is also checked for sideways scrolling, and the run for console errors and CSP violations.
+ * is also checked for sideways scrolling, and the run for console errors and CSP violations. The stock whose price is
+ * the longest to write (272,750.00 KRW beats $12.71) gets its idea and ticker pages taken too, since a long price is
+ * what pushes a phone's layout sideways.
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "@playwright/test";
+import { formatPrice } from "../src/lib/format";
 import type { IdeasList } from "../src/lib/types";
 import { settings, signIn, Watch } from "./helpers";
 
@@ -28,6 +31,12 @@ async function ideaPages(request: import("@playwright/test").APIRequestContext):
   }
   const plain = list.ideas.find((item) => item.debate === null);
   if (plain) pages.push(["idea-plain", `/ideas/${plain.id}`]);
+  const written = (item: IdeasList["ideas"][number]) => formatPrice(item.price.amount, item.currency).length;
+  const longest = [...list.ideas].sort((a, b) => written(b) - written(a))[0];
+  if (longest) {
+    pages.push(["idea-long-price", `/ideas/${longest.id}`]);
+    pages.push(["ticker-long-price", `/tickers/${encodeURIComponent(longest.ticker)}`]);
+  }
   return pages;
 }
 

@@ -817,6 +817,45 @@ def test_the_ticker_page(seeded):
     assert "Manual analyses aren&#39;t available right now." in page
 
 
+def test_a_long_price_may_wrap_before_its_currency_code(site):
+    """A price in won ("272,750.00 KRW") is a number and a code that can go onto two lines on a phone, never one
+    unbreakable run: the hero of an idea and of a ticker ran into the figure beside them at 390px, and the 52-week
+    range made the ticker page scroll sideways. The number itself never breaks."""
+    k = 272_750.0 / 142.5
+    site.prices.bars["005930.KS"] = bars_until(TODAY, 272_750.0)
+    site.prices.currencies["005930.KS"] = "KRW"
+    idea = site.add(
+        ticker="005930.KS",
+        company="Samsung Electronics Co., Ltd.",
+        stats=make_stats(ticker="005930.KS", price=272_750.0, currency="KRW", exchange="KSC"),
+        analysis=make_analysis(potential_low=118.0 * k, entry_price=132.0 * k, target_price=168.0 * k),
+    )
+    client = site.client()
+    split = '<span class="num">272,750.00</span> <span class="num">KRW</span>'
+    assert f'<span class="stat-value">{split}</span>' in client.get(f"/ideas/{idea.id}").text
+    ticker = client.get("/tickers/005930.KS").text
+    price = r'<span class="num">[\d,]+\.\d\d</span> <span class="num">KRW</span>'
+    assert re.search(f'<span class="price-now">{price}</span>', ticker)
+    shown = re.search(r"<dt>52-week range</dt><dd>(.*?)</dd>", ticker)
+    assert shown is not None and re.fullmatch(f"{price} – {price}", shown.group(1)), shown
+    shown = re.search(r"<dt>Statistical 6-month low</dt><dd>(.*?)</dd>", ticker)
+    assert shown is not None and re.fullmatch(price, shown.group(1)), shown
+    # a price with a currency sign has nothing to break at: one piece, as before
+    amd = client.get("/tickers/AMD").text
+    assert re.search(r'<span class="price-now"><span class="num">\$[\d,]+\.\d\d</span></span>', amd)
+
+
+def test_the_ticker_hero_lets_a_long_price_wrap_under_the_name():
+    """The CSS half of the test above: the ticker hero's head wraps (the price under the name) instead of squeezing
+    the name under a long price, and a half-width track cell's label wraps instead of pushing its figure out."""
+    css = (Path(pages.__file__).parent / "static" / "pages.css").read_text()
+    compact = re.sub(r"\s+", " ", css)
+    assert ".ticker-hero .idea-hero-head { flex-wrap: wrap; }" in compact
+    assert ".ticker-hero .idea-name { flex: 1 1 10rem; }" in compact
+    label = ".table-stack.outcomes td::before, .table-stack.scoreboard-table td::before {"
+    assert f"{label} flex: 0 1 auto; white-space: normal; }}" in compact
+
+
 def test_an_idea_row_measures_the_target_from_the_entry_beside_it(seeded):
     """ "Entry $X · +Y% to target": Y is from the entry (the limit orders), not from the price in the report."""
     site, ids = seeded

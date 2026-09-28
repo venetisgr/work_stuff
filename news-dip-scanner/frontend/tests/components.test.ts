@@ -9,6 +9,7 @@ import IdeaList from "@/components/IdeaList";
 import NoIdeas from "@/components/NoIdeas";
 import NotFoundView from "@/components/NotFoundView";
 import StatusStrip from "@/components/StatusStrip";
+import { Money, PriceText } from "@/components/ui";
 import { metadata } from "@/app/layout";
 import { cycleFindings, formatPct, usSessionHours } from "@/lib/format";
 import type { IdeasList, Me, Status } from "@/lib/types";
@@ -117,6 +118,37 @@ describe("the dashboard with no ideas", () => {
     expect(cycleFindings("Cycle 2026-09-25 18:00 EEST failed: feeds down")).toBe(
       "Cycle 2026-09-25 18:00 EEST failed: feeds down",
     );
+  });
+});
+
+describe("a long price", () => {
+  // "272,750.00 KRW" in one unbreakable run covered the next column of an idea card, and the figure beside the price
+  // on the idea page, at 390px: it may break before its currency code now, never inside the number.
+  const won = '<span class="num">272,750.00</span> <span class="num">KRW</span>';
+  const money = (amount: number, currency: string, className = "") =>
+    renderToStaticMarkup(createElement(Money, { value: { amount, approx: null }, currency, approxCurrency: null, className }));
+
+  it("may break between the number and its currency code", () => {
+    expect(money(272750, "KRW", "flex flex-col")).toBe(`<span class=" flex flex-col"><span>${won}</span></span>`);
+    expect(renderToStaticMarkup(createElement(PriceText, { text: "272,750.00 KRW", className: "font-bold" }))).toBe(
+      `<span class="font-bold">${won}</span>`,
+    );
+  });
+
+  it("stays one piece when a sign stands for the currency", () => {
+    expect(money(132, "USD")).toContain('<span class="num">$132.00</span>');
+    expect(money(11.84, "EUR")).toContain('<span class="num">€11.84</span>');
+    expect(renderToStaticMarkup(createElement(PriceText, { text: "245.50p" }))).toBe('<span class="num">245.50p</span>');
+  });
+
+  it("in an idea card", () => {
+    const hk = list.ideas.find((idea) => idea.currency === "HKD");
+    expect(hk).toBeDefined();
+    const html = renderToStaticMarkup(
+      createElement(IdeaList, { ideas: [hk!], now, timeZone: "Europe/Athens", userCurrency: null }),
+    );
+    expect(html).toMatch(/<span class="num">[\d,]+\.\d\d<\/span> <span class="num">HKD<\/span>/);
+    expect(html).not.toMatch(/<span class="num">[\d,]+\.\d\d HKD<\/span>/);
   });
 });
 
