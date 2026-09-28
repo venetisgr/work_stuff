@@ -50,6 +50,11 @@ describe("the idea list", () => {
     expect(html).toContain(formatPct(idea.entry_downside_pct));
     expect(html).not.toContain(formatPct(idea.upside_pct));
   });
+
+  it("lets a table too wide for its card scroll in it rather than cutting off its last column", () => {
+    // at 1024px, or at 1280px with a price in won, the "Analysed" column went under the card's clipped edge
+    expect(html).toMatch(/<div class="card card-flush overflow-x-auto"><table /);
+  });
 });
 
 describe("the status strip", () => {

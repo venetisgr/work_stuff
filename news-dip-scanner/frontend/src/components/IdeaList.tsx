@@ -115,7 +115,9 @@ function IdeaCard({ idea, now, timeZone }: { idea: IdeaSummary; now: number; tim
 
 function IdeaTable({ ideas, now, timeZone }: ListProps) {
   return (
-    <div className="card card-flush">
+    // A table wider than its card (long names and prices on a 1024px screen) scrolls inside it instead of losing its
+    // last column under the card's rounded corners.
+    <div className="card card-flush overflow-x-auto">
       <table className="w-full border-collapse text-[0.9375rem]">
         <thead className="bg-surface-2 text-left text-[0.8125rem] text-muted">
           <tr>
@@ -156,7 +158,7 @@ function IdeaTable({ ideas, now, timeZone }: ListProps) {
                 <td className="px-4 py-3">
                   <ScoreBadge score={idea.score} band={idea.score_band} />
                 </td>
-                <td className="max-w-[18rem] px-3 py-3">
+                <td className="max-w-[15rem] px-3 py-3 xl:max-w-[18rem]">
                   <div className="flex items-center gap-1.5">
                     <Link href={`/ideas/${idea.id}`} className="ticker stretched text-ink hover:no-underline">
                       {idea.ticker}

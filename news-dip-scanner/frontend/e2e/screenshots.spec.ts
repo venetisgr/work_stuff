@@ -1,9 +1,9 @@
 /**
  * Screenshots of every page through the front door, React and Fly alike, on a phone (390×844) and a desktop
  * (1280×800), light and dark, so the two halves can be compared side by side. Only with E2E_SHOTS=<folder>. Each page
- * is also checked for sideways scrolling, and the run for console errors and CSP violations. The stock whose price is
- * the longest to write (272,750.00 KRW beats $12.71) gets its idea and ticker pages taken too, since a long price is
- * what pushes a phone's layout sideways.
+ * is also checked for sideways scrolling and for tables cut off by their box, and the run for console errors and CSP
+ * violations. The stock whose price is the longest to write (272,750.00 KRW beats $12.71) gets its idea and ticker
+ * pages taken too, since a long price is what pushes a layout sideways.
  */
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -52,6 +52,22 @@ for (const viewport of VIEWPORTS) {
         await page.waitForLoadState("networkidle");
         const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
         expect(overflow, `${name} scrolls sideways at ${viewport.width}px`).toBeLessThanOrEqual(0);
+        // A table wider than a box that hides its overflow loses its last columns without a way to reach them.
+        const cut = await page.evaluate(() =>
+          [...document.querySelectorAll("table")].flatMap((table) => {
+            if (!table.offsetWidth) return [];
+            for (let box = table.parentElement; box; box = box.parentElement) {
+              const overflowX = getComputedStyle(box).overflowX;
+              if (overflowX === "hidden" || overflowX === "clip") {
+                const lost = box.scrollWidth - box.clientWidth;
+                return lost > 1 ? [`"${table.querySelector("th")?.textContent?.trim()}…" table: ${lost}px`] : [];
+              }
+              if (overflowX !== "visible") return [];
+            }
+            return [];
+          }),
+        );
+        expect(cut, `${name} cuts a table off at ${viewport.width}px`).toEqual([]);
         await page.screenshot({
           path: join(settings.shots, `${name}-${viewport.width}-${scheme}.png`),
           fullPage: true,
