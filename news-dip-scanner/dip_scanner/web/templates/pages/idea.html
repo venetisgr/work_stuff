@@ -1,0 +1,23 @@
+{#- A first idea page from the website's foundation; the member pages replace it. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% block content %}
+<div class="page-header">
+  <h1><span class="ticker">{{ opp.ticker }}</span> <span class="muted">{{ opp.company }}</span></h1>
+  <div class="cluster">{{ ui.score_badge(opp.score) }} {{ ui.verdict_badge(opp.analysis.verdict) }}</div>
+</div>
+<div class="card stack">
+  <dl class="kv">
+    <div><dt>Price at the analysis</dt><dd>{{ ui.money(opp.price, opp) }}</dd></div>
+    <div><dt>Chance higher in 6 months</dt><dd>{{ opp.analysis.probability_up_6m|percent }}</dd></div>
+    <div><dt>Entry (limit buy)</dt><dd>{{ ui.money(opp.analysis.entry_price, opp) }}</dd></div>
+    <div><dt>Target (limit sell)</dt><dd>{{ ui.money(opp.analysis.target_price, opp) }}</dd></div>
+    <div><dt>Potential low</dt><dd>{{ ui.money(opp.analysis.potential_low, opp) }}</dd></div>
+    <div><dt>Upside to the target</dt><dd>{{ ui.pct(opp.upside_pct()) }}</dd></div>
+  </dl>
+  {% if opp|fx_note %}<p class="small muted">{{ opp|fx_note }}.</p>{% endif %}
+  <p>{{ opp.analysis.thesis }}</p>
+  <p class="small muted">Analysed {{ opp.created|when }} by {{ opp.model }}.</p>
+  <div class="form-actions">{{ ui.analyse_button(opp.ticker, label="Analyse again now", next="/ideas/" ~ opp.id) }}</div>
+</div>
+{% endblock %}

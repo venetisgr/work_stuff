@@ -130,6 +130,11 @@ def stopped_lines(command: str, reason: str, now: datetime) -> list[str]:
     """The body of a STOPPED notice for `dip-scanner <command>`."""
     if command == "watch":
         effect = "`dip-scanner watch` has exited: no news is scanned and no alerts are sent until it is started again."
+    elif command == "serve":
+        effect = (
+            "The website keeps running, but its scanner has stopped: no news is scanned and no alerts are sent until "
+            'an admin clicks "Start again" on the admin page or the website restarts.'
+        )
     else:
         effect = (
             f"Every `dip-scanner {command}` stops with this error until it is fixed: no news is scanned and no alerts "

@@ -771,6 +771,41 @@ def test_backup_copies_the_database_and_keeps_the_newest(workdir, capsys, monkey
         cli.main(["backup", "--keep", "0"])
 
 
+def test_serve_needs_a_secret_key_and_runs_the_website(workdir, capsys, monkeypatch):
+    from dip_scanner.web import server
+
+    seen: dict = {}
+
+    def serve(settings, config, feeds, **kwargs):
+        seen.update(kwargs, feeds=[feed.key for feed in feeds], secret=settings.web.secret_key)
+
+    monkeypatch.setattr(server, "serve", serve)
+    assert cli.main(["serve"]) == 2
+    err = capsys.readouterr().err
+    assert "Configuration problem: SECRET_KEY isn't set" in err and 'python -c "import secrets' in err
+    assert seen == {}
+
+    monkeypatch.setenv("SECRET_KEY", "k" * 40)
+    assert cli.main(["serve", "--host", "0.0.0.0", "--port", "9000"]) == 0
+    assert (seen["host"], seen["port"], seen["scanner_enabled"]) == ("0.0.0.0", 9000, True)
+    assert seen["feeds"] == ["marketwatch", "sec-8k", "off"] and seen["secret"] == "k" * 40
+    assert cli.main(["serve", "--no-scanner"]) == 0
+    assert (seen["host"], seen["port"], seen["scanner_enabled"]) == ("127.0.0.1", 8080, False)
+    monkeypatch.setenv("SCANNER_ENABLED", "false")
+    assert cli.main(["serve"]) == 0 and seen["scanner_enabled"] is False
+    with pytest.raises(SystemExit):
+        cli.main(["serve", "--port", "70000"])
+
+
+def test_serve_without_the_web_extra_says_what_to_install(workdir, capsys, monkeypatch):
+    import sys
+
+    monkeypatch.setenv("SECRET_KEY", "k" * 40)
+    monkeypatch.setitem(sys.modules, "dip_scanner.web.server", None)
+    assert cli.main(["serve"]) == 2
+    assert 'The website needs the web extra: pip install -e ".[web]"' in capsys.readouterr().err
+
+
 def test_the_readme_names_every_command():
     readme = (Path(cli.__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
     commands = cli._parser()._subparsers._group_actions[0].choices

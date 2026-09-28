@@ -1,0 +1,173 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% block content %}
+<div class="page-header">
+  <h1>Settings</h1>
+  <p class="lede">Your alert rules, watchlist, channels, currency and time zone. They apply from the scanner's next cycle.</p>
+</div>
+
+{% if errors %}
+<div class="flash flash-error" role="alert"><p>Nothing was saved: {{ errors|length|plural("setting needs", "settings need") }} a fix (marked below).</p></div>
+{% endif %}
+
+<form class="stack" method="post" action="/settings" novalidate>
+  {{ ui.csrf_field() }}
+
+  <section class="card" id="alerts" aria-labelledby="alerts-title">
+    <h2 class="section-title" id="alerts-title">Alerts</h2>
+    <p class="section-lede">Which new ideas are sent to you. Everything the scanner finds is on the Ideas page anyway.</p>
+    <div class="form">
+      <div class="field-row">
+        {{ ui.field("min_score", "Lowest score", value=values.min_score, type="text", error=errors.get("min_score"), help="0-100. 65 alerts only confident \"temporary fear\" calls; 55 adds mixed verdicts.", attrs={"inputmode": "decimal"}, css="input input-short") }}
+        {{ ui.field("min_probability", "Lowest chance of being higher in 6 months", value=values.min_probability, type="text", error=errors.get("min_probability"), help="In %, 0-100.", attrs={"inputmode": "numeric"}, css="input input-short") }}
+      </div>
+      <fieldset class="field{% if errors.get('verdicts') %} has-error{% endif %}">
+        <legend>Verdicts</legend>
+        <div class="check-list check-list-inline">
+          {% for verdict, label in verdict_choices %}
+          <label class="check"><input type="checkbox" name="verdicts" value="{{ verdict }}"{% if verdict in values.verdicts %} checked{% endif %}> {{ label }}</label>
+          {% endfor %}
+        </div>
+        {{ ui.field_error("verdicts", errors.get("verdicts")) }}
+      </fieldset>
+      <div class="check-list">
+        <label class="check"><input type="checkbox" name="only_watchlist" value="on"{% if values.only_watchlist %} checked{% endif %}> <span>Only alert me about my watchlist</span></label>
+        <label class="check"><input type="checkbox" name="thesis_changes" value="on"{% if values.thesis_changes %} checked{% endif %}> <span>Tell me when a later analysis no longer supports an idea I was alerted about ("thesis change")</span></label>
+      </div>
+    </div>
+  </section>
+
+  <section class="card" id="watchlist" aria-labelledby="watchlist-title">
+    <h2 class="section-title" id="watchlist-title">Watchlist</h2>
+    <p class="section-lede">Any negative or mixed news about these companies makes them a candidate, however small. Yahoo Finance symbols: AMD, SAP.DE, ASML.AS, ALWN.AT.</p>
+    <div class="field{% if errors.get('watchlist') %} has-error{% endif %}">
+      <label for="f-watchlist">Symbols</label>
+      <textarea class="textarea mono" id="f-watchlist" name="watchlist" rows="3" autocapitalize="characters" spellcheck="false"{% if errors.get("watchlist") %} aria-invalid="true" aria-describedby="f-watchlist-error"{% endif %}>{{ values.watchlist }}</textarea>
+      <p class="help">Separated by commas, spaces or new lines; at most 100.</p>
+      {{ ui.field_error("watchlist", errors.get("watchlist")) }}
+    </div>
+  </section>
+
+  <section class="card" id="channels" aria-labelledby="channels-title">
+    <h2 class="section-title" id="channels-title">Where alerts go</h2>
+    <p class="section-lede">{% if has_channel %}Alerts go to every channel below.{% else %}No channel yet: set one up to get alerts. Ideas from before are never sent late.{% endif %}</p>
+    <div class="form">
+      {% if offered.email %}
+      <div class="field{% if errors.get('email_alerts') %} has-error{% endif %}">
+        <label class="check"><input type="checkbox" name="email_alerts" value="on"{% if values.email_alerts %} checked{% endif %}> <span>Email to {{ user.email }}</span></label>
+        {% if not offered.email_ready %}<p class="help">The server has no email settings any more, so no email is sent. Untick this to tidy up.</p>{% endif %}
+        {{ ui.field_error("email_alerts", errors.get("email_alerts")) }}
+      </div>
+      {% endif %}
+      {% if offered.telegram %}
+      {{ ui.field("telegram_chat_id", "Telegram chat id", value=values.telegram_chat_id, error=errors.get("telegram_chat_id"), help="Start a chat with the site's bot first. A number (negative for a group) or a public channel's @name; empty for none." if offered.telegram_ready else "The server has no Telegram bot any more, so nothing is sent. Empty the field to tidy up.", attrs={"inputmode": "text", "autocapitalize": "none", "spellcheck": "false"}) }}
+      {% endif %}
+      <div class="field-row">
+        {{ ui.field("webhook_url", "Webhook address", value=values.webhook_url, type="url", error=errors.get("webhook_url"), help="A Slack or Discord incoming webhook, or any https:// address that takes JSON. Empty for none.", attrs={"autocapitalize": "none", "spellcheck": "false", "placeholder": "https://hooks.slack.com/services/..."}) }}
+        <div class="field{% if errors.get('webhook_format') %} has-error{% endif %}">
+          <label for="f-webhook_format">Webhook format</label>
+          <select class="select" id="f-webhook_format" name="webhook_format">
+            {% for fmt in webhook_formats %}
+            <option value="{{ fmt }}"{% if fmt == values.webhook_format %} selected{% endif %}>{{ {"slack": "Slack", "discord": "Discord", "generic": "Generic JSON"}.get(fmt, fmt) }}</option>
+            {% endfor %}
+          </select>
+          {{ ui.field_error("webhook_format", errors.get("webhook_format")) }}
+        </div>
+      </div>
+      {% if not offered.email and not offered.telegram %}
+      <p class="help">Email and Telegram alerts aren't set up on this server; a webhook works.</p>
+      {% endif %}
+    </div>
+  </section>
+
+  <section class="card" id="display" aria-labelledby="display-title">
+    <h2 class="section-title" id="display-title">Display</h2>
+    <p class="section-lede">How amounts and times are shown on these pages and in your alerts.</p>
+    <div class="form">
+      <div class="field-row">
+        <div class="field{% if errors.get('currency') %} has-error{% endif %}">
+          <label for="f-currency">Your currency</label>
+          <select class="select" id="f-currency" name="currency">
+            <option value=""{% if not values.currency %} selected{% endif %}>Trading currency only</option>
+            {% for code in currencies %}
+            <option value="{{ code }}"{% if code == values.currency %} selected{% endif %}>{{ code }}</option>
+            {% endfor %}
+          </select>
+          <p class="help">Prices, entries and targets also show "≈" this currency, at the exchange rate of the analysis.</p>
+          {{ ui.field_error("currency", errors.get("currency")) }}
+        </div>
+        <div class="field{% if errors.get('timezone') %} has-error{% endif %}">
+          <label for="f-timezone">Time zone</label>
+          <select class="select" id="f-timezone" name="timezone">
+            {% set ns = namespace(found=false) %}
+            {% for region, zones in timezones %}
+            {% if region %}<optgroup label="{{ region }}">{% endif %}
+            {% for zone in zones %}
+            {% if zone == values.timezone %}{% set ns.found = true %}{% endif %}
+            <option value="{{ zone }}"{% if zone == values.timezone %} selected{% endif %}>{{ zone.replace("_", " ") }}</option>
+            {% endfor %}
+            {% if region %}</optgroup>{% endif %}
+            {% endfor %}
+            {% if not ns.found and values.timezone %}<option value="{{ values.timezone }}" selected>{{ values.timezone }}</option>{% endif %}
+          </select>
+          {{ ui.field_error("timezone", errors.get("timezone")) }}
+        </div>
+      </div>
+      {{ ui.field("name", "Your name", value=values.name, autocomplete="name", help="Shown in the menu and to the site's admins.") }}
+    </div>
+  </section>
+
+  <div class="form-actions">
+    <button class="btn btn-primary" type="submit">Save settings</button>
+  </div>
+</form>
+
+<hr>
+
+<div class="grid">
+  <section class="card" aria-labelledby="test-title">
+    <h2 class="section-title" id="test-title">Test your alerts</h2>
+    <p class="section-lede">Sends a short test message to each saved channel and says how each went.</p>
+    <form method="post" action="/settings/test">
+      {{ ui.csrf_field() }}
+      <button class="btn btn-secondary" type="submit"{% if not has_channel %} disabled{% endif %}>Send a test alert</button>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="analyses-title">
+    <h2 class="section-title" id="analyses-title">Manual analyses</h2>
+    <p class="section-lede">"Analyse now" on an idea or a ticker asks the model about it at once.</p>
+    {% if jobs_limit is none %}
+    <p>No limit for admins.</p>
+    {% elif jobs_limit == 0 %}
+    <p>Switched off on this server.</p>
+    {% else %}
+    <p><strong class="num">{{ jobs_remaining }}</strong> of {{ jobs_limit }} left in the last 24 hours.</p>
+    {% endif %}
+  </section>
+
+  <section class="card" id="password" aria-labelledby="password-title">
+    <h2 class="section-title" id="password-title">Password</h2>
+    <p class="section-lede">Changing it signs you out on every other device.</p>
+    {% if password_error %}<div class="flash flash-error" role="alert"><p>{{ password_error }}</p></div>{% endif %}
+    <form class="form" method="post" action="/settings/password">
+      {{ ui.csrf_field() }}
+      <input type="hidden" name="username" value="{{ user.email }}" autocomplete="username">
+      {{ ui.field("current_password", "Current password", type="password", required=true, autocomplete="current-password") }}
+      {{ ui.field("new_password", "New password", type="password", required=true, autocomplete="new-password", attrs={"minlength": min_password}, help="At least " ~ min_password ~ " characters.") }}
+      {{ ui.field("confirm", "New password again", type="password", required=true, autocomplete="new-password", attrs={"minlength": min_password}) }}
+      <div class="form-actions"><button class="btn btn-secondary" type="submit">Change password</button></div>
+    </form>
+  </section>
+
+  <section class="card" aria-labelledby="sessions-title">
+    <h2 class="section-title" id="sessions-title">Signed-in devices</h2>
+    {% if other_sessions %}
+    <p class="section-lede">You're also signed in on {{ other_sessions|plural("other device or browser", "other devices or browsers") }}.</p>
+    {{ ui.post_button("/settings/sessions", "Sign out everywhere else", css="btn btn-danger", confirm="Sign out on every other device?") }}
+    {% else %}
+    <p class="section-lede">Only this browser is signed in.</p>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

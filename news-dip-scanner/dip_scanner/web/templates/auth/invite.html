@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% block head %}<meta name="referrer" content="no-referrer">{% endblock %}
+{% block content %}
+<div class="auth-card card">
+  <h1>Create your account</h1>
+  <p class="muted">You were invited{% if invite.role == "admin" %} as an admin{% endif %}. The link works once, until {{ invite.expires|when }}.</p>
+  {% if error %}<div class="flash flash-error" role="alert"><p>{{ error }}</p></div>{% endif %}
+  <form class="form" method="post" action="">
+    {{ ui.csrf_field() }}
+    {% if invite.email %}
+    {{ ui.field("email", "Email", value=invite.email, type="email", autocomplete="username", attrs={"readonly": "readonly"}, help="The invite is for this address.") }}
+    {% else %}
+    {{ ui.field("email", "Email", value=email, type="email", required=true, autocomplete="username", attrs={"autocapitalize": "none", "spellcheck": "false"}) }}
+    {% endif %}
+    {{ ui.field("name", "Your name", value=name, autocomplete="name", help="Shown to the site's admins; optional.") }}
+    {{ ui.field("password", "Password", type="password", required=true, autocomplete="new-password", attrs={"minlength": min_password}, help="At least " ~ min_password ~ " characters.") }}
+    {{ ui.field("confirm", "Password again", type="password", required=true, autocomplete="new-password", attrs={"minlength": min_password}) }}
+    <div class="form-actions">
+      <button class="btn btn-primary btn-block" type="submit">Create account</button>
+    </div>
+  </form>
+</div>
+{% endblock %}

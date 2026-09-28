@@ -1,0 +1,64 @@
+{#- The layout of every page. Pages extend it and fill these blocks:
+      title (default: page_title · Dip scanner), head (more <head> tags), body_class, content.
+    Context from app.render: user, is_admin, nav, flashes, csrf_token, extra_css (pages.css / admin.css). -#}
+{% import "_macros.html" as ui with context %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#161a20" media="(prefers-color-scheme: dark)">
+  <meta name="robots" content="noindex, nofollow">
+  <title>{% block title %}{% if page_title %}{{ page_title }} · {% endif %}{{ app_name }}{% endblock %}</title>
+  <link rel="icon" href="{{ static('favicon.svg') }}" type="image/svg+xml">
+  <link rel="stylesheet" href="{{ static('app.css') }}">
+  {% for name in extra_css %}
+  <link rel="stylesheet" href="{{ static(name) }}">
+  {% endfor %}
+  <script src="{{ static('app.js') }}" defer></script>
+  {% block head %}{% endblock %}
+</head>
+<body class="{% block body_class %}{% endblock %}">
+  <a class="skip-link" href="#main">Skip to the content</a>
+  <header class="site-header">
+    <div class="container header-inner">
+      <a class="brand" href="/">
+        <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false"><rect width="32" height="32" rx="7" fill="#0b5cad"/><path d="M5 10 L12 13 L16 23 L21 16 L27 12" fill="none" stroke="#ffffff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/><circle cx="16" cy="23" r="2.6" fill="#ffd166"/></svg>
+        <span>{{ app_name }}</span>
+      </a>
+      {% if user %}
+      <nav class="nav" aria-label="Main">
+        <a href="/"{% if nav == "ideas" %} aria-current="page"{% endif %}>Ideas</a>
+        <a href="/news"{% if nav == "news" %} aria-current="page"{% endif %}>News</a>
+        <a href="/track"{% if nav == "track" %} aria-current="page"{% endif %}>Track record</a>
+        <a href="/settings"{% if nav == "settings" %} aria-current="page"{% endif %}>Settings</a>
+        {% if is_admin %}<a href="/admin"{% if nav == "admin" %} aria-current="page"{% endif %}>Admin</a>{% endif %}
+      </nav>
+      <details class="menu">
+        <summary><span class="avatar" aria-hidden="true">{{ user.label[:1]|upper }}</span><span class="menu-label truncate">{{ user.label }}</span></summary>
+        <div class="menu-panel">
+          <div class="menu-who">Signed in as {{ user.email }}{% if is_admin %} (admin){% endif %}</div>
+          <a href="/settings">Settings</a>
+          <form method="post" action="/logout">
+            {{ ui.csrf_field() }}
+            <button type="submit">Sign out</button>
+          </form>
+        </div>
+      </details>
+      {% endif %}
+    </div>
+  </header>
+  <main id="main" class="container">
+    {{ ui.flash_messages(flashes) }}
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="site-footer">
+    <div class="container">
+      <p class="disclaimer">{{ footer }}</p>
+      <p>A language model rates news-driven price dips; its chances and scores are estimates, not promises. Do your own checks before you buy or sell anything.{% if user %} Times in {{ tz_name }}.{% endif %}</p>
+    </div>
+  </footer>
+</body>
+</html>

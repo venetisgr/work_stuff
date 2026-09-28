@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="auth-card card">
+  <p class="error-code">Error {{ status }}</p>
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <div class="form-actions">
+    {% if user %}
+    <a class="btn btn-primary" href="/">Back to the ideas</a>
+    {% elif status == 403 or status == 429 %}
+    <a class="btn btn-primary" href="/login">Go to sign in</a>
+    {% else %}
+    <a class="btn btn-primary" href="/">Go to the home page</a>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

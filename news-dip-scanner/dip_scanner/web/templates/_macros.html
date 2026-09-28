@@ -1,0 +1,135 @@
+{#- Shared pieces of the website's pages. Import them with context (they use csrf_token, request and now):
+      {% import "_macros.html" as ui with context %}
+    and call them like {{ ui.score_badge(opp.score) }}. Everything they print is autoescaped. -#}
+
+{#- The hidden token every POST form must carry. -#}
+{% macro csrf_field() -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{%- endmacro %}
+
+{#- A score of 0-100 coloured by its band (80+ strong, 65-80 good, 50-65 fair, under 50 weak). -#}
+{% macro score_badge(score) -%}
+<span class="badge badge-score band-{{ score|band }}" title="Score {{ score|score }} of 100: {{ score|band }}">{{ score|score }}</span>
+{%- endmacro %}
+
+{#- A verdict: temporary_fear -> "Temporary fear", coloured. -#}
+{% macro verdict_badge(verdict) -%}
+<span class="badge badge-verdict verdict-{{ verdict }}">{{ verdict|verdict }}</span>
+{%- endmacro %}
+
+{#- An amount in the idea's currency, with "≈ €..." in the reader's (pass the opp from ctx.view / in_currency); the
+    two parts may wrap onto two lines on a phone. -#}
+{% macro money(value, opp) -%}
+{% set other = value|approx(opp) %}
+<span class="money"><span class="num">{{ value|price(opp.currency) }}</span>{% if other %} <span class="num approx">{{ other }}</span>{% endif %}</span>
+{%- endmacro %}
+
+{#- A signed percentage, green when above zero and red below. -#}
+{% macro pct(value) -%}
+<span class="num{% if value is not none and value > 0 %} up{% elif value is not none and value < 0 %} down{% endif %}">{{ value|pct }}</span>
+{%- endmacro %}
+
+{#- A time: "5 min ago" (relative=true) or "2026-09-25 18:00 EEST", the other form in the tooltip. -#}
+{% macro time(value, relative=true) -%}
+{% if value %}<time datetime="{{ value|iso }}" title="{{ value|when if relative else value|ago }}">{{ value|ago if relative else value|when }}</time>{% else %}–{% endif %}
+{%- endmacro %}
+
+{#- A link to a ticker's page. -#}
+{% macro ticker_link(ticker) -%}
+<a class="ticker" href="/tickers/{{ ticker|urlencode }}">{{ ticker }}</a>
+{%- endmacro %}
+
+{#- A headline linking to its article (http/https only, new tab, no referrer); plain text otherwise. -#}
+{% macro headline_link(title, url) -%}
+{% set link = url|safe_url %}
+{% if link %}<a href="{{ link }}" target="_blank" rel="noopener noreferrer">{{ title }}</a>{% else %}{{ title }}{% endif %}
+{%- endmacro %}
+
+{#- "Analyse now" for a ticker: POST /analyze, then the job's page. next: where to come back when it can't start. -#}
+{% macro analyse_button(ticker, label="Analyse now", next=none, css="btn btn-secondary") -%}
+<form class="inline-form" method="post" action="/analyze">
+  {{ csrf_field() }}
+  <input type="hidden" name="ticker" value="{{ ticker }}">
+  {% if next %}<input type="hidden" name="next" value="{{ next }}">{% endif %}
+  <button class="{{ css }}" type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{#- A POST button with an optional confirmation question (app.js asks; without JavaScript it just submits). -#}
+{% macro post_button(action, label, css="btn btn-secondary", confirm=none, fields={}) -%}
+<form class="inline-form" method="post" action="{{ action }}"{% if confirm %} data-confirm="{{ confirm }}"{% endif %}>
+  {{ csrf_field() }}
+  {% for name, value in fields.items() %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endfor %}
+  <button class="{{ css }}" type="submit">{{ label }}</button>
+</form>
+{%- endmacro %}
+
+{#- Nothing to show yet. -#}
+{% macro empty_state(title, text=none, action_url=none, action_label=none) -%}
+<div class="empty-state">
+  <p class="empty-title">{{ title }}</p>
+  {% if text %}<p>{{ text }}</p>{% endif %}
+  {% if action_url %}<p><a class="btn btn-secondary" href="{{ action_url }}">{{ action_label or "Go" }}</a></p>{% endif %}
+</div>
+{%- endmacro %}
+
+{#- An input with its label, help text and error. attrs: more attributes, e.g. {"inputmode": "decimal"}. -#}
+{% macro field(name, label, value="", type="text", error=none, help=none, required=false, autocomplete=none, attrs={}, css="input") -%}
+<div class="field{% if error %} has-error{% endif %}">
+  <label for="f-{{ name }}">{{ label }}</label>
+  <input class="{{ css }}" id="f-{{ name }}" name="{{ name }}" type="{{ type }}" value="{{ value }}"
+    {%- if required %} required{% endif %}
+    {%- if autocomplete %} autocomplete="{{ autocomplete }}"{% endif %}
+    {%- for key, item in attrs.items() %} {{ key }}="{{ item }}"{% endfor %}
+    {%- if error %} aria-invalid="true" aria-describedby="f-{{ name }}-error"{% elif help %} aria-describedby="f-{{ name }}-help"{% endif %}>
+  {% if help %}<p class="help" id="f-{{ name }}-help">{{ help }}</p>{% endif %}
+  {% if error %}<p class="field-error" id="f-{{ name }}-error">{{ error }}</p>{% endif %}
+</div>
+{%- endmacro %}
+
+{#- The error under a hand-made field (id f-<name>-error, for aria-describedby). -#}
+{% macro field_error(name, error) -%}
+{% if error %}<p class="field-error" id="f-{{ name }}-error">{{ error }}</p>{% endif %}
+{%- endmacro %}
+
+{#- Previous / next links for a Page (app.paginate), keeping the other query parameters. -#}
+{% macro pagination(page) -%}
+{% if page.pages > 1 %}
+<nav class="pagination" aria-label="Pages">
+  {% if page.has_previous %}<a class="btn btn-small" href="{{ url_with(request, page=page.number - 1 if page.number > 2 else none) }}" rel="prev">Newer</a>{% endif %}
+  <span class="muted">Page {{ page.number }} of {{ page.pages }}</span>
+  {% if page.has_next %}<a class="btn btn-small" href="{{ url_with(request, page=page.number + 1) }}" rel="next">Older</a>{% endif %}
+</nav>
+{% endif %}
+{%- endmacro %}
+
+{#- The messages of redirect(...)/flash(...). -#}
+{% macro flash_messages(flashes) -%}
+{% if flashes %}
+<div class="flashes" role="status">
+  {% for kind, text in flashes %}<div class="flash flash-{{ kind }}"><p>{{ text }}</p></div>{% endfor %}
+</div>
+{% endif %}
+{%- endmacro %}
+
+{#- The scanner's state in one line (dashboard, admin): status is a ScannerStatus (ctx.control.status()).
+    calls_today: the model calls since 00:00 UTC, when the page has them. -#}
+{% macro status_strip(status, calls_today=none) -%}
+<div class="status-strip" role="status">
+  <span class="status-item"><span class="status-dot is-{{ status.state }}" aria-hidden="true"></span><strong>Scanner {{ {"running": "running", "paused": "paused", "stopped": "stopped", "disabled": "off", "stalled": "stalled"}.get(status.state, status.state) }}</strong></span>
+  {% if status.cycle_started %}
+  <span class="status-item"><span class="spinner" aria-hidden="true"></span>Cycle running since {{ status.cycle_started|clock }}</span>
+  {% elif status.next_cycle_at and status.state in ("running", "paused") %}
+  <span class="status-item">Next cycle {{ time(status.next_cycle_at) }}</span>
+  {% endif %}
+  {% if status.last_cycle %}
+  <span class="status-item">Last cycle {{ time(status.last_cycle_at) }}{% if not status.last_cycle.ok %} (failed){% endif %}</span>
+  {% set stats = status.last_cycle.stats %}
+  {% if "feeds_ok" in stats %}<span class="status-item num">{{ stats["feeds_ok"] }}/{{ stats["feeds_ok"] + stats.get("feeds_failed", 0) }} feeds ok</span>{% endif %}
+  {% else %}
+  <span class="status-item">No cycle yet</span>
+  {% endif %}
+  {% if calls_today is not none %}<span class="status-item num">{{ calls_today|plural("model call") }} today</span>{% endif %}
+  {% if status.reason %}<span class="status-reason">{{ status.reason }}</span>{% endif %}
+</div>
+{%- endmacro %}

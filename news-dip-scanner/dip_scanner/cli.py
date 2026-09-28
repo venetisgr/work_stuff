@@ -189,6 +189,17 @@ def _parser() -> argparse.ArgumentParser:
     action("enable", "Enable a disabled account again.").add_argument("email")
     action("reset-link", "Print a link to set a new password, valid for 48 hours.").add_argument("email")
 
+    serve = command("serve", _serve, "Run the website, with the scanner in the same process (needs the web extra).")
+    serve.add_argument(
+        "--host", default="127.0.0.1", help="address to listen on (default: 127.0.0.1; 0.0.0.0 in a container)"
+    )
+    serve.add_argument(
+        "--port", type=_positive_int(65535), default=8080, metavar="PORT", help="port to listen on (default: 8080)"
+    )
+    serve.add_argument(
+        "--no-scanner", action="store_true", help="serve the pages only, without scanning (like SCANNER_ENABLED=false)"
+    )
+
     backup = command("backup", _backup, "Copy the database to DATA_DIR/backups and keep the newest copies.")
     backup.add_argument(
         "--keep", type=_positive_int(10_000), default=DEFAULT_KEEP, metavar="N", help="backups to keep (default: 7)"
@@ -861,6 +872,23 @@ def _list_users(accounts: Accounts) -> None:
             print(
                 f"  {invite.email or 'anyone with the link':<38} {invite.role:<6} expires {format_when(invite.expires)}"
             )
+
+
+def _serve(args: argparse.Namespace, settings: Settings) -> int:
+    """`dip-scanner serve`: the website and (unless --no-scanner or SCANNER_ENABLED=false) the scanner's watch loop in
+    one process, until Ctrl+C or SIGTERM. A setup problem of the scanner doesn't stop the website (web/server.py)."""
+    try:
+        from .web.server import serve
+    except ImportError as exc:  # installed without the web extra
+        raise ConfigError(
+            f'The website needs the web extra: pip install -e ".[web]" ({exc.name or exc} is missing).'
+        ) from None
+    settings.web.require_secret_key()
+    config = _scanner_config(args)
+    feeds = _feed_list(args)
+    enabled = settings.web.scanner_enabled and not args.no_scanner
+    serve(settings, config, feeds, host=args.host, port=args.port, scanner_enabled=enabled, session=make_session())
+    return EXIT_OK
 
 
 def _backup(args: argparse.Namespace, settings: Settings) -> int:

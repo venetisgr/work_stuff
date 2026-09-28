@@ -166,6 +166,27 @@ them, except `BASE_URL` for the links `dip-scanner users` prints.
 | `ANALYZE_LIMIT_PER_USER` | 5 | Manual analyses ("Analyse now") a member may start in 24 hours; admins have no limit, 0 turns them off for members. |
 | `SCANNER_ENABLED` | true | Run the scanner inside the website's process; `false` serves the pages only. |
 
+To try the website on your own computer, install it with `pip install -e ".[web]"`, put a `SECRET_KEY`,
+`BASE_URL=http://127.0.0.1:8080` and `COOKIE_SECURE=false` in `.env`, run `dip-scanner users add-admin
+you@example.com`, start `dip-scanner serve` and open the link it printed. It is invite-only: there is no sign-up
+page, and new people come in through invite links.
+
+What the website does to keep accounts safe:
+
+- **Sessions**: a random token in an HttpOnly, SameSite=Lax cookie (Secure unless `COOKIE_SECURE=false`), of which
+  the database keeps only a hash; 30 days from the last visit. Signing out, a new password and disabling an account
+  end sessions at once.
+- **Forms**: every change is a POST carrying a token (the session's, or before signing in a signed cookie token), and
+  a POST from another site (by its `Origin` or `Referer` header, compared with `BASE_URL`) is refused.
+- **Limits**: 10 failed sign-ins in 15 minutes lock that email address and that network address for 15 minutes;
+  invite and password links, test alerts and "Analyse now" have limits of their own.
+- **Pages**: a strict Content-Security-Policy (no inline scripts or styles), HSTS over https, no framing, and error
+  pages without technical details. Invite and password link tokens never appear in the log.
+- **Behind Fly.io's proxy**, the server trusts `X-Forwarded-Proto` and `X-Forwarded-For` from any address, which is
+  safe there because a Fly Machine is only reachable through the proxy; the address used for the limits is
+  `Fly-Client-IP` (set by the proxy) when `FLY_APP_NAME` shows it runs on Fly. On another host, put it behind a proxy
+  that overwrites those headers.
+
 Website users choose their own alert rules, watchlist, currency and time zone. Their email alerts go through the
 server's `SMTP_*` settings to their account's address, and Telegram alerts through the server's
 `TELEGRAM_BOT_TOKEN` to their own chat id, so those channels are offered only when the server has them. A user's
@@ -284,6 +305,7 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 | `dip-scanner report [--days 7] [--min-score N] [--html PATH]` | The stored opportunities of the last days. | no |
 | `dip-scanner track [--days 365]` | How past opportunities played out, next to their exchange's index (see [Track record](#track-record)). | no |
 | `dip-scanner prices TICKER` | Price statistics and whether they count as a dip. | no |
+| `dip-scanner serve [--host 127.0.0.1] [--port 8080] [--no-scanner]` | The website (see [Website settings](#website-settings)), with the scanner running in the same process unless `--no-scanner` or `SCANNER_ENABLED=false`. A setup problem (no key, no credit) stops only the scanner: the pages keep working, say why, and an admin can start it again. | for the scanner and "Analyse now" |
 | `dip-scanner users add-admin EMAIL [--name NAME]` | Creates the website's admin (or makes an existing user one) and prints a one-time link to set the password, valid for 48 hours. | no |
 | `dip-scanner users invite [EMAIL] [--role member\|admin]` | Prints a single-use invite link, valid for 7 days (with EMAIL, only that address can use it). | no |
 | `dip-scanner users list` | The website's accounts (role, status, last login, alert channels) and unused invites. | no |
@@ -711,3 +733,7 @@ without sleeping.
 | `accounts.py` | The website's users, invites, sessions, password links, login limits, per-user settings and "Analyse now" jobs |
 | `netguard.py` | Checks that a user's webhook address is on the public internet (no private or local networks) |
 | `backup.py` | Consistent copies of the database (SQLite's backup API), with rotation |
+| `web/app.py` | The website: `create_app`, security headers, error pages, templates and their filters |
+| `web/auth.py` / `web/account.py` | Session cookie, CSRF and Origin checks, sign-in limits; sign-in, invite, password and settings pages |
+| `web/jobs.py` / `web/control.py` / `web/server.py` | "Analyse now" jobs; the scanner's loop inside the website; `dip-scanner serve` |
+| `web/pages.py` / `web/admin.py` | The member and admin pages (templates in `web/templates`, styles and scripts in `web/static`) |

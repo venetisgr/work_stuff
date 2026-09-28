@@ -1,0 +1,8 @@
+{#- A first admin page from the website's foundation; the admin pages replace it. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% block content %}
+<div class="page-header"><h1>Admin</h1></div>
+{{ ui.status_strip(status) }}
+{{ ui.empty_state("More coming soon", "Users, invites, scanner controls and model spend will be here.") }}
+{% endblock %}
