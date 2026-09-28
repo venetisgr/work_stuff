@@ -8,7 +8,9 @@ Every piece of text that came from a feed or a model is escaped for the format i
 are turned into links (anything else, e.g. javascript:, is shown as plain text).
 
 Times are shown in the display time zone (DISPLAY_TZ, set once by the command line with set_display_zone; UTC by
-default); amounts in another currency than the [account] one get "≈ €121.31" next to them (format_money).
+default; display_zone_as switches it for one thread, e.g. for one recipient's alerts); amounts in another currency
+than the [account] one get "≈ €121.31" next to them (format_money; Opportunity.in_currency and for_currency show
+another currency).
 """
 
 from __future__ import annotations
@@ -19,13 +21,20 @@ import logging
 import math
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import replace
 from datetime import UTC, date, datetime, tzinfo
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .fx import main_currency, same_money
 from .models import Article, Impact, Opportunity, from_iso, utc
+
+if TYPE_CHECKING:
+    from .fx import FxRates
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +88,8 @@ _WARN_LINE = "#d4a72c"
 _CODE_BG = "#eff2f5"
 
 _display_zone: tzinfo = UTC
+# A time zone for the current thread (or task) only: one recipient's alerts, one website user's page.
+_zone_override: ContextVar[tzinfo | None] = ContextVar("display_zone_override", default=None)
 
 
 # --- times -----------------------------------------------------------------------------------------------------------
@@ -91,14 +102,26 @@ def set_display_zone(zone: tzinfo | None) -> None:
     _display_zone = zone if zone is not None else UTC
 
 
+@contextmanager
+def display_zone_as(zone: tzinfo | None) -> Iterator[None]:
+    """Show times in zone inside the block, in this thread only (a recipient's or a website user's time zone; None
+    keeps the process-wide one). Safe while other threads render in their own zones."""
+    token = _zone_override.set(zone)
+    try:
+        yield
+    finally:
+        _zone_override.reset(token)
+
+
 def display_zone() -> tzinfo:
-    """The time zone times are shown in (see set_display_zone)."""
-    return _display_zone
+    """The time zone times are shown in: display_zone_as's inside such a block, else set_display_zone's."""
+    zone = _zone_override.get()
+    return zone if zone is not None else _display_zone
 
 
 def local_time(dt: datetime) -> datetime:
     """dt in the display time zone (naive datetimes are taken to be UTC)."""
-    return utc(dt).astimezone(_display_zone)
+    return utc(dt).astimezone(display_zone())
 
 
 def zone_label(local: datetime) -> str:
@@ -164,15 +187,34 @@ def format_money(value: float, opp: Opportunity) -> str:
 
 def fx_text(opp: Opportunity) -> str | None:
     """The exchange rate behind the ≈ amounts, e.g. "1 USD = 0.8783 EUR at the analysis (Yahoo Finance); your
-    broker's rate and conversion fee differ"; None when nothing is converted."""
+    broker's rate and conversion fee differ" ("at today's rate" when for_currency fetched it); None when nothing is
+    converted."""
     if opp.fx_rate is None or not in_account(1.0, opp):
         return None
     main, factor = main_currency(opp.currency)
     rate = opp.fx_rate * factor  # per main unit: 1 GBP, not 1 penny
+    when = "at today's rate" if opp.fx_rate_today else "at the analysis"
     return (
-        f"1 {main} = {rate:.4g} {opp.account_currency} at the analysis (Yahoo Finance); your broker's rate and "
-        "conversion fee differ"
+        f"1 {main} = {rate:.4g} {opp.account_currency} {when} (Yahoo Finance); your broker's rate and conversion "
+        "fee differ"
     )
+
+
+def for_currency(
+    opp: Opportunity, currency: str | None, *, fx: FxRates | None = None, now: datetime | None = None
+) -> Opportunity:
+    """opp showing its "≈" amounts in currency (a website user's), at the rate stored at the analysis. Without a
+    stored rate, and given fx, today's rate is fetched (FxRates caches it) and labelled "at today's rate" (fx_text);
+    when that fails too, or without a currency, the amounts stay in the trading currency only."""
+    view = opp.in_currency(currency)
+    if view.fx_rate is not None or fx is None or not view.account_currency:
+        return view
+    try:
+        rate = fx.rate(opp.currency, view.account_currency, now=now)
+    except Exception as exc:  # PriceError, PriceFetchError: only the ≈ amounts are missing
+        log.debug("No %s/%s rate for %s: %s", opp.currency, view.account_currency, opp.ticker, exc)
+        return view
+    return replace(view, fx_rate=rate, fx_rate_today=True)
 
 
 def relative_to(value: float, base: float) -> str:

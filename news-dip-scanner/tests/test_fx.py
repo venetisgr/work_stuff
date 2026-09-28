@@ -79,3 +79,17 @@ def test_history_is_inverted_and_starts_a_little_early():
     assert rate_on(history, date(2026, 9, 6)) == pytest.approx(1 / 1.20)  # a Sunday: Friday's close
     assert rate_on(history, date(2026, 8, 31)) is None
     assert fx.history("EUR", "EUR", date(2026, 9, 3)) == [(date(2026, 8, 24), 1.0)]
+
+
+def test_rates_into_several_currencies_report_each_failure_on_its_own():
+    fx, _ = rates(
+        {
+            "EURUSD=X": chart_json("EURUSD=X", [1.14], currency="USD"),
+            "GBPUSD=X": chart_json("GBPUSD=X", [1.25], currency="USD"),
+        }
+    )
+    found, problems = fx.rates("USD", ["eur", "GBP", " ", "XYZ", "USD", "EUR"], now=NOW)
+    assert found == {"EUR": pytest.approx(1 / 1.14), "GBP": pytest.approx(1 / 1.25), "USD": 1.0}
+    assert list(problems) == ["XYZ"] and isinstance(problems["XYZ"], PriceError)
+    assert fx.rates("GBp", ["GBP"], now=NOW) == ({"GBP": 0.01}, {})
+    assert fx.rates("USD", [], now=NOW) == ({}, {})

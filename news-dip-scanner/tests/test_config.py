@@ -21,6 +21,7 @@ from dip_scanner.config import (
     ScannerConfig,
     Settings,
     UniverseConfig,
+    WebSettings,
     default_file,
     display_zone,
     load_feeds,
@@ -42,6 +43,7 @@ def test_an_empty_environment_gives_the_defaults(tmp_path, monkeypatch):
     assert settings.sec_user_agent is None
     assert settings.data_dir == tmp_path / "data"
     assert settings.display_tz is UTC
+    assert settings.web == WebSettings() == WebSettings(None, None, True, 5, True)
     assert Settings().llm.provider == "openai"
 
 
@@ -81,6 +83,11 @@ def test_every_setting_is_read():
         "TELEGRAM_CHAT_ID": "-10042",
         "SEC_USER_AGENT": "Jane Doe jane@example.com",
         "DISPLAY_TZ": "Europe/Athens",
+        "SECRET_KEY": "k" * 40,
+        "BASE_URL": "https://My-Dips.fly.dev/",
+        "COOKIE_SECURE": "false",
+        "ANALYZE_LIMIT_PER_USER": "0",
+        "SCANNER_ENABLED": "no",
     }
     settings = load_settings(env)
     assert settings.llm == LLMSettings(
@@ -113,6 +120,13 @@ def test_every_setting_is_read():
     )
     assert settings.sec_user_agent == "Jane Doe jane@example.com"
     assert settings.display_tz == ZoneInfo("Europe/Athens")
+    assert settings.web == WebSettings(
+        secret_key="k" * 40,
+        base_url="https://My-Dips.fly.dev",
+        cookie_secure=False,
+        analyze_limit_per_user=0,
+        scanner_enabled=False,
+    )
 
 
 @pytest.mark.parametrize(
@@ -158,6 +172,15 @@ def test_default_models_cover_openai_and_anthropic_only():
         ({"SMTP_PORT": "70000"}, "SMTP_PORT must be a port number"),
         ({"SMTP_STARTTLS": "maybe"}, "SMTP_STARTTLS must be true or false"),
         ({"WEBHOOK_FORMAT": "teams"}, "WEBHOOK_FORMAT must be one of slack, discord, generic"),
+        ({"BASE_URL": "my-dips.fly.dev"}, "BASE_URL must be the website's address"),
+        ({"BASE_URL": "ftp://my-dips.fly.dev"}, "BASE_URL must be the website's address"),
+        ({"BASE_URL": "https://my-dips.fly.dev/?next=1"}, "BASE_URL must be the website's address"),
+        ({"BASE_URL": "https://user@my-dips.fly.dev"}, "BASE_URL must be the website's address"),
+        ({"BASE_URL": "https://my-dips.fly.dev:99999"}, "BASE_URL must be the website's address"),
+        ({"COOKIE_SECURE": "maybe"}, "COOKIE_SECURE must be true or false"),
+        ({"SCANNER_ENABLED": "sometimes"}, "SCANNER_ENABLED must be true or false"),
+        ({"ANALYZE_LIMIT_PER_USER": "five"}, "ANALYZE_LIMIT_PER_USER must be a whole number"),
+        ({"ANALYZE_LIMIT_PER_USER": "-1"}, "ANALYZE_LIMIT_PER_USER can't be negative"),
     ],
 )
 def test_wrong_values_are_reported(env, message):
@@ -634,3 +657,55 @@ def test_a_toml_file_saved_with_a_byte_order_mark_is_read(tmp_path):
     path.write_bytes('[account]\ncurrency = "€"\n'.encode("cp1253"))
     with pytest.raises(ConfigError, match="isn't UTF-8 text"):
         load_scanner_config(path)
+
+
+# --- the website ---
+
+
+def test_links_need_base_url():
+    web = WebSettings(base_url="https://my-dips.fly.dev")
+    assert web.link("/invite/abc") == "https://my-dips.fly.dev/invite/abc"
+    assert web.link("password/xyz") == "https://my-dips.fly.dev/password/xyz"
+    with pytest.raises(ConfigError, match="Set BASE_URL"):
+        WebSettings().link("/invite/abc")
+
+
+def test_the_website_needs_a_long_random_secret_key():
+    assert WebSettings(secret_key="s" * 32).require_secret_key() == "s" * 32
+    for key, problem in ((None, "isn't set"), ("short-secret", "is too short \\(12 characters\\)")):
+        with pytest.raises(ConfigError, match=f"SECRET_KEY {problem}") as error:
+            WebSettings(secret_key=key).require_secret_key()
+        assert 'python -c "import secrets; print(secrets.token_urlsafe(48))"' in str(error.value)
+
+
+def test_the_readme_describes_every_website_setting():
+    readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
+    example = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
+    for name in ("SECRET_KEY", "BASE_URL", "COOKIE_SECURE", "ANALYZE_LIMIT_PER_USER", "SCANNER_ENABLED"):
+        assert f"| `{name}` |" in readme, name
+        assert f"# {name}=" in example, name
+    assert "### Website settings" in readme
+
+
+def test_the_website_extra_and_its_files_are_packaged():
+    """The web extra has what `serve` needs, the dev extra what its tests need (FastAPI's TestClient runs on httpx),
+    and the templates and static files ship inside the package."""
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    extras = pyproject["project"]["optional-dependencies"]
+    names = {re.split(r"[\\[<>=]", requirement)[0] for requirement in extras["web"]}
+    assert names == {"fastapi", "uvicorn", "jinja2", "python-multipart"}
+    assert any(requirement.startswith("httpx") for requirement in extras["dev"])
+    setuptools = pyproject["tool"]["setuptools"]
+    assert "dip_scanner.web" in setuptools["packages"]
+    assert setuptools["package-data"]["dip_scanner.web"] == ["templates/**/*", "static/**/*"]
+    web = PROJECT_ROOT / "dip_scanner" / "web"
+    assert (web / "__init__.py").is_file() and (web / "templates").is_dir() and (web / "static").is_dir()
+    # Every file there matches a pattern (setuptools leaves hidden files like .gitkeep out on purpose).
+    shipped = {path for pattern in setuptools["package-data"]["dip_scanner.web"] for path in web.glob(pattern)}
+    files = {
+        path
+        for folder in ("templates", "static")
+        for path in (web / folder).rglob("*")
+        if path.is_file() and not path.name.startswith(".")
+    }
+    assert web / "static" / "favicon.svg" in files and files <= shipped

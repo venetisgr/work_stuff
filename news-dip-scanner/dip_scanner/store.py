@@ -1,24 +1,30 @@
-"""SQLite persistence for feed state, articles, impacts, ticker validity, symbol lookups and opportunities.
+"""SQLite persistence for feed state, articles, impacts, ticker validity, symbol lookups and opportunities, each
+recipient's alert deliveries, the scan cycles, and the state the website shares with the scanner thread.
+
+The website's account tables (users, invites, sessions, password links, login attempts, jobs) are created here too,
+so one SCHEMA_VERSION covers the whole database; accounts.py reads and writes them through transaction() and query().
 
 One connection per Store, shared between threads (check_same_thread=False) and serialised with a lock. WAL mode
-lets a second process (e.g. `dip-scanner news` while `watch` runs) read while the scanner writes. Timestamps are
-stored as ISO 8601 UTC text with microseconds (always the same width), so SQL can compare them as strings.
+lets a second process or connection (e.g. `dip-scanner news` while `watch` runs, or the website next to its scanner
+thread) read while the scanner writes. Timestamps are stored as ISO 8601 UTC text with microseconds (always the same
+width), so SQL can compare them as strings.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import sqlite3
 import threading
-from collections.abc import Collection, Iterable, Iterator, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from .feeds import FeedState
-from .models import Article, Impact, ModelUsage, Opportunity, from_iso, utc
+from .models import Article, CycleRecord, Impact, ModelUsage, Opportunity, from_iso, utc
 
 log = logging.getLogger(__name__)
 
@@ -34,9 +40,19 @@ SYMBOL_LOOKUP_TTL = timedelta(days=7)
 ARTICLE_STATUSES = ("pending", "done", "failed", "skipped")
 _MAX_PARAMS = 500  # stay well under SQLite's bound-parameter limit in IN (...) lists
 
+# Who gets alerts: "default" is the command line's .env channels; the website's users are "user:<id>".
+DEFAULT_RECIPIENT = "default"
+DELIVERY_KINDS = ("alert", "thesis", "handled")
+# app_state keys shared by the website and the scanner thread.
+SCANNER_PAUSED = "scanner_paused"  # "1" while an admin has paused the scanner (Scanner.watch skips its cycles)
+CYCLES_KEPT = 500  # the newest cycle records kept (record_cycle deletes older ones)
+
 # 2: opportunities.alerted; 3: model_calls and system_notices; 4: symbol_lookups; 5: symbol_lookups.unconfirmed, and
-# the lookups of version 4 forgotten (its looser name test took HESM for Hess and a bond fund for Credit Suisse).
-SCHEMA_VERSION = 5
+# the lookups of version 4 forgotten (its looser name test took HESM for Hess and a bond fund for Credit Suisse);
+# 6: the website's tables (users, invites, sessions, password_tokens, login_attempts, jobs, app_state, cycles) and
+# alert_deliveries, the alert state of each recipient, with the notified/alerted marks of version 5 moved to the
+# recipient "default".
+SCHEMA_VERSION = 6
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS feeds (
     key TEXT PRIMARY KEY,
@@ -94,8 +110,10 @@ CREATE TABLE IF NOT EXISTS opportunities (
     created TEXT NOT NULL,
     score REAL NOT NULL,
     data TEXT NOT NULL,
-    notified TEXT,  -- handled: sent, or deliberately not sent (a repeat, superseded, --no-notify, read in `analyze`)
-    alerted TEXT    -- actually delivered to the user (an alert, a thesis change, or shown by `analyze`)
+    -- handled for everybody: never to be sent (--no-notify, read in `analyze`, a cycle without any channel). Before
+    -- version 6 also the command line's own sent or not-sent marks, which are in alert_deliveries now.
+    notified TEXT,
+    alerted TEXT    -- shown to the command line's user (mark_notified); alert decisions use alert_deliveries
 );
 CREATE INDEX IF NOT EXISTS opportunities_ticker_created ON opportunities (ticker, created);
 CREATE INDEX IF NOT EXISTS opportunities_created ON opportunities (created);
@@ -121,6 +139,98 @@ CREATE TABLE IF NOT EXISTS system_notices (
     last_attempt TEXT,                  -- the last time a notice of this kind was tried
     last_sent TEXT                      -- the last time one reached at least one channel
 );
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    recipient TEXT NOT NULL,            -- DEFAULT_RECIPIENT or "user:<id>"
+    opportunity_id INTEGER NOT NULL,
+    ticker TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('alert', 'thesis', 'handled')),  -- handled: deliberately not sent
+    created TEXT NOT NULL,              -- when this was decided or last tried
+    sent INTEGER NOT NULL DEFAULT 0,    -- 1: at least one of the recipient's channels took it
+    detail TEXT,                        -- why it couldn't be sent
+    PRIMARY KEY (recipient, opportunity_id, kind)
+);
+CREATE INDEX IF NOT EXISTS alert_deliveries_ticker ON alert_deliveries (recipient, ticker);
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,  -- never reused: alert_deliveries names users by id
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL DEFAULT '',
+    password_hash TEXT,                 -- scrypt$n$r$p$salt$hash; NULL until the setup link is used
+    role TEXT NOT NULL DEFAULT 'member' CHECK (role IN ('admin', 'member')),
+    created TEXT NOT NULL,
+    last_login TEXT,
+    disabled INTEGER NOT NULL DEFAULT 0,
+    settings TEXT NOT NULL DEFAULT '{}',  -- accounts.UserSettings as JSON (only what the user saved)
+    alerts_since TEXT                   -- alerts count from here: when the user's first channel was set up
+);
+CREATE TABLE IF NOT EXISTS invites (
+    token_hash TEXT PRIMARY KEY,        -- sha256 of the token in the link; the token itself is never stored
+    email TEXT COLLATE NOCASE,          -- the only address that can use it, or NULL for anyone with the link
+    role TEXT NOT NULL CHECK (role IN ('admin', 'member')),
+    created_by INTEGER,                 -- NULL when made with the command line
+    created TEXT NOT NULL,
+    expires TEXT NOT NULL,
+    used_by INTEGER,
+    used_at TEXT,
+    revoked INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,        -- sha256 of the cookie's token
+    user_id INTEGER NOT NULL,
+    csrf TEXT NOT NULL,
+    created TEXT NOT NULL,
+    expires TEXT NOT NULL,
+    last_seen TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS sessions_user ON sessions (user_id);
+CREATE TABLE IF NOT EXISTS password_tokens (
+    token_hash TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL CHECK (purpose IN ('setup', 'reset')),
+    created TEXT NOT NULL,
+    expires TEXT NOT NULL,
+    used_at TEXT
+);
+CREATE TABLE IF NOT EXISTS login_attempts (
+    key TEXT NOT NULL,                  -- "ip:<address>", "email:<address>", or another rate limit's key
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS login_attempts_key ON login_attempts (key, at);
+CREATE TABLE IF NOT EXISTS jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'running', 'done', 'failed')),
+    created TEXT NOT NULL,
+    finished TEXT,
+    opportunity_id INTEGER,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS jobs_user_created ON jobs (user_id, created);
+CREATE TABLE IF NOT EXISTS app_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
+CREATE TABLE IF NOT EXISTS cycles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    started TEXT NOT NULL,
+    finished TEXT,
+    summary TEXT NOT NULL,
+    notes TEXT NOT NULL DEFAULT '[]',   -- JSON list of strings
+    stats TEXT NOT NULL DEFAULT '{}',   -- JSON object of counts (pipeline.cycle_stats)
+    ok INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cycles_started ON cycles (started);
+"""
+# Version 6: what the command line sent, or decided not to send, before per-recipient alerts belongs to "default".
+_MIGRATE_MARKS = f"""
+INSERT OR IGNORE INTO alert_deliveries (recipient, opportunity_id, ticker, kind, created, sent)
+    SELECT '{DEFAULT_RECIPIENT}', id, ticker, 'alert', alerted, 1 FROM opportunities WHERE alerted IS NOT NULL;
+INSERT OR IGNORE INTO alert_deliveries (recipient, opportunity_id, ticker, kind, created, sent)
+    SELECT '{DEFAULT_RECIPIENT}', id, ticker, 'handled', notified, 0 FROM opportunities
+    WHERE notified IS NOT NULL AND alerted IS NULL;
 """
 
 _ARTICLE_COLUMNS = "id, source, source_name, title, link, summary, published, fetched, title_key"
@@ -162,14 +272,18 @@ class Store:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             with conn:
-                if conn.execute("PRAGMA user_version").fetchone()[0] < 5:
+                version = conn.execute("PRAGMA user_version").fetchone()[0]
+                if version < 5:
                     conn.execute("DROP TABLE IF EXISTS symbol_lookups")  # see SCHEMA_VERSION
                 conn.executescript(_SCHEMA)
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(opportunities)")}
                 if "alerted" not in columns:  # a version 1 database: what was notified then was sent
                     conn.execute("ALTER TABLE opportunities ADD COLUMN alerted TEXT")
                     conn.execute("UPDATE opportunities SET alerted = notified")
-                if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+                if version < 6:
+                    for statement in filter(str.strip, _MIGRATE_MARKS.split(";")):
+                        conn.execute(statement)
+                if version < SCHEMA_VERSION:
                     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
         except sqlite3.DatabaseError as exc:
             if conn is not None:
@@ -199,6 +313,15 @@ class Store:
     def _query(self, sql: str, params: Iterable = ()) -> list[sqlite3.Row]:
         with self._lock:
             return self._conn.execute(sql, tuple(params)).fetchall()
+
+    def transaction(self) -> contextlib.AbstractContextManager[sqlite3.Connection]:
+        """One locked transaction on the database, for the modules that keep their own tables here (accounts.py):
+        committed when the block ends, rolled back when it raises."""
+        return self._write()
+
+    def query(self, sql: str, params: Iterable = ()) -> list[sqlite3.Row]:
+        """The rows of one read-only query (sqlite3.Row: by index or column name)."""
+        return self._query(sql, params)
 
     # --- feeds ---
 
@@ -569,34 +692,116 @@ class Store:
         return [_opportunity(row) for row in self._query(sql, params)]
 
     def mark_notified(self, ids: list[int], *, when: datetime, sent: bool = True) -> None:
-        """Record that these opportunities were handled: sent to the user (sent=True), or deliberately not sent
-        (a repeat, superseded by a newer analysis, a --no-notify run). Either way they aren't retried."""
+        """Record that these opportunities are handled for everybody, so no recipient is ever sent them: a --no-notify
+        run, a cycle without any channel, or (sent=True) one the command line's user has just read in `analyze`,
+        which then also counts as alerted to "default" (its repeats and thesis changes compare with it)."""
+        ids = list(dict.fromkeys(ids))
         with self._write() as conn:
-            for chunk in _chunks(list(dict.fromkeys(ids))):
+            for chunk in _chunks(ids):
                 conn.execute(
                     f"UPDATE opportunities SET notified = ?, alerted = COALESCE(?, alerted) "
                     f"WHERE id IN ({_placeholders(len(chunk))})",
                     (_ts(when), _ts(when) if sent else None, *chunk),
                 )
+        if sent:
+            self.record_deliveries(DEFAULT_RECIPIENT, ids, "alert", when=when, sent=True)
 
-    def last_alerted(self, ticker: str, *, before: datetime | None = None) -> Opportunity | None:
-        """The newest opportunity of a ticker that was sent to the user (optionally only one created before)."""
-        sql = "SELECT id, data FROM opportunities WHERE ticker = ? AND alerted IS NOT NULL"
-        params: list = [ticker.strip().upper()]
+    def record_deliveries(
+        self,
+        recipient: str,
+        ids: Iterable[int],
+        kind: str,
+        *,
+        when: datetime,
+        sent: bool,
+        detail: str | None = None,
+    ) -> None:
+        """Record what happened to these opportunities for one recipient: an alert or thesis change sent (sent=True)
+        or tried without success (sent=False, detail says why: it is tried again), or deliberately not sent
+        (kind "handled": superseded, or a repeat). Replaces an earlier record of the same kind."""
+        if kind not in DELIVERY_KINDS:
+            raise ValueError(f"Unknown delivery kind {kind!r}; use one of {', '.join(DELIVERY_KINDS)}.")
+        ids = [int(item) for item in dict.fromkeys(ids)]
+        with self._write() as conn:
+            for chunk in _chunks(ids):
+                conn.execute(
+                    "INSERT OR REPLACE INTO alert_deliveries "
+                    "(recipient, opportunity_id, ticker, kind, created, sent, detail) "
+                    f"SELECT ?, id, ticker, ?, ?, ?, ? FROM opportunities WHERE id IN ({_placeholders(len(chunk))})",
+                    (recipient, kind, _ts(when), int(bool(sent)), (detail or None) and detail[:1000], *chunk),
+                )
+
+    def deliveries(
+        self,
+        *,
+        recipient: str | None = None,
+        opportunity_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict]:
+        """Delivery records, newest first: dicts of recipient, opportunity_id, ticker, kind, created (UTC datetime),
+        sent (bool) and detail, optionally for one recipient and/or one opportunity."""
+        where, params = ["1 = 1"], []
+        if recipient is not None:
+            where.append("recipient = ?")
+            params.append(recipient)
+        if opportunity_id is not None:
+            where.append("opportunity_id = ?")
+            params.append(int(opportunity_id))
+        sql = (
+            "SELECT recipient, opportunity_id, ticker, kind, created, sent, detail FROM alert_deliveries "
+            f"WHERE {' AND '.join(where)} ORDER BY created DESC, opportunity_id DESC, kind"
+        )
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, limit))
+        return [
+            {
+                "recipient": row["recipient"],
+                "opportunity_id": row["opportunity_id"],
+                "ticker": row["ticker"],
+                "kind": row["kind"],
+                "created": from_iso(row["created"]),
+                "sent": bool(row["sent"]),
+                "detail": row["detail"],
+            }
+            for row in self._query(sql, params)
+        ]
+
+    def last_alerted(
+        self, ticker: str, *, before: datetime | None = None, recipient: str = DEFAULT_RECIPIENT
+    ) -> Opportunity | None:
+        """The newest opportunity of a ticker that reached a recipient as an alert or a thesis change (optionally
+        only one created before)."""
+        sql = (
+            "SELECT o.id, o.data FROM opportunities o WHERE o.ticker = ? AND EXISTS (SELECT 1 FROM alert_deliveries d "
+            "WHERE d.recipient = ? AND d.opportunity_id = o.id AND d.kind IN ('alert', 'thesis') AND d.sent = 1)"
+        )
+        params: list = [ticker.strip().upper(), recipient]
         if before is not None:
-            sql += " AND created < ?"
+            sql += " AND o.created < ?"
             params.append(_ts(before))
-        rows = self._query(sql + " ORDER BY created DESC, id DESC LIMIT 1", params)
+        rows = self._query(sql + " ORDER BY o.created DESC, o.id DESC LIMIT 1", params)
         return _opportunity(rows[0]) if rows else None
 
-    def unnotified(self, *, since: datetime | None = None) -> list[Opportunity]:
-        """Opportunities that were never sent as notifications (optionally only those created since), newest first."""
-        sql, params = "SELECT id, data FROM opportunities WHERE notified IS NULL", []
+    def unnotified(self, *, since: datetime | None = None, recipient: str = DEFAULT_RECIPIENT) -> list[Opportunity]:
+        """Opportunities still waiting for a recipient's decision, newest first (optionally only those created since):
+        not handled for everybody (mark_notified), not sent to it and not deliberately skipped for it. An attempt
+        that no channel took leaves it waiting."""
+        sql = (
+            "SELECT o.id, o.data FROM opportunities o WHERE o.notified IS NULL AND NOT EXISTS (SELECT 1 FROM "
+            "alert_deliveries d WHERE d.recipient = ? AND d.opportunity_id = o.id AND (d.kind = 'handled' OR d.sent))"
+        )
+        params: list = [recipient]
         if since is not None:
-            sql += " AND created >= ?"
+            sql += " AND o.created >= ?"
             params.append(_ts(since))
-        rows = self._query(sql + " ORDER BY created DESC, id DESC", params)
+        rows = self._query(sql + " ORDER BY o.created DESC, o.id DESC", params)
         return [_opportunity(row) for row in rows]
+
+    def get_opportunity(self, opportunity_id: int) -> Opportunity | None:
+        """One stored opportunity by id."""
+        rows = self._query("SELECT id, data FROM opportunities WHERE id = ?", (int(opportunity_id),))
+        return _opportunity(rows[0]) if rows else None
 
     # --- failed analyses (so one ticker the model keeps failing on doesn't cost a request every cycle) ---
 
@@ -718,12 +923,86 @@ class Store:
         with self._write() as conn:
             conn.execute("UPDATE system_notices SET streak = 0 WHERE kind = ?", (kind,))
 
+    # --- app state (shared by the website and the scanner thread) ---
+
+    def get_state(self, key: str, default: str | None = None) -> str | None:
+        """The value stored under key in app_state, or default."""
+        rows = self._query("SELECT value FROM app_state WHERE key = ?", (key,))
+        return rows[0]["value"] if rows and rows[0]["value"] is not None else default
+
+    def set_state(self, key: str, value: str | None) -> None:
+        """Store value under key in app_state (None deletes it)."""
+        with self._write() as conn:
+            if value is None:
+                conn.execute("DELETE FROM app_state WHERE key = ?", (key,))
+            else:
+                conn.execute("INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)", (key, str(value)))
+
+    def scanner_paused(self) -> bool:
+        """Whether an admin has paused the scanner (app_state SCANNER_PAUSED)."""
+        return self.get_state(SCANNER_PAUSED) == "1"
+
+    def set_scanner_paused(self, paused: bool) -> None:
+        """Pause the scanner (Scanner.watch skips its cycles until resumed) or resume it."""
+        self.set_state(SCANNER_PAUSED, "1" if paused else None)
+
+    # --- cycles (the website's status strip and admin page) ---
+
+    def record_cycle(
+        self,
+        *,
+        started: datetime,
+        finished: datetime | None,
+        summary: str,
+        notes: Sequence[str] = (),
+        stats: Mapping[str, int] | None = None,
+        ok: bool = True,
+        keep: int = CYCLES_KEPT,
+    ) -> int:
+        """Store a finished cycle and return its id; only the newest keep cycles are kept."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT INTO cycles (started, finished, summary, notes, stats, ok) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    _ts(started),
+                    _ts(finished) if finished is not None else None,
+                    summary,
+                    json.dumps([str(note) for note in notes], ensure_ascii=False),
+                    json.dumps(dict(stats or {})),
+                    int(bool(ok)),
+                ),
+            )
+            conn.execute(
+                "DELETE FROM cycles WHERE id NOT IN (SELECT id FROM cycles ORDER BY started DESC, id DESC LIMIT ?)",
+                (max(1, keep),),
+            )
+            return int(cursor.lastrowid)
+
+    def cycles(self, *, limit: int = 50, since: datetime | None = None) -> list[CycleRecord]:
+        """The newest stored cycles, newest first (optionally only those started since)."""
+        sql, params = "SELECT * FROM cycles", []
+        if since is not None:
+            sql += " WHERE started >= ?"
+            params.append(_ts(since))
+        rows = self._query(sql + " ORDER BY started DESC, id DESC LIMIT ?", [*params, max(0, limit)])
+        return [_cycle(row) for row in rows]
+
+    def last_cycle(self, *, ok: bool | None = None) -> CycleRecord | None:
+        """The newest stored cycle (ok=True: the newest that succeeded; ok=False: the newest that failed)."""
+        sql, params = "SELECT * FROM cycles", []
+        if ok is not None:
+            sql += " WHERE ok = ?"
+            params.append(int(ok))
+        rows = self._query(sql + " ORDER BY started DESC, id DESC LIMIT 1", params)
+        return _cycle(rows[0]) if rows else None
+
     def prune(self, *, older_than: datetime) -> int:
         """Delete articles (and their impacts) older than the given time; returns how many were deleted.
 
         An article goes once both its publication and our first sighting of it are older than older_than (so an
-        old item still listed in a feed isn't re-inserted as new every day). Model call records and symbol lookups
-        older than that go too. Opportunities are always kept.
+        old item still listed in a feed isn't re-inserted as new every day). Model call records, symbol lookups,
+        finished manual-analysis jobs and alert delivery records older than that go too, and so do expired website
+        sessions, password links and invites, and login attempts older than a day. Opportunities are always kept.
         """
         cutoff = _ts(older_than)
         with self._write() as conn:
@@ -733,6 +1012,16 @@ class Store:
             count = deleted.rowcount
             conn.execute("DELETE FROM model_calls WHERE created < ?", (cutoff,))
             conn.execute("DELETE FROM symbol_lookups WHERE checked < ?", (cutoff,))
+            conn.execute("DELETE FROM jobs WHERE created < ? AND status IN ('done', 'failed')", (cutoff,))
+            # Alerts that were sent stay: repeats and thesis changes compare with them for 6 months.
+            conn.execute(
+                "DELETE FROM alert_deliveries WHERE created < ? AND NOT (kind IN ('alert', 'thesis') AND sent = 1)",
+                (cutoff,),
+            )
+            conn.execute("DELETE FROM sessions WHERE expires < ?", (cutoff,))
+            conn.execute("DELETE FROM password_tokens WHERE expires < ?", (cutoff,))
+            conn.execute("DELETE FROM invites WHERE expires < ? AND used_by IS NULL", (cutoff,))
+            conn.execute("DELETE FROM login_attempts WHERE at < ?", (cutoff,))
         if count:
             log.info("Pruned %d article(s) older than %s", count, cutoff)
         return count
@@ -803,3 +1092,26 @@ def _opportunity(row: sqlite3.Row) -> Opportunity:
     data = json.loads(row["data"])
     data["id"] = row["id"]
     return Opportunity.from_dict(data)
+
+
+def _json_or(text: str | None, default: list | dict) -> list | dict:
+    """JSON text of the same type as default, else default (a damaged value never breaks a page)."""
+    try:
+        value = json.loads(text) if text else default
+    except ValueError:
+        return default
+    return value if isinstance(value, type(default)) else default
+
+
+def _cycle(row: sqlite3.Row) -> CycleRecord:
+    notes = _json_or(row["notes"], [])
+    stats = _json_or(row["stats"], {})
+    return CycleRecord(
+        id=row["id"],
+        started=from_iso(row["started"]),
+        finished=from_iso(row["finished"]) if row["finished"] else None,
+        summary=row["summary"],
+        notes=[str(note) for note in notes],
+        stats={str(key): value for key, value in dict(stats).items() if isinstance(value, int)},
+        ok=bool(row["ok"]),
+    )

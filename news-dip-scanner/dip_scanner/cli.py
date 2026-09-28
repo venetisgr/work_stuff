@@ -20,6 +20,8 @@ import truststore
 from dotenv import load_dotenv
 
 from . import __version__
+from .accounts import ROLES, AccountError, Accounts, User
+from .backup import BACKUP_FOLDER, DEFAULT_KEEP, backup_database
 from .config import (
     DATABASE_NAME,
     PROJECT_ROOT,
@@ -167,6 +169,30 @@ def _parser() -> argparse.ArgumentParser:
 
     prices = command("prices", _prices, "Print a ticker's price statistics (no language model needed).")
     prices.add_argument("ticker", help="Yahoo Finance symbol, e.g. AMD, SAP.DE")
+
+    users = command("users", _users, "Manage the website's accounts; the links use BASE_URL.")
+    actions = users.add_subparsers(dest="users_action", required=True, metavar="ACTION")
+
+    def action(name: str, help_text: str) -> argparse.ArgumentParser:
+        sub = actions.add_parser(name, help=help_text, description=help_text)
+        _global_options(sub, suppress=True)
+        return sub
+
+    add_admin = action("add-admin", "Create an admin (or make a user one) and print a link to set the password.")
+    add_admin.add_argument("email", help="the admin's email address")
+    add_admin.add_argument("--name", default="", help="the name shown on the website")
+    invite = action("invite", "Print a single-use invite link, valid for 7 days.")
+    invite.add_argument("email", nargs="?", help="only this address can use it (default: anyone with the link)")
+    invite.add_argument("--role", choices=ROLES, default="member", help="the new account's role (default: member)")
+    action("list", "List the accounts and the unused invites.")
+    action("disable", "Disable an account: it is signed out at once and can't sign in.").add_argument("email")
+    action("enable", "Enable a disabled account again.").add_argument("email")
+    action("reset-link", "Print a link to set a new password, valid for 48 hours.").add_argument("email")
+
+    backup = command("backup", _backup, "Copy the database to DATA_DIR/backups and keep the newest copies.")
+    backup.add_argument(
+        "--keep", type=_positive_int(10_000), default=DEFAULT_KEEP, metavar="N", help="backups to keep (default: 7)"
+    )
     return parser
 
 
@@ -213,6 +239,21 @@ def _positive_float(maximum: float) -> Callable[[str], float]:
         if not number > 0 or not math.isfinite(number):
             raise argparse.ArgumentTypeError(f"expected a number greater than zero, got {value!r}")
         return min(number, maximum)
+
+    return parse
+
+
+def _positive_int(maximum: int) -> Callable[[str], int]:
+    """An argparse type: a whole number from 1 to maximum."""
+
+    def parse(value: str) -> int:
+        try:
+            number = int(value)
+        except ValueError:
+            number = 0
+        if not 1 <= number <= maximum:
+            raise argparse.ArgumentTypeError(f"expected a whole number from 1 to {maximum}, got {value!r}")
+        return number
 
     return parse
 
@@ -706,6 +747,131 @@ def _known_replacement(settings: Settings, symbol: str) -> Resolution | None:
     except sqlite3.Error as exc:  # only a hint
         log.debug("Couldn't read the symbol lookups: %s", exc)
         return None
+
+
+@contextmanager
+def _quiet(args: argparse.Namespace, *names: str) -> Iterator[None]:
+    """Keep these loggers' info lines (which the command prints in its own words) out of the output, unless -v."""
+    loggers = [logging.getLogger(name) for name in names]
+    levels = [logger.level for logger in loggers]
+    if not args.verbose:
+        for logger in loggers:
+            logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for logger, level in zip(loggers, levels, strict=True):
+            logger.setLevel(level)
+
+
+def _users(args: argparse.Namespace, settings: Settings) -> int:
+    """`dip-scanner users ACTION`: the website's accounts, for the server's owner (e.g. over `fly ssh console`).
+
+    The links carry one-time tokens: they are printed for the person running the command and never logged.
+    """
+    action = args.users_action
+    if action in ("add-admin", "invite", "reset-link"):
+        settings.web.link("/")  # BASE_URL is needed for the link: say so before anything is changed
+    with _quiet(args, "dip_scanner.accounts"), open_store(settings) as store:
+        accounts = Accounts(store, clock=lambda: _now())
+        try:
+            if action == "list":
+                _list_users(accounts)
+                return EXIT_OK
+            if action == "invite":
+                token = accounts.create_invite(created_by=None, email=args.email, role=args.role)
+                who = args.email.strip().lower() if args.email else "anyone with the link"
+                role = "an admin" if args.role == "admin" else "a member"
+                print(f"Invite for {who} as {role}, valid once within 7 days:")
+                print(f"  {settings.web.link(f'/invite/{token}')}")
+                return EXIT_OK
+            if action == "add-admin":
+                user, said = _make_admin(accounts, args.email, args.name)
+                print(said)
+            else:
+                user = accounts.get_user_by_email(args.email)
+                if user is None:
+                    print(f"Error: there is no account for {args.email.strip()}.", file=sys.stderr)
+                    return EXIT_ERROR
+                if action in ("disable", "enable"):
+                    user = accounts.set_disabled(user.id, action == "disable")
+                    print(f"{user.email} is {action}d{' and signed out everywhere' if action == 'disable' else ''}.")
+                    return EXIT_OK
+                if user.disabled:
+                    print(f"Error: {user.email} is disabled; `dip-scanner users enable` it first.", file=sys.stderr)
+                    return EXIT_ERROR
+        except AccountError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        purpose = "reset" if user.has_password else "setup"
+        token = accounts.create_password_token(user.id, purpose)
+    what = "choose a new password" if purpose == "reset" else "set the password"
+    print(f"Open this link within 48 hours to {what} for {user.email} (it works once):")
+    print(f"  {settings.web.link(f'/password/{token}')}")
+    return EXIT_OK
+
+
+def _make_admin(accounts: Accounts, email: str, name: str) -> tuple[User, str]:
+    """The admin account for email, created or made an admin (and enabled) when it already exists."""
+    user = accounts.get_user_by_email(email)
+    if user is None:
+        user = accounts.create_user(email, name=name, role="admin")
+        return user, f"Created the admin account {user.email}."
+    changes = []
+    if not user.is_admin:
+        user = accounts.set_role(user.id, "admin")
+        changes.append("made it an admin")
+    if user.disabled:
+        user = accounts.set_disabled(user.id, False)
+        changes.append("enabled it")
+    if name:
+        user = accounts.set_name(user.id, name)
+    done = f"; {' and '.join(changes)}" if changes else ""
+    return user, f"{user.email} already had an account{done}."
+
+
+def _list_users(accounts: Accounts) -> None:
+    users = accounts.list_users()
+    if not users:
+        print("No accounts yet. Create the first admin with `dip-scanner users add-admin EMAIL`.")
+    else:
+        print(f"{len(users)} account{'s' if len(users) != 1 else ''}:")
+    for user in users:
+        chosen = user.settings
+        status = "disabled" if user.disabled else "active" if user.has_password else "no password yet"
+        seen = f"last login {format_when(user.last_login)}" if user.last_login else "never signed in"
+        channels = [
+            name
+            for name, on in (
+                ("email", chosen.email_alerts),
+                ("telegram", bool(chosen.telegram_chat_id)),
+                ("webhook", bool(chosen.webhook_url)),
+            )
+            if on
+        ]
+        name = f" ({user.name})" if user.name else ""
+        print(
+            f"  #{user.id:<3} {user.email:<34} {user.role:<6} {status:<15} {seen}; "
+            f"alerts: {', '.join(channels) or 'none'}{name}"
+        )
+    invites = accounts.list_invites()
+    if invites:
+        print(f"{len(invites)} unused invite{'s' if len(invites) != 1 else ''}:")
+        for invite in invites:
+            print(
+                f"  {invite.email or 'anyone with the link':<38} {invite.role:<6} expires {format_when(invite.expires)}"
+            )
+
+
+def _backup(args: argparse.Namespace, settings: Settings) -> int:
+    with _quiet(args, "dip_scanner.backup"):
+        path = backup_database(
+            settings.data_dir / DATABASE_NAME, settings.data_dir / BACKUP_FOLDER, keep=args.keep, now=_now()
+        )
+    size = path.stat().st_size
+    shown = f"{size / 1_048_576:.1f} MB" if size >= 1_048_576 else f"{max(1, round(size / 1024))} kB"
+    print(f"Backed up the database to {path} ({shown}); the newest {args.keep} backups are kept.")
+    return EXIT_OK
 
 
 def _symbol(text: str) -> str:

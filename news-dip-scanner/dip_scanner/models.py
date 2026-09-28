@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from datetime import UTC, date, datetime, tzinfo
 from typing import Any
 
@@ -276,7 +276,8 @@ class Opportunity:
     news_after_session: bool = False
     # [account] currency when this was analysed, and the exchange rate then: account-currency units per unit of
     # currency as quoted (a price times fx_rate is in account_currency). None without [account] currency, or when
-    # Yahoo had no rate (fx_rate only).
+    # Yahoo had no rate (fx_rate only). Reports and alerts show "≈" amounts in account_currency at fx_rate; a copy
+    # made by in_currency shows another currency the same way.
     account_currency: str | None = None
     fx_rate: float | None = None
     # The benchmark index of the ticker's exchange (track.benchmark_for) and its level when this was analysed, from
@@ -284,6 +285,31 @@ class Opportunity:
     # unknown (records from before these were stored, or no quote for the index then).
     benchmark: str | None = None
     benchmark_level: float | None = None
+    # The exchange rates at the analysis into every currency someone wanted then ([account] currency and each
+    # website user's): {"EUR": 0.8783, "GBP": 0.74}, units of that currency per unit of currency as quoted. Empty for
+    # records from before these were stored (their [account] rate is still in fx_rate).
+    fx_rates: dict[str, float] = field(default_factory=dict)
+    # True when fx_rate is today's rate, fetched for display because none was stored at the analysis
+    # (report.for_currency); shown as "at today's rate". Never stored.
+    fx_rate_today: bool = False
+
+    def rate_to(self, currency: str | None) -> float | None:
+        """The exchange rate into currency stored at the analysis (units of it per unit of currency as quoted), or
+        None when none was stored."""
+        code = (currency or "").strip().upper()
+        if not code:
+            return None
+        if code in self.fx_rates:
+            return self.fx_rates[code]
+        if self.account_currency == code and not self.fx_rate_today:
+            return self.fx_rate
+        return None
+
+    def in_currency(self, currency: str | None) -> Opportunity:
+        """A copy that shows its "≈" amounts in currency, at the rate stored at the analysis; without a stored rate
+        (or without a currency) the amounts stay in the trading currency only."""
+        code = (currency or "").strip().upper() or None
+        return replace(self, account_currency=code, fx_rate=self.rate_to(code), fx_rate_today=False)
 
     def upside_pct(self) -> float:
         """How far the target price is above the price at the time of the analysis, in %."""
@@ -322,6 +348,7 @@ class Opportunity:
             "fx_rate": self.fx_rate,
             "benchmark": self.benchmark,
             "benchmark_level": self.benchmark_level,
+            "fx_rates": dict(self.fx_rates),
         }
 
     @classmethod
@@ -346,6 +373,7 @@ class Opportunity:
             fx_rate=_positive_or_none(data.get("fx_rate")),
             benchmark=data.get("benchmark") or None,
             benchmark_level=_positive_or_none(data.get("benchmark_level")),
+            fx_rates=_rates(data.get("fx_rates")),
         )
 
 
@@ -359,6 +387,20 @@ class ModelUsage:
     input_tokens: int  # the sum of the calls that reported tokens
     output_tokens: int
     unmetered: int = 0  # calls the service answered without token counts (their tokens aren't in the sums)
+
+
+@dataclass(frozen=True)
+class CycleRecord:
+    """A finished scan cycle as stored in the cycles table (the website's status strip and admin page)."""
+
+    id: int
+    started: datetime
+    finished: datetime | None
+    summary: str  # CycleResult.summary(), or "Cycle ... failed: ..." for a cycle that raised
+    notes: list[str]  # what was left out and why, delivery problems...
+    stats: dict[str, int]  # feeds_ok, feeds_failed, new_articles, triaged, impacts, candidates, opportunities,
+    # alerts, thesis_changes, model_calls, recipients, sent (see pipeline.cycle_stats)
+    ok: bool  # False when the cycle raised
 
 
 @dataclass(frozen=True)
@@ -459,6 +501,18 @@ def _positive_or_none(value: Any) -> float | None:
     if isinstance(value, int | float) and not isinstance(value, bool) and value > 0 and value != float("inf"):
         return float(value)
     return None
+
+
+def _rates(value: Any) -> dict[str, float]:
+    """Stored exchange rates by currency code; anything that isn't a positive number is left out."""
+    if not isinstance(value, dict):
+        return {}
+    rates = {}
+    for code, rate in value.items():
+        number = _positive_or_none(rate)
+        if isinstance(code, str) and code.strip() and number is not None:
+            rates[code.strip().upper()] = number
+    return rates
 
 
 def _when(moment: datetime, tz: tzinfo) -> str:

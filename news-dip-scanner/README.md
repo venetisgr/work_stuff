@@ -153,6 +153,26 @@ for the name the article uses). Greek letters are read as the Latin ones of Athe
 Greek code without an exchange is an Athens one: `ΜΟΗ` is `MOH.AT`), Cyrillic ones that look like Latin letters as
 those.
 
+### Website settings
+
+The website (`dip-scanner serve`) takes these from `.env` or the environment as well; the command line doesn't need
+them, except `BASE_URL` for the links `dip-scanner users` prints.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `SECRET_KEY` | none | A random secret of at least 32 characters, required by the website: `python -c "import secrets; print(secrets.token_urlsafe(48))"`. |
+| `BASE_URL` | none | The website's address, e.g. `https://my-dips.fly.dev`: invite and password links point at it. |
+| `COOKIE_SECURE` | true | The session cookie only travels over https; `false` only for testing on `http://localhost`. |
+| `ANALYZE_LIMIT_PER_USER` | 5 | Manual analyses ("Analyse now") a member may start in 24 hours; admins have no limit, 0 turns them off for members. |
+| `SCANNER_ENABLED` | true | Run the scanner inside the website's process; `false` serves the pages only. |
+
+Website users choose their own alert rules, watchlist, currency and time zone. Their email alerts go through the
+server's `SMTP_*` settings to their account's address, and Telegram alerts through the server's
+`TELEGRAM_BOT_TOKEN` to their own chat id, so those channels are offered only when the server has them. A user's
+webhook must be an `https://` address on the public internet: it is checked when saved and again before every message,
+and redirects aren't followed. Each user's watchlist joins `[universe] watchlist` for finding candidates, and every
+analysis stores the exchange rates into every user's currency.
+
 ## Scanning Athens stocks
 
 The enabled feeds are English and mostly about US and large European companies. To cover the Athens Exchange too:
@@ -264,9 +284,20 @@ After `pip install -e .`, `dip-scanner` works as a shorthand for `python -m dip_
 | `dip-scanner report [--days 7] [--min-score N] [--html PATH]` | The stored opportunities of the last days. | no |
 | `dip-scanner track [--days 365]` | How past opportunities played out, next to their exchange's index (see [Track record](#track-record)). | no |
 | `dip-scanner prices TICKER` | Price statistics and whether they count as a dip. | no |
+| `dip-scanner users add-admin EMAIL [--name NAME]` | Creates the website's admin (or makes an existing user one) and prints a one-time link to set the password, valid for 48 hours. | no |
+| `dip-scanner users invite [EMAIL] [--role member\|admin]` | Prints a single-use invite link, valid for 7 days (with EMAIL, only that address can use it). | no |
+| `dip-scanner users list` | The website's accounts (role, status, last login, alert channels) and unused invites. | no |
+| `dip-scanner users disable EMAIL` / `enable EMAIL` | Disables an account (signed out at once, can't sign in) or enables it again. | no |
+| `dip-scanner users reset-link EMAIL` | Prints a one-time link to choose a new password, valid for 48 hours. | no |
+| `dip-scanner backup [--keep 7]` | A consistent copy of the database in `DATA_DIR/backups/scanner-YYYYmmdd-HHMMSS.sqlite3` (UTC), taken while the scanner runs; only the newest copies are kept. | no |
 
 Options for every command: `-v` (debug logging), `--env-file PATH`, `--config PATH`, `--feeds PATH` and
 `--data-dir DIR`. Exit codes: 0 ok, 1 runtime error, 2 configuration error.
+
+The `users` commands print links on `BASE_URL` (see [Website settings](#website-settings)); the links carry one-time
+tokens, so share them only with the person they are for. A backup is a complete database: to restore one, stop the
+scanner and copy it over `scanner.sqlite3` (and delete `scanner.sqlite3-wal` and `scanner.sqlite3-shm` if they are
+there).
 
 ### Output
 
@@ -300,6 +331,9 @@ get one line per opportunity. The rules:
   saying what changed. In `report` and `track`, an older analysis with a newer one is marked superseded.
 - **Nothing is queued silently**: results of `run --no-notify` or `watch --no-notify`, of cycles run before any
   channel was set up, and of `dip-scanner analyze` (you've just read it) are never sent later.
+- **Each on their own**: on the website every user's alerts follow their own rules, and repeats, retries and thesis
+  changes are counted per user, so one user's channel being down never marks another's alert as sent. A user's alerts
+  start when they set up their first channel.
 
 A channel that is only half set up is skipped with a warning naming the missing setting, and Discord messages can't
 ping anyone (mentions are turned off). Chat messages don't include the report's local path.
@@ -647,7 +681,7 @@ Add `-v` to any command for debug logging.
 ## Development
 
 ```bash
-pip install -e ".[dev]"            # pytest, ruff, and the Anthropic and Azure SDKs the tests use
+pip install -e ".[dev]"            # pytest, ruff, and the SDKs and web packages the tests use
 pytest
 ruff check . && ruff format --check .
 ```
@@ -660,7 +694,7 @@ without sleeping.
 | `cli.py` | Commands, options, exit codes |
 | `pipeline.py` | One cycle, the watch loop, manual analysis |
 | `feeds.py` | Fetching and parsing RSS/Atom, link and headline normalisation, per-ticker news |
-| `store.py` | SQLite: feed state, articles, impacts, ticker validity, symbol lookups, opportunities, model calls, notice times |
+| `store.py` | SQLite: feed state, articles, impacts, ticker validity, symbol lookups, opportunities, model calls, notice times, each recipient's alert deliveries, the cycles, and the tables of `accounts.py` |
 | `triage.py` / `prompts.py` | News to affected companies (batched), and all prompt text |
 | `prices.py` | Yahoo Finance chart API and the price statistics |
 | `fundamentals.py` | SEC XBRL company facts (US filers) |
@@ -670,6 +704,10 @@ without sleeping.
 | `report.py` / `notify.py` | Markdown/HTML/JSON reports, the news digest, and alerts |
 | `notices.py` | System notices ("dip-scanner stopped", model unavailable, feeds failing), rate-limited and scrubbed |
 | `track.py` | The track record, its benchmark indices and returns in the account currency |
-| `fx.py` | Exchange rates from Yahoo Finance for `[account] currency`, and minor currency units (pence, cents, agorot) |
+| `fx.py` | Exchange rates from Yahoo Finance for `[account] currency` and users' currencies, and minor currency units (pence, cents, agorot) |
 | `llm.py` | OpenAI, Azure AI Foundry and Anthropic chat models, JSON replies |
 | `config.py` / `models.py` | Settings and config files; the shared data types |
+| `recipients.py` | Who gets alerts: the command line's `.env` channels, and each website user with their own rules and channels |
+| `accounts.py` | The website's users, invites, sessions, password links, login limits, per-user settings and "Analyse now" jobs |
+| `netguard.py` | Checks that a user's webhook address is on the public internet (no private or local networks) |
+| `backup.py` | Consistent copies of the database (SQLite's backup API), with rotation |

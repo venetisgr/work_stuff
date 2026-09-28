@@ -3,12 +3,13 @@ import sqlite3
 import threading
 from dataclasses import replace
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 from conftest import NOW, make_article, make_impact, make_opportunity
 
 from dip_scanner.feeds import FeedState, title_key
-from dip_scanner.store import SCHEMA_VERSION, Store
+from dip_scanner.store import DEFAULT_RECIPIENT, SCANNER_PAUSED, SCHEMA_VERSION, Store
 
 
 @pytest.fixture
@@ -472,7 +473,7 @@ def test_a_version_1_database_gets_the_alerted_column(tmp_path):
 
     with Store(path) as store:
         assert store.last_alerted("AMD") is not None
-        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 5
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
 
 
 def test_a_version_4_database_forgets_its_symbol_lookups(tmp_path):
@@ -544,3 +545,163 @@ def test_notice_times_and_failure_streaks_are_kept(store):
     store.reset_streak("feeds_failing")
     assert store.bump_streak("feeds_failing") == 1
     store.reset_streak("never_seen")  # nothing to reset: fine
+
+
+# --- version 6: per-recipient alert state, app state, cycles, the website's tables -------------------------------
+
+FIXTURES = Path(__file__).parent / "fixtures"
+
+
+def test_a_version_5_database_is_upgraded_and_keeps_its_alert_state(tmp_path):
+    """scanner_v5.sql was dumped from a database made by the Store before version 6: AMD sent, NVDA handled without
+    sending (a repeat), BA still waiting. The command line's marks become the "default" recipient's."""
+    path = tmp_path / "v5.sqlite3"
+    conn = sqlite3.connect(path)
+    conn.executescript((FIXTURES / "scanner_v5.sql").read_text(encoding="utf-8"))
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 5
+    conn.close()
+
+    with Store(path) as store:
+        assert store._conn.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION == 6
+        tables = {row[0] for row in store._conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        assert {
+            "alert_deliveries", "users", "invites", "sessions", "password_tokens", "login_attempts", "jobs",
+            "app_state", "cycles",
+        } <= tables  # fmt: skip
+        amd, nvda, ba = sorted(store.opportunities(), key=lambda opp: opp.id)
+        assert (amd.ticker, nvda.ticker, ba.ticker) == ("AMD", "NVDA", "BA")
+        assert store.unnotified() == [ba]
+        assert store.last_alerted("AMD") == amd and store.last_alerted("NVDA") is None
+        kinds = {(row["ticker"], row["kind"], row["sent"]) for row in store.deliveries(recipient=DEFAULT_RECIPIENT)}
+        assert kinds == {("AMD", "alert", True), ("NVDA", "handled", False)}
+        # What the command line already handled is handled for everybody; the waiting one waits for users too.
+        assert store.unnotified(recipient="user:1") == [ba]
+        assert store.last_alerted("AMD", recipient="user:1") is None
+        # The rest of the data is untouched.
+        assert store.feed_state("marketwatch").etag == '"v1"'
+        assert len(store.news(NOW - timedelta(days=1))) == 1
+        assert store.notice_times("stopped")[1] == NOW - timedelta(days=1)
+    with Store(path) as store:  # opening it again changes nothing
+        assert len(store.deliveries()) == 2 and store.unnotified() == [ba]
+
+
+def test_deliveries_are_kept_per_recipient(store):
+    first = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=2)))
+    second = store.add_opportunity(make_opportunity(created=NOW - timedelta(hours=1)))
+    other = store.add_opportunity(make_opportunity(ticker="NVDA", created=NOW))
+    store.record_deliveries("user:1", [first.id], "alert", when=NOW, sent=True)
+    store.record_deliveries("user:2", [first.id], "alert", when=NOW, sent=False, detail="email: refused")
+    store.record_deliveries("user:2", [second.id], "handled", when=NOW, sent=False)
+
+    assert store.unnotified(recipient="user:1") == [other, second]
+    assert store.unnotified(recipient="user:2") == [other, first]  # a failed attempt stays waiting
+    assert store.unnotified() == [other, second, first]  # "default" has decided nothing yet
+    assert store.last_alerted("AMD", recipient="user:1") == first
+    assert store.last_alerted("AMD", recipient="user:2") is None
+    assert store.last_alerted("AMD", recipient="user:1", before=first.created) is None
+    [failed] = store.deliveries(recipient="user:2", opportunity_id=first.id)
+    assert failed == {
+        "recipient": "user:2",
+        "opportunity_id": first.id,
+        "ticker": "AMD",
+        "kind": "alert",
+        "created": NOW,
+        "sent": False,
+        "detail": "email: refused",
+    }
+    store.record_deliveries("user:2", [first.id], "alert", when=NOW + timedelta(minutes=5), sent=True)  # retried
+    assert store.deliveries(recipient="user:2", opportunity_id=first.id)[0]["sent"] is True
+    assert store.unnotified(recipient="user:2") == [other]
+    store.record_deliveries("user:3", [other.id], "thesis", when=NOW, sent=True)
+    assert store.last_alerted("NVDA", recipient="user:3") == other  # a thesis change counts as alerted
+    assert len(store.deliveries(limit=2)) == 2
+    with pytest.raises(ValueError, match="Unknown delivery kind"):
+        store.record_deliveries("user:1", [first.id], "email", when=NOW, sent=True)
+
+
+def test_mark_notified_handles_an_opportunity_for_everybody(store):
+    opp = store.add_opportunity(make_opportunity())
+    store.mark_notified([opp.id], when=NOW, sent=False)
+    assert store.unnotified() == [] and store.unnotified(recipient="user:1") == []
+    assert store.last_alerted("AMD") is None
+    shown = store.add_opportunity(make_opportunity(created=NOW + timedelta(hours=1)))
+    store.mark_notified([shown.id], when=NOW, sent=True)  # read in `analyze`: alerted to the command line's user
+    assert store.last_alerted("AMD") == shown and store.last_alerted("AMD", recipient="user:1") is None
+    assert store.get_opportunity(shown.id) == shown and store.get_opportunity(999) is None
+
+
+def test_app_state_and_the_pause_flag(store):
+    assert store.get_state("x") is None and store.get_state("x", "fallback") == "fallback"
+    store.set_state("x", "1")
+    assert store.get_state("x") == "1"
+    store.set_state("x", None)
+    assert store.get_state("x") is None
+    assert not store.scanner_paused()
+    store.set_scanner_paused(True)
+    assert store.scanner_paused() and store.get_state(SCANNER_PAUSED) == "1"
+    store.set_scanner_paused(False)
+    assert not store.scanner_paused()
+
+
+def test_cycles_are_recorded_newest_first_and_only_the_newest_kept(store):
+    for n in range(5):
+        store.record_cycle(
+            started=NOW + timedelta(minutes=5 * n),
+            finished=NOW + timedelta(minutes=5 * n, seconds=30),
+            summary=f"Cycle {n}",
+            notes=[f"note {n}", "Ελληνικά"],
+            stats={"feeds_ok": n, "alerts": 1},
+            ok=n != 3,
+            keep=3,
+        )
+    cycles = store.cycles()
+    assert [cycle.summary for cycle in cycles] == ["Cycle 4", "Cycle 3", "Cycle 2"]
+    newest = cycles[0]
+    assert newest.started == NOW + timedelta(minutes=20) and newest.finished == newest.started + timedelta(seconds=30)
+    assert newest.notes == ["note 4", "Ελληνικά"] and newest.stats == {"feeds_ok": 4, "alerts": 1} and newest.ok
+    assert store.last_cycle().summary == "Cycle 4"
+    assert store.last_cycle(ok=False).summary == "Cycle 3"
+    assert [c.summary for c in store.cycles(limit=1)] == ["Cycle 4"]
+    assert [c.summary for c in store.cycles(since=NOW + timedelta(minutes=15))] == ["Cycle 4", "Cycle 3"]
+    with store.transaction() as conn:  # a damaged record still loads
+        conn.execute("UPDATE cycles SET notes = 'oops', stats = '[1]', finished = NULL WHERE summary = 'Cycle 2'")
+    damaged = store.cycles()[-1]
+    assert (damaged.notes, damaged.stats, damaged.finished) == ([], {}, None)
+
+
+def test_prune_clears_old_website_records_but_keeps_sent_alerts(store):
+    old, recent = NOW - timedelta(days=40), NOW - timedelta(hours=1)
+    opp = store.add_opportunity(make_opportunity(created=old))
+    store.record_deliveries("user:1", [opp.id], "alert", when=old, sent=True)
+    store.record_deliveries("user:2", [opp.id], "handled", when=old, sent=False)
+    with store.transaction() as conn:
+        conn.execute("INSERT INTO sessions VALUES ('old', 1, 'c', ?, ?, ?, NULL, NULL)", (_t(old), _t(old), _t(old)))
+        conn.execute(
+            "INSERT INTO sessions VALUES ('live', 1, 'c', ?, ?, ?, NULL, NULL)", (_t(recent), _t(NOW), _t(NOW))
+        )
+        conn.execute("INSERT INTO login_attempts VALUES ('ip:1', ?), ('ip:1', ?)", (_t(old), _t(recent)))
+        conn.execute(
+            "INSERT INTO jobs (user_id, kind, ticker, status, created) VALUES (1, 'analyze', 'A', 'done', ?)",
+            (_t(old),),
+        )
+        conn.execute(
+            "INSERT INTO jobs (user_id, kind, ticker, status, created) VALUES (1, 'analyze', 'B', 'done', ?)",
+            (_t(recent),),
+        )
+        conn.execute(
+            "INSERT INTO invites (token_hash, role, created, expires) VALUES ('i', 'member', ?, ?)", (_t(old), _t(old))
+        )
+        conn.execute("INSERT INTO password_tokens VALUES ('p', 1, 'reset', ?, ?, NULL)", (_t(old), _t(old)))
+
+    store.prune(older_than=NOW - timedelta(days=30))
+
+    assert [row["kind"] for row in store.deliveries()] == ["alert"]
+    assert [row[0] for row in store.query("SELECT token_hash FROM sessions")] == ["live"]
+    assert store.query("SELECT COUNT(*) FROM login_attempts")[0][0] == 1
+    assert [row[0] for row in store.query("SELECT ticker FROM jobs")] == ["B"]
+    assert store.query("SELECT COUNT(*) FROM invites")[0][0] == 0
+    assert store.query("SELECT COUNT(*) FROM password_tokens")[0][0] == 0
+
+
+def _t(dt):
+    return dt.isoformat(timespec="microseconds")

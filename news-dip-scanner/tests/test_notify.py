@@ -23,6 +23,7 @@ from dip_scanner.notify import (
     build_notifiers,
     chunk_text,
     discord_text,
+    email_missing,
     plain_text,
     short_alert,
     slack_text,
@@ -518,3 +519,84 @@ def test_short_alert_empty_and_single():
     assert short_alert([]) == "No new dip opportunities."
     assert short_alert([make_opportunity(company="Multi\nline")]).splitlines()[0] == "1 new dip opportunity:"
     assert "(Multi line)" in short_alert([make_opportunity(company="Multi\nline")])
+
+
+# --- options for a website user's own channels ---------------------------------------------------------------------
+
+
+def test_a_user_webhook_is_checked_before_every_message_and_never_follows_redirects():
+    session = FakeSession({"https://hooks.example.com/": FakeResponse(status_code=302, headers={"Location": "x"})})
+    checked = []
+
+    def check_url(url):
+        checked.append(url)
+
+    hook = WebhookNotifier(
+        "https://hooks.example.com/abc",
+        "generic",
+        session=session,
+        check_url=check_url,
+        follow_redirects=False,
+        show_replies=False,
+    )
+    with pytest.raises(NotifyError) as error:
+        hook.send("Subject", "text", "<p>html</p>")
+    assert checked == ["https://hooks.example.com/abc"]
+    assert session.calls[0]["allow_redirects"] is False
+    assert str(error.value) == (
+        "The generic webhook at hooks.example.com answered 302 (a redirect, which isn't followed)."
+    )
+
+
+def test_a_user_webhook_that_now_resolves_privately_is_not_posted_to():
+    from dip_scanner.netguard import check_public_url
+
+    session = FakeSession({"https://rebind.example.com/": "ok"})
+    hook = WebhookNotifier(
+        "https://rebind.example.com/hook",
+        "slack",
+        session=session,
+        check_url=lambda url: check_public_url(url, resolver=lambda host, port: ["169.254.169.254"]),
+    )
+    with pytest.raises(NotifyError, match="isn't allowed: The address must be on the public internet"):
+        hook.send("Subject", "text", "html")
+    assert session.calls == []
+
+
+def test_a_user_webhook_error_leaves_the_reply_out_and_uses_the_hints_given():
+    reply = FakeResponse(status_code=404, content="<html>internal admin page: secret stuff</html>")
+    hook = WebhookNotifier(
+        "https://hooks.example.com/abc",
+        "discord",
+        session=FakeSession({"https://hooks.example.com/": reply}),
+        show_replies=False,
+        hints={404: "Check the webhook address in your settings."},
+    )
+    with pytest.raises(NotifyError) as error:
+        hook.send("Subject", "text", "html")
+    assert str(error.value) == (
+        "The discord webhook at hooks.example.com answered 404. Check the webhook address in your settings."
+    )
+    assert "secret" not in str(error.value)
+    # The command line's own webhook keeps showing the reply and the .env hint.
+    own = WebhookNotifier(
+        "https://hooks.example.com/abc", "discord", session=FakeSession({"https://hooks.example.com/": reply})
+    )
+    with pytest.raises(NotifyError, match=r"answered 404: <html>internal admin page.*Check WEBHOOK_URL"):
+        own.send("Subject", "text", "html")
+
+
+def test_telegram_hints_can_speak_to_a_website_user():
+    session = FakeSession(
+        {TELEGRAM_URL: FakeResponse(status_code=400, json_data={"ok": False, "description": "chat not found"})}
+    )
+    telegram = TelegramNotifier(TOKEN, "42", session=session, hints={400: "Check the chat id in your settings."})
+    with pytest.raises(NotifyError, match="chat not found. Check the chat id in your settings."):
+        telegram.send("Subject", "text", "html")
+
+
+def test_email_for_website_users_needs_no_email_to():
+    server = NotifySettings(smtp_host="smtp.example.com", smtp_from="dips@example.com")
+    assert email_missing(server) == ["EMAIL_TO"]
+    assert email_missing(server, recipients=False) == []
+    assert email_missing(NotifySettings(), recipients=False) == ["SMTP_HOST", "SMTP_FROM"]

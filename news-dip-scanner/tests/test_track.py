@@ -698,3 +698,14 @@ def test_the_reported_dates_follow_the_display_time_zone():
     set_display_zone(ZoneInfo("Europe/Athens"))
     text = render_track_record(outcomes, summarize(outcomes))
     assert "| 2026-09-26 | **AMD** |" in text and "reported on 2026-09-26" in text
+
+
+def test_a_users_currency_return_starts_from_the_rate_stored_for_that_currency():
+    """The website stores rates into every user's currency with an analysis; a GBP user's return starts from the
+    GBP rate of the analysis, not from the EUR account's."""
+    rates = [(SIGNAL, 0.75), (date(2026, 9, 29), 0.74)]
+    opp = make_opportunity(account_currency="EUR", fx_rate=0.86, fx_rates={"EUR": 0.86, "GBP": 0.73})
+    outcome = with_account_return(evaluate(opp, GAIN, now=LATER), "GBP", rates)
+    assert outcome.account_return_pct == pytest.approx(((150 / 142.5) * 0.74 / 0.73 - 1) * 100)
+    missing = with_account_return(evaluate(make_opportunity(fx_rates={"EUR": 0.86}), GAIN, now=LATER), "GBP", rates)
+    assert missing.account_return_pct == pytest.approx(((150 / 142.5) * 0.74 / 0.75 - 1) * 100)  # the day's close

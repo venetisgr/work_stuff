@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -107,6 +107,20 @@ class FxRates:
         with self._lock:
             self._cache[key] = (now, value)
         return value / factor
+
+    def rates(
+        self, currency: str, targets: Iterable[str], *, now: datetime | None = None
+    ) -> tuple[dict[str, float], dict[str, Exception]]:
+        """(rates, problems): the rate from currency into each target (as rate()), and the error of each target Yahoo
+        had no rate for. One target's failure never costs the others."""
+        found: dict[str, float] = {}
+        problems: dict[str, Exception] = {}
+        for target in dict.fromkeys(code.strip().upper() for code in targets if code and code.strip()):
+            try:
+                found[target] = self.rate(currency, target, now=now)
+            except Exception as exc:  # PriceError, PriceFetchError, or a bug: reported per currency
+                problems[target] = exc
+        return found, problems
 
     def history(
         self, currency: str, account: str, start: date, *, now: datetime | None = None

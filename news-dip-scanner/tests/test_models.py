@@ -319,3 +319,31 @@ def test_the_benchmark_level_round_trips_and_old_records_have_none():
     assert (old.benchmark, old.benchmark_level) == (None, None)
     data["benchmark_level"] = 0  # never a level
     assert Opportunity.from_dict(data).benchmark_level is None
+
+
+def test_rates_into_several_currencies_round_trip_and_older_records_have_none():
+    opp = make_opportunity(account_currency="EUR", fx_rate=0.88, fx_rates={"EUR": 0.88, "GBP": 0.75})
+    data = json.loads(json.dumps(opp.to_dict()))
+    assert data["fx_rates"] == {"EUR": 0.88, "GBP": 0.75}
+    assert Opportunity.from_dict(data) == opp
+    data.pop("fx_rates")
+    assert Opportunity.from_dict(data).fx_rates == {}  # stored before rates per currency
+    data["fx_rates"] = {"gbp": 0.75, "CHF": -1, "JPY": "lots", "": 1.0, "SEK": True}
+    assert Opportunity.from_dict(data).fx_rates == {"GBP": 0.75}
+    data["fx_rates"] = ["not", "a", "dict"]
+    assert Opportunity.from_dict(data).fx_rates == {}
+
+
+def test_rate_to_and_in_currency_use_the_rates_stored_at_the_analysis():
+    legacy = make_opportunity(account_currency="EUR", fx_rate=0.88)  # a record from before fx_rates
+    assert legacy.rate_to("eur") == 0.88 and legacy.rate_to("GBP") is None and legacy.rate_to(None) is None
+    opp = make_opportunity(account_currency="EUR", fx_rate=0.88, fx_rates={"EUR": 0.88, "GBP": 0.75})
+    pounds = opp.in_currency("gbp")
+    assert (pounds.account_currency, pounds.fx_rate) == ("GBP", 0.75)
+    assert opp.in_currency("CHF").fx_rate is None and opp.in_currency("CHF").account_currency == "CHF"
+    plain = opp.in_currency(None)
+    assert (plain.account_currency, plain.fx_rate) == (None, None)
+    assert pounds.to_dict()["fx_rates"] == opp.to_dict()["fx_rates"]  # the rates themselves stay
+    today = replace(opp, account_currency="CHF", fx_rate=0.8, fx_rate_today=True)
+    assert today.rate_to("CHF") is None  # today's rate is never taken for the analysis's
+    assert "fx_rate_today" not in opp.to_dict()

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, tzinfo
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError, available_timezones
 
 from .models import DIRECTIONS, VERDICTS, Feed
@@ -68,6 +69,46 @@ class NotifySettings:
     telegram_chat_id: str | None = None  # TELEGRAM_CHAT_ID
 
 
+SECRET_KEY_MIN_LENGTH = 32
+GENERATE_SECRET_KEY = 'python -c "import secrets; print(secrets.token_urlsafe(48))"'
+
+
+@dataclass(frozen=True)
+class WebSettings:
+    """The website (`dip-scanner serve`) and the account links the command line prints."""
+
+    secret_key: str | None = None  # SECRET_KEY: required by `serve` only (see require_secret_key)
+    base_url: str | None = None  # BASE_URL, e.g. https://my-dips.fly.dev (no trailing slash): invite and reset links
+    cookie_secure: bool = True  # COOKIE_SECURE: the session cookie only travels over https (false for local http)
+    analyze_limit_per_user: int = 5  # ANALYZE_LIMIT_PER_USER: manual analyses per member in 24 hours (admins: none)
+    scanner_enabled: bool = True  # SCANNER_ENABLED: `serve` runs the scanner too (`serve --no-scanner` overrides)
+
+    def link(self, path: str) -> str:
+        """An absolute link to a page of the website, e.g. link("/invite/abc") -> https://my-dips.fly.dev/invite/abc.
+
+        Raises ConfigError when BASE_URL isn't set: a link without it would point nowhere.
+        """
+        if not self.base_url:
+            raise ConfigError(
+                "Set BASE_URL in .env (or the environment) to the website's address, e.g. https://my-dips.fly.dev, "
+                "so the link points at it."
+            )
+        return f"{self.base_url}/{path.lstrip('/')}"
+
+    def require_secret_key(self) -> str:
+        """SECRET_KEY, which `serve` needs; a ConfigError with the command that generates one when it is missing or
+        too short to be secret."""
+        key = self.secret_key or ""
+        if len(key) < SECRET_KEY_MIN_LENGTH:
+            problem = "isn't set" if not key else f"is too short ({len(key)} characters)"
+            raise ConfigError(
+                f"SECRET_KEY {problem}: the website needs a random secret of at least {SECRET_KEY_MIN_LENGTH} "
+                f"characters. Generate one with {GENERATE_SECRET_KEY} and set it in .env (on Fly.io: fly secrets set "
+                "SECRET_KEY=...)."
+            )
+        return key
+
+
 @dataclass(frozen=True)
 class Settings:
     llm: LLMSettings = field(default_factory=LLMSettings)
@@ -77,6 +118,7 @@ class Settings:
     # DISPLAY_TZ, e.g. Europe/Athens: the time zone of every time people read (reports, alerts, summaries, notes and
     # the log). Everything is still stored and compared in UTC.
     display_tz: tzinfo = UTC
+    web: WebSettings = field(default_factory=WebSettings)
 
 
 def load_settings(env: Mapping[str, str] | None = None, *, problems: list[ConfigError] | None = None) -> Settings:
@@ -147,11 +189,55 @@ def load_settings(env: Mapping[str, str] | None = None, *, problems: list[Config
         sec_user_agent=get("SEC_USER_AGENT"),
         data_dir=_data_dir(get("DATA_DIR")),
         display_tz=display_tz,
+        web=WebSettings(
+            secret_key=get("SECRET_KEY"),
+            base_url=_base_url(get("BASE_URL")),
+            cookie_secure=_bool(get("COOKIE_SECURE"), "COOKIE_SECURE", default=True),
+            analyze_limit_per_user=_whole_number(get("ANALYZE_LIMIT_PER_USER"), "ANALYZE_LIMIT_PER_USER", default=5),
+            scanner_enabled=_bool(get("SCANNER_ENABLED"), "SCANNER_ENABLED", default=True),
+        ),
     )
 
 
 def _lower(value: str | None) -> str | None:
     return value.lower() if value else None
+
+
+def _whole_number(value: str | None, name: str, *, default: int) -> int:
+    """A setting that is a whole number of 0 or more."""
+    if value is None:
+        return default
+    try:
+        number = int(value.replace("_", ""))
+    except ValueError:
+        raise ConfigError(f"{name} must be a whole number (got {value!r}).") from None
+    if number < 0:
+        raise ConfigError(f"{name} can't be negative (got {number}).")
+    return number
+
+
+def _base_url(value: str | None) -> str | None:
+    """BASE_URL without a trailing slash; it must be an http(s) address without a query or fragment."""
+    if value is None:
+        return None
+    url = value.rstrip("/")
+    try:
+        parts = urlsplit(url)
+        port_ok = parts.port is None or parts.port > 0
+    except ValueError:
+        parts, port_ok = None, False
+    if (
+        parts is None
+        or not port_ok
+        or parts.scheme.lower() not in ("http", "https")
+        or not parts.hostname
+        or parts.query
+        or parts.fragment
+        or "@" in parts.netloc
+        or any(char.isspace() for char in url)
+    ):
+        raise ConfigError(f"BASE_URL must be the website's address, like https://my-dips.fly.dev (got {value!r}).")
+    return url
 
 
 def _positive_int(value: str | None, name: str) -> int | None:
@@ -209,6 +295,11 @@ def display_zone(name: str | None) -> tzinfo:
         f"DISPLAY_TZ must be an IANA time zone name such as Europe/Athens, Europe/Berlin or America/New_York (got "
         f"{name!r}).{hint}"
     )
+
+
+def zone_name(zone: tzinfo) -> str:
+    """The IANA name of a time zone from display_zone ("Europe/Athens"; "UTC" for UTC)."""
+    return getattr(zone, "key", None) or "UTC"
 
 
 def _data_dir(value: str | None) -> Path:

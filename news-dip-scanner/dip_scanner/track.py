@@ -40,8 +40,9 @@ return_pct minus it. A record without a stored level starts the index at its clo
 was made while the session was running, the stock's return for the comparison then starts at that close too
 (index_aligned_return_pct), so the rest of the report's day doesn't count for one and not the other.
 
-with_account_return() adds the return in the [account] currency: (1 + return) * rate at the end / rate at the report
-- 1, with the rate stored with the report when there is one, else the day's closing rate.
+with_account_return() adds the return in the [account] currency (or a website user's): (1 + return) * rate at the end
+/ rate at the report - 1, with the rate into that currency stored with the report when there is one, else the day's
+closing rate.
 """
 
 from __future__ import annotations
@@ -304,7 +305,7 @@ def with_account_return(outcome: Outcome, account: str, rates: Sequence[tuple[da
     if outcome.priced and same_money(opp.currency, account):
         value = outcome.return_pct
     elif outcome.priced and rates and outcome.last_day is not None:
-        start = opp.fx_rate if opp.account_currency == account and opp.fx_rate else rate_on(rates, quote_day(opp))
+        start = opp.rate_to(account) or rate_on(rates, quote_day(opp))
         end = rate_on(rates, outcome.last_day)
         if start and end:
             value = ((1 + outcome.return_pct / 100) * end / start - 1) * 100

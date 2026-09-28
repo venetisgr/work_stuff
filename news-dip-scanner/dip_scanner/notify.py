@@ -92,12 +92,13 @@ def _smtp_connect(host: str, port: int, implicit_tls: bool, timeout: float) -> s
     return smtplib.SMTP(host, port, timeout=timeout)
 
 
-def email_missing(settings: NotifySettings) -> list[str]:
-    """The settings email still needs, by environment variable name (empty when email can be sent)."""
+def email_missing(settings: NotifySettings, *, recipients: bool = True) -> list[str]:
+    """The settings email still needs, by environment variable name (empty when email can be sent). With
+    recipients=False, EMAIL_TO isn't needed (the website sends to each user's own address)."""
     missing = []
     if not settings.smtp_host:
         missing.append("SMTP_HOST")
-    if not settings.email_to:
+    if recipients and not settings.email_to:
         missing.append("EMAIL_TO")
     if not (settings.smtp_from or (settings.smtp_user and "@" in settings.smtp_user)):
         missing.append("SMTP_FROM")
@@ -194,6 +195,11 @@ class WebhookNotifier:
     - discord: {"content": ...} in Discord Markdown, split into DISCORD_LIMIT-char messages, with mentions disabled so
       a headline containing @everyone can't ping anyone;
     - generic: one POST of {"subject", "markdown", "html"}.
+
+    For a URL a website user typed (recipients.py): check_url is called with the URL before every message and raises
+    (netguard.check_public_url) when the address no longer resolves to a public one; follow_redirects=False treats a
+    redirect as a failure instead of following it somewhere else; show_replies=False keeps the service's reply out
+    of error messages (only its status code is named); hints replace the .env-worded hints per status code.
     """
 
     name = "webhook"
@@ -206,6 +212,10 @@ class WebhookNotifier:
         session=None,
         timeout: float = 20,
         sleep: Callable[[float], None] = time.sleep,
+        check_url: Callable[[str], object] | None = None,
+        follow_redirects: bool = True,
+        show_replies: bool = True,
+        hints: dict[int, str] | None = None,
     ) -> None:
         if not safe_url(url):
             raise ConfigError("WEBHOOK_URL must be an http(s) URL.")
@@ -218,6 +228,10 @@ class WebhookNotifier:
         self._session = session if session is not None else requests.Session()
         self._timeout = timeout
         self._sleep = sleep
+        self._check_url = check_url
+        self._follow_redirects = follow_redirects
+        self._show_replies = show_replies
+        self._hints = _WEBHOOK_HINTS if hints is None else hints
         parts = urlsplit(self.url)
         self._label = f"the {fmt} webhook at {parts.hostname}"
         # The path and query of a webhook URL are its secret; long path segments are the token itself.
@@ -242,22 +256,30 @@ class WebhookNotifier:
         """Post the report (split into several messages where the service has a size limit)."""
         payloads = self.payloads(subject, markdown, html)
         for payload in payloads:
+            if self._check_url is not None:
+                try:
+                    self._check_url(self.url)
+                except ValueError as exc:  # netguard.UnsafeURLError: its message names no part of the URL
+                    raise NotifyError(f"{self._label[:1].upper()}{self._label[1:]} isn't allowed: {exc}") from exc
             _post(
                 self._session,
                 self.url,
                 payload,
                 label=self._label,
                 secrets=self._secrets,
-                hints=_WEBHOOK_HINTS,
+                hints=self._hints,
                 timeout=self._timeout,
                 sleep=self._sleep,
+                follow_redirects=self._follow_redirects,
+                show_replies=self._show_replies,
             )
         log.info("Posted %s to the %s (%d message(s)).", _one_line(subject), self.name, len(payloads))
 
 
 class TelegramNotifier:
     """Sends the report through a Telegram bot (Bot API sendMessage) as plain text, in messages of at most
-    TELEGRAM_LIMIT characters, without link previews."""
+    TELEGRAM_LIMIT characters, without link previews. hints replace the .env-worded hints per status code (for a
+    website user's own chat id)."""
 
     name = "telegram"
 
@@ -270,6 +292,7 @@ class TelegramNotifier:
         timeout: float = 20,
         sleep: Callable[[float], None] = time.sleep,
         api_url: str = TELEGRAM_API,
+        hints: dict[int, str] | None = None,
     ) -> None:
         if not token or not chat_id:
             raise ConfigError("Telegram notifications need TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env.")
@@ -279,6 +302,7 @@ class TelegramNotifier:
         self._session = session if session is not None else requests.Session()
         self._timeout = timeout
         self._sleep = sleep
+        self._hints = _TELEGRAM_HINTS if hints is None else hints
 
     def messages(self, subject: str, markdown: str) -> list[str]:
         """The message texts send() delivers, in order."""
@@ -300,7 +324,7 @@ class TelegramNotifier:
                 payload,
                 label="Telegram",
                 secrets=[self._token],
-                hints=_TELEGRAM_HINTS,
+                hints=self._hints,
                 timeout=self._timeout,
                 sleep=self._sleep,
             )
@@ -321,12 +345,16 @@ def _post(
     hints: dict[int, str],
     timeout: float,
     sleep: Callable[[float], None],
+    follow_redirects: bool = True,
+    show_replies: bool = True,
 ):
-    """POST JSON; retry once after a 429; NotifyError (secrets scrubbed) on a connection error or non-2xx status."""
+    """POST JSON; retry once after a 429; NotifyError (secrets scrubbed) on a connection error or non-2xx status.
+    follow_redirects=False makes a redirect a failure; show_replies=False leaves the reply's text out of the error."""
     retried = False
+    options = {} if follow_redirects else {"allow_redirects": False}
     while True:
         try:
-            response = session.post(url, json=payload, timeout=timeout)
+            response = session.post(url, json=payload, timeout=timeout, **options)
         except requests.RequestException as exc:
             raise NotifyError(f"Couldn't reach {label}: {_scrub(str(exc), secrets)}") from exc
         status = response.status_code
@@ -337,9 +365,13 @@ def _post(
             sleep(wait)
             continue
         if not 200 <= status < 300:
-            message = f"{label[:1].upper()}{label[1:]} answered {status}: {_short_body(response, secrets)}"
+            message = f"{label[:1].upper()}{label[1:]} answered {status}"
+            if show_replies:
+                message += f": {_short_body(response, secrets)}"
+            elif 300 <= status < 400:
+                message += " (a redirect, which isn't followed)"
             hint = hints.get(status)
-            raise NotifyError(f"{message.rstrip('.')}. {hint}" if hint else message)
+            raise NotifyError(f"{message.rstrip('.')}. {hint}" if hint else message + ("" if show_replies else "."))
         return response
 
 

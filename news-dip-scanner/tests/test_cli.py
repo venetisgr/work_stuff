@@ -5,6 +5,8 @@ from __future__ import annotations
 import functools
 import io
 import logging
+import re
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -50,6 +52,11 @@ ENV_VARS = (
     "DISPLAY_TZ",
     "SCANNER_CONFIG",
     "FEEDS_FILE",
+    "SECRET_KEY",
+    "BASE_URL",
+    "COOKIE_SECURE",
+    "ANALYZE_LIMIT_PER_USER",
+    "SCANNER_ENABLED",
 )
 
 FEEDS_TOML = f"""
@@ -637,3 +644,137 @@ def test_track_without_index_prices_says_so_and_carries_on(workdir, web, capsys)
 def test_track_with_nothing_stored(workdir, capsys):
     assert cli.main(["track", "--days", "30"]) == 0
     assert "No opportunities stored in the last 30 days yet." in capsys.readouterr().out
+
+
+# --- the website's accounts and backups ----------------------------------------------------------------------------
+
+
+@pytest.fixture
+def fast_scrypt(monkeypatch):
+    from dip_scanner import accounts as accounts_module
+
+    monkeypatch.setattr(accounts_module, "SCRYPT_N", 2**4)
+
+
+def _link(out: str, kind: str) -> str:
+    [token] = re.findall(rf"https://dips\.example\.com/{kind}/([A-Za-z0-9_-]{{43}})", out)
+    return token
+
+
+def test_users_add_admin_prints_a_setup_link_that_works_once(workdir, capsys, monkeypatch, fast_scrypt):
+    from dip_scanner.accounts import Accounts
+
+    assert cli.main(["users", "add-admin", "owner@example.com"]) == 2  # no BASE_URL: nothing is created
+    assert "Set BASE_URL" in capsys.readouterr().err
+    assert cli.main(["users", "list"]) == 0
+    assert "No accounts yet" in capsys.readouterr().out
+
+    monkeypatch.setenv("BASE_URL", "https://dips.example.com/")
+    assert cli.main(["users", "add-admin", "Owner@Example.com", "--name", "Owner"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Created the admin account owner@example.com.\nOpen this link within 48 hours to set the")
+    token = _link(out, "password")
+    with store_at(workdir) as store:
+        accounts = Accounts(store, clock=lambda: CYCLE)
+        user = accounts.use_password_token(token, "a long enough password")
+        assert (user.email, user.name, user.role, user.has_password) == ("owner@example.com", "Owner", "admin", True)
+        assert token not in str(store.query("SELECT * FROM password_tokens")[0])
+
+    # Again for an existing user: it stays (or becomes) an admin, and gets a reset link.
+    assert cli.main(["users", "add-admin", "owner@example.com"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("owner@example.com already had an account.\nOpen this link within 48 hours to choose a new")
+    _link(out, "password")
+
+
+def test_users_add_admin_promotes_and_enables_a_member(workdir, capsys, monkeypatch, fast_scrypt):
+    from dip_scanner.accounts import Accounts
+
+    monkeypatch.setenv("BASE_URL", "https://dips.example.com")
+    with store_at(workdir) as store:
+        accounts = Accounts(store, clock=lambda: CYCLE)
+        accounts.create_user("owner@example.com", role="admin", password="a long enough password")
+        member = accounts.create_user("friend@example.com", password="a long enough password")
+        accounts.set_disabled(member.id, True)
+    assert cli.main(["users", "add-admin", "friend@example.com"]) == 0
+    assert "friend@example.com already had an account; made it an admin and enabled it." in capsys.readouterr().out
+    with store_at(workdir) as store:
+        friend = Accounts(store).get_user_by_email("friend@example.com")
+        assert friend.is_admin and not friend.disabled
+
+
+def test_users_invite_list_disable_enable_and_reset_link(workdir, capsys, monkeypatch, fast_scrypt):
+    from dip_scanner.accounts import Accounts
+
+    monkeypatch.setenv("BASE_URL", "https://dips.example.com")
+    assert cli.main(["users", "invite", "Friend@Example.com"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Invite for friend@example.com as a member, valid once within 7 days:")
+    member_invite = _link(out, "invite")
+    assert cli.main(["users", "invite", "--role", "admin"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Invite for anyone with the link as an admin")
+    with store_at(workdir) as store:
+        accounts = Accounts(store, clock=lambda: CYCLE)
+        accounts.create_user("owner@example.com", role="admin", password="a long enough password")
+        accounts.accept_invite(member_invite, name="Friend", password="another long password")
+        accounts.update_settings(
+            accounts.get_user_by_email("friend@example.com").id,
+            replace(accounts.defaults, telegram_chat_id="42", email_alerts=True),
+        )
+
+    assert cli.main(["users", "list"]) == 0
+    out = capsys.readouterr().out
+    assert "2 accounts:" in out and "1 unused invite:" in out
+    assert re.search(r"#1 +owner@example.com +admin +active +never signed in; alerts: none", out)
+    assert re.search(r"#2 +friend@example.com +member +active .*alerts: email, telegram \(Friend\)", out)
+    assert "anyone with the link" in out and "expires 2026-10-02 20:30 UTC" in out
+
+    assert cli.main(["users", "disable", "friend@example.com"]) == 0
+    assert capsys.readouterr().out == "friend@example.com is disabled and signed out everywhere.\n"
+    assert cli.main(["users", "reset-link", "friend@example.com"]) == 1
+    assert "is disabled; `dip-scanner users enable` it first" in capsys.readouterr().err
+    assert cli.main(["users", "enable", "FRIEND@example.com"]) == 0
+    assert capsys.readouterr().out == "friend@example.com is enabled.\n"
+    assert cli.main(["users", "reset-link", "friend@example.com"]) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("Open this link within 48 hours to choose a new password for friend@example.com")
+    _link(out, "password")
+
+    assert cli.main(["users", "disable", "nobody@example.com"]) == 1
+    assert "there is no account for nobody@example.com" in capsys.readouterr().err
+    assert cli.main(["users", "disable", "owner@example.com"]) == 1  # the only admin
+    assert "is the only admin" in capsys.readouterr().err
+    assert cli.main(["users", "invite", "owner@example.com"]) == 1
+    assert "There is already an account for owner@example.com." in capsys.readouterr().err
+
+
+def test_backup_copies_the_database_and_keeps_the_newest(workdir, capsys, monkeypatch):
+    assert cli.main(["backup"]) == 1  # nothing yet
+    assert "nothing to back up" in capsys.readouterr().err
+    with store_at(workdir) as store:
+        store.add_opportunity(make_opportunity())
+    times = iter(CYCLE + timedelta(hours=hours) for hours in range(4))
+    monkeypatch.setattr(cli, "_now", lambda: next(times))
+    for _ in range(4):
+        assert cli.main(["backup", "--keep", "2"]) == 0
+    out = capsys.readouterr().out
+    assert "Backed up the database to " in out and "the newest 2 backups are kept." in out
+    folder = workdir / "data" / "backups"
+    assert sorted(path.name for path in folder.iterdir()) == [
+        "scanner-20260925-223000.sqlite3",
+        "scanner-20260925-233000.sqlite3",
+    ]
+    with Store(folder / "scanner-20260925-233000.sqlite3") as copy:
+        assert len(copy.opportunities()) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["backup", "--keep", "0"])
+
+
+def test_the_readme_names_every_command():
+    readme = (Path(cli.__file__).resolve().parent.parent / "README.md").read_text(encoding="utf-8")
+    commands = cli._parser()._subparsers._group_actions[0].choices
+    for name in commands:
+        assert f"`dip-scanner {name}" in readme, name
+    for action in commands["users"]._subparsers._group_actions[0].choices:
+        assert f"`dip-scanner users {action}" in readme or f"`{action} EMAIL`" in readme, action

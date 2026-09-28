@@ -20,14 +20,21 @@ dependencies = [
 [project.optional-dependencies]
 anthropic = ["anthropic>=1,<2"]
 azure = ["azure-identity>=1.19"]
-# The tests exercise every provider, so the dev extra installs the other extras' SDKs too.
-dev = ["news-dip-scanner[anthropic,azure]", "pytest>=8", "ruff>=0.6"]
+# The website (`dip-scanner serve`): FastAPI on uvicorn, Jinja2 templates, form parsing.
+web = ["fastapi>=0.115", "uvicorn[standard]>=0.30", "jinja2>=3.1", "python-multipart>=0.0.9"]
+# The tests exercise every provider and the website, so the dev extra installs the other extras too (httpx is what
+# FastAPI's TestClient runs on).
+dev = ["news-dip-scanner[anthropic,azure,web]", "httpx>=0.27", "pytest>=8", "ruff>=0.6"]
 
 [project.scripts]
 dip-scanner = "dip_scanner.cli:main"
 
 [tool.setuptools]
-packages = ["dip_scanner"]
+packages = ["dip_scanner", "dip_scanner.web"]
+
+[tool.setuptools.package-data]
+# The website's templates and static files ship inside the package (wheel and editable installs alike).
+"dip_scanner.web" = ["templates/**/*", "static/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

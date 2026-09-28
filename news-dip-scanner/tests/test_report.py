@@ -11,6 +11,9 @@ from conftest import NOW, make_analysis, make_article, make_impact, make_opportu
 from dip_scanner.models import Opportunity
 from dip_scanner.report import (
     DISCLAIMER,
+    display_zone,
+    display_zone_as,
+    for_currency,
     format_clock,
     format_money,
     format_pct,
@@ -499,3 +502,67 @@ def test_times_are_shown_in_the_display_time_zone():
     # Files are still named by UTC time, so they sort the same wherever they are read.
     set_display_zone(None)
     assert format_when(NOW) == "2026-09-25 15:00 UTC"
+
+
+# --- a time zone and a currency per reader -------------------------------------------------------------------------
+
+
+def test_display_zone_as_changes_the_zone_for_this_thread_only():
+    import threading
+    from zoneinfo import ZoneInfo
+
+    set_display_zone(ZoneInfo("Europe/Athens"))
+    moment = datetime(2026, 9, 25, 15, 0, tzinfo=UTC)
+    seen: dict[str, str] = {}
+    inside = threading.Event()
+    done = threading.Event()
+
+    def other_thread():
+        inside.wait(5)
+        seen["other"] = format_when(moment)  # while the main thread is inside its block
+        done.set()
+
+    worker = threading.Thread(target=other_thread)
+    worker.start()
+    with display_zone_as(ZoneInfo("America/New_York")):
+        inside.set()
+        done.wait(5)
+        seen["inside"] = format_when(moment)
+        with display_zone_as(None):  # None keeps the process-wide zone
+            seen["none"] = format_clock(moment)
+    worker.join(5)
+    assert seen == {"inside": "2026-09-25 11:00 EDT", "other": "2026-09-25 18:00 EEST", "none": "18:00 EEST"}
+    assert format_when(moment) == "2026-09-25 18:00 EEST" and display_zone() == ZoneInfo("Europe/Athens")
+
+
+class FakeFx:
+    def __init__(self, rate=None, error=None):
+        self.calls = []
+        self._rate, self._error = rate, error
+
+    def rate(self, currency, account, *, now=None):
+        self.calls.append((currency, account, now))
+        if self._error is not None:
+            raise self._error
+        return self._rate
+
+
+def test_for_currency_uses_the_stored_rate_else_todays_labelled_as_such():
+    from dip_scanner.prices import PriceError
+
+    opp = make_opportunity(fx_rates={"EUR": 0.88})
+    stored = for_currency(opp, "EUR", fx=FakeFx(rate=0.5), now=NOW)
+    assert (stored.fx_rate, stored.fx_rate_today) == (0.88, False)
+    assert fx_text(stored).startswith("1 USD = 0.88 EUR at the analysis")
+
+    fx = FakeFx(rate=0.75)
+    today = for_currency(opp, "gbp", fx=fx, now=NOW)
+    assert (today.account_currency, today.fx_rate, today.fx_rate_today) == ("GBP", 0.75, True)
+    assert fx.calls == [("USD", "GBP", NOW)]
+    assert format_money(132.0, today) == "$132.00 ≈ £99.00"
+    assert fx_text(today).startswith("1 USD = 0.75 GBP at today's rate (Yahoo Finance)")
+
+    failed = for_currency(opp, "CHF", fx=FakeFx(error=PriceError("no rate")), now=NOW)
+    assert (failed.account_currency, failed.fx_rate) == ("CHF", None) and format_money(1.0, failed) == "$1.00"
+    assert for_currency(opp, "CHF").fx_rate is None  # without fx nothing is fetched
+    assert for_currency(opp, None, fx=fx).account_currency is None and len(fx.calls) == 1

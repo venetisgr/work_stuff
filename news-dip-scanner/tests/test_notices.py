@@ -7,7 +7,7 @@ from datetime import timedelta
 import pytest
 from conftest import NOW
 
-from dip_scanner.config import LLMSettings, NotifySettings, Settings
+from dip_scanner.config import LLMSettings, NotifySettings, Settings, WebSettings
 from dip_scanner.notices import (
     NOTICE_REPEAT,
     NOTICE_RETRY,
@@ -137,3 +137,10 @@ def test_notices_use_the_display_time_zone_and_show_commands_as_code(store):
     [(_, markdown, html)] = channel.sent
     assert "`dip-scanner run --no-notify`" in markdown
     assert ">dip-scanner run --no-notify</code>" in html and "`" not in html
+
+
+def test_the_websites_secret_key_is_a_secret_too():
+    key = "website-secret-key-" + "x" * 30
+    settings = Settings(web=WebSettings(secret_key=key))
+    assert key in secrets_of(settings)
+    assert scrub(f"failed with {key} in it", secrets_of(settings)) == "failed with *** in it"

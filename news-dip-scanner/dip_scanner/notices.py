@@ -57,6 +57,7 @@ def secrets_of(settings: Settings) -> list[str]:
         llm.foundry_api_key,
         notify.smtp_password,
         notify.telegram_bot_token,
+        settings.web.secret_key,
         *(os.environ.get(name) for name in _OTHER_SECRET_VARIABLES),
     ]
     if notify.webhook_url:  # the path and query of a webhook URL are its secret
