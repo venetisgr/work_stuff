@@ -899,7 +899,9 @@ sends messages to addresses users give it and can spend the model budget, so:
   (compared in constant time); anything else gets a short page pointing at `BASE_URL`, so the `*.fly.dev` address is
   of no use on its own. Only a request with the secret may name the visitor's address (`x-dip-client-ip`), which the
   sign-in limits and the log then use; without it they would count every visitor as the front door's own address.
-  The front door itself sends Fly only an allow-list of the visitor's headers, drops any `x-dip-*` header a visitor
+  The front door takes that address from the headers Vercel sets and overwrites (`x-real-ip`), only on Vercel or
+  behind a proxy of your own that overwrites them (`DIP_TRUSTED_PROXY=1`), so a visitor can't pick it. It sends Fly
+  only an allow-list of the visitor's headers, drops any `x-dip-*` header a visitor
   sends and never passes on Vercel's own (`x-vercel-*`, its OIDC token), keeps its two settings in server-only
   environment variables (never in the pages' JavaScript), and gives its React pages a Content-Security-Policy with a
   fresh nonce per request (no `unsafe-eval`, no inline styles) and the Fly pages' other headers.

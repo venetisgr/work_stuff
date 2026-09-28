@@ -4,7 +4,9 @@
  * (/ and /ideas/[id]) and its own files (/_next/..., /icon.svg) first, so this catch-all only sees the rest.
  *
  * It streams the request to DIP_API_ORIGIN with the proxy's headers (src/lib/forward.ts) and streams Fly's answer
- * back: status, headers (each Set-Cookie), redirects as they are (redirect: "manual") and body.
+ * back: status, headers (each Set-Cookie), redirects as they are (redirect: "manual") and body. When Fly can't be
+ * asked (not configured, unreachable, too slow, or Fly's edge answering for a stopped Machine) it answers a small page
+ * of its own, or the API's JSON error (src/lib/unavailable.ts).
  *
  * Why a route handler and not a rewrite in proxy.ts: a rewrite with changed request headers works (tested with
  * `next start`: GET, POST, cookies both ways, 303 redirects), but Next.js then tells the browser where it went in an
@@ -16,26 +18,30 @@ import {
   clientIp,
   downstreamResponseHeaders,
   hasBody,
+  trustsForwardedHeaders,
+  UPSTREAM_TIMEOUT_MS,
   upstreamRequestHeaders,
   upstreamUrl,
   visitorHost,
 } from "@/lib/forward";
+import { isEdgeError, unavailableResponse, type UnavailableKind } from "@/lib/unavailable";
 
 export const dynamic = "force-dynamic";
 
-/** How long Fly may take to answer (a manual analysis is a job; no page should take this long). */
-const UPSTREAM_TIMEOUT_MS = 30_000;
+/** Seconds this function may run on Vercel: a little longer than UPSTREAM_TIMEOUT_MS (Hobby allows 300 with Fluid
+ * compute, the default); a literal, as Next.js reads it from the source. */
+export const maxDuration = 130;
 
 async function forward(request: NextRequest): Promise<Response> {
+  const url = new URL(request.url);
   let config;
   try {
     config = serverConfig();
   } catch (error) {
     const message = error instanceof ConfigError ? error.message : "The proxy isn't configured.";
     console.error(`Proxy not configured: ${message}`);
-    return unavailable("This site isn't set up yet: its administrator has to finish the Vercel settings.");
+    return unavailable(request, url, "not_configured");
   }
-  const url = new URL(request.url);
   let target: string;
   try {
     target = upstreamUrl(config.origin, url.pathname, url.search);
@@ -45,7 +51,7 @@ async function forward(request: NextRequest): Promise<Response> {
   const headers = upstreamRequestHeaders(request.headers, {
     secret: config.secret,
     host: visitorHost(request.headers, url.host),
-    clientIp: clientIp(request.headers),
+    clientIp: clientIp(request.headers, trustsForwardedHeaders()),
   });
   const init: RequestInit & { duplex?: "half" } = {
     method: request.method,
@@ -66,12 +72,13 @@ async function forward(request: NextRequest): Promise<Response> {
   } catch (error) {
     const timedOut = error instanceof Error && error.name === "TimeoutError";
     console.error(`Fly didn't answer ${request.method} ${url.pathname}: ${timedOut ? "timed out" : String(error)}`);
-    return unavailable(
-      timedOut
-        ? "The scanner's server took too long to answer. Try again in a moment."
-        : "The scanner's server can't be reached just now. Try again in a moment.",
-      timedOut ? 504 : 502,
-    );
+    return unavailable(request, url, timedOut ? "timeout" : "unreachable");
+  }
+  if (isEdgeError(upstream.status, upstream.headers)) {
+    // Fly's edge answering for a Machine that is restarting or down (the app's own answers carry its CSP)
+    console.error(`Fly's edge answered ${upstream.status} for ${request.method} ${url.pathname}`);
+    await upstream.body?.cancel().catch(() => undefined);
+    return unavailable(request, url, upstream.status === 504 ? "timeout" : "unreachable", upstream.status);
   }
   return new Response(request.method === "HEAD" ? null : upstream.body, {
     status: upstream.status,
@@ -80,17 +87,21 @@ async function forward(request: NextRequest): Promise<Response> {
   });
 }
 
-/** A short page (or JSON for the API) when Fly can't be asked; no technical details. */
-function unavailable(message: string, status = 503): Response {
-  return new Response(`${message}\n`, {
-    status,
-    headers: {
-      "content-type": "text/plain; charset=utf-8",
-      "cache-control": "no-store",
-      "retry-after": "30",
-      "x-content-type-options": "nosniff",
+/** Our own page (or the API's JSON error) when Fly can't be asked; no technical details (src/lib/unavailable.ts). */
+function unavailable(request: NextRequest, url: URL, kind: UnavailableKind, upstreamStatus?: number): Response {
+  return unavailableResponse(
+    {
+      method: request.method,
+      pathname: url.pathname,
+      search: url.search,
+      accept: request.headers.get("accept"),
+      referer: request.headers.get("referer"),
+      origin: url.origin,
+      https: url.protocol === "https:" || request.headers.get("x-forwarded-proto") === "https",
     },
-  });
+    kind,
+    upstreamStatus,
+  );
 }
 
 export {

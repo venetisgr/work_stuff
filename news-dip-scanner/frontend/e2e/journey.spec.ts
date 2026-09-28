@@ -169,6 +169,15 @@ test("the other Fly pages work through the proxy", async () => {
   await expect(page.getByRole("heading", { level: 1, name: "Ideas" })).toBeVisible();
 });
 
+test("an idea that doesn't exist keeps the header of a signed-in visitor", async () => {
+  const response = await page.goto("/ideas/999999");
+  expect(response?.status()).toBe(404);
+  await expect(page.getByRole("heading", { name: "Page not found" })).toBeVisible();
+  const nav = page.getByRole("navigation", { name: "Main" });
+  for (const name of ["Ideas", "News", "Settings"]) await expect(nav.getByRole("link", { name })).toBeVisible();
+  await expect(page.locator("details.menu summary")).toBeVisible();
+});
+
 test("signing out from a React page ends the session", async () => {
   await page.goto("/");
   await page.locator("details.menu summary").click();
@@ -181,6 +190,9 @@ test("signing out from a React page ends the session", async () => {
 });
 
 test("nothing went wrong on any page", async () => {
-  // The refused settings form answers 400 on purpose, which Chrome logs as a failed load.
-  watch.expectClean([/^console error on \/settings: Failed to load resource: .* 400 \(Bad Request\)$/]);
+  // The refused settings form answers 400 and the missing idea 404 on purpose, which Chrome logs as failed loads.
+  watch.expectClean([
+    /^console error on \/settings: Failed to load resource: .* 400 \(Bad Request\)$/,
+    /^console error on \/ideas\/999999: Failed to load resource: .* 404 \(Not Found\)$/,
+  ]);
 });

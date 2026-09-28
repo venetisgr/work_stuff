@@ -847,6 +847,19 @@ def test_a_job_page_reloads_while_the_analysis_waits(tmp_path):
     assert client.get("/jobs/1").status_code == 303
 
 
+def test_a_running_analysis_says_how_long_a_debate_takes(tmp_path):
+    """A debate is three rounds of model calls (openings, rebuttals, a ruling): minutes, not "under a minute"."""
+    parked = Parked()
+    site = Site(tmp_path, analyse=analyse_ok, executor=parked)
+    client = site.signed_in()
+    post_form(client, "/analyze", {"ticker": "AMD"})
+    site.accounts.start_job(1)
+    assert "this usually takes under a minute" in client.get("/jobs/1").text  # one model
+    site.ctx.settings = replace(site.settings, llm=replace(site.settings.llm, analysis_mode="debate"))
+    page = client.get("/jobs/1").text
+    assert "this usually takes a few minutes" in page and "under a minute" not in page
+
+
 def test_a_failed_analysis_says_why(tmp_path):
     def no_prices(ticker, now):
         raise PriceError(f"No prices for {ticker} (unknown symbol).")

@@ -51,3 +51,15 @@ export function parseServerConfig(env: Record<string, string | undefined>): Serv
 export function serverConfig(): ServerConfig {
   return parseServerConfig(process.env);
 }
+
+/** Whether both settings are there and well-formed (proxy.ts answers "This site isn't set up yet" otherwise; the
+ * route handler and api.ts log which one is wrong). */
+export function isConfigured(env: Record<string, string | undefined> = process.env): boolean {
+  try {
+    parseServerConfig(env);
+    return true;
+  } catch (error) {
+    if (error instanceof ConfigError) return false;
+    throw error;
+  }
+}

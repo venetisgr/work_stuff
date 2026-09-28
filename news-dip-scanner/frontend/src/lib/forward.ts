@@ -3,7 +3,8 @@
  * catch-all route handler (src/app/[...path]/route.ts), the server-side API client (src/lib/api.ts) and the tests.
  *
  * To Fly: only an allow-list of the visitor's headers (FORWARDED_REQUEST_HEADERS), never an incoming x-dip-* header,
- * plus x-dip-proxy-secret (DIP_PROXY_SECRET), x-dip-client-ip (the visitor's address as Vercel reports it),
+ * plus x-dip-proxy-secret (DIP_PROXY_SECRET), x-dip-client-ip (the visitor's address as Vercel reports it; see
+ * trustsForwardedHeaders),
  * x-forwarded-host (the address the visitor used) and x-forwarded-proto: https. Everything else the platform adds
  * (x-vercel-*, including OIDC tokens; x-middleware-*; x-forwarded-for) stays here.
  *
@@ -47,6 +48,14 @@ const HOP_BY_HOP = new Set([
 /** Response headers not passed back: hop-by-hop ones, and the encoding and length of a body fetch has decoded. */
 const DROPPED_RESPONSE_HEADERS = new Set([...HOP_BY_HOP, "content-encoding", "content-length"]);
 
+/**
+ * How long the catch-all route waits for Fly. A manual analysis is a job and answers at once, but "Send test alert"
+ * waits for each of the member's channels (a webhook for up to 30 seconds: dip_scanner/notify.py
+ * USER_WEBHOOK_DEADLINE), and an answer dropped here loses the messages Fly put in its cookie. The route's
+ * maxDuration is a little longer.
+ */
+export const UPSTREAM_TIMEOUT_MS = 120_000;
+
 export const SECRET_HEADER = "x-dip-proxy-secret";
 export const CLIENT_IP_HEADER = "x-dip-client-ip";
 const PRIVATE_PREFIX = "x-dip-";
@@ -63,11 +72,22 @@ export function cleanIp(value: string | null | undefined): string | null {
 }
 
 /**
- * The visitor's address. On Vercel, x-real-ip and x-forwarded-for are set by the platform, which overwrites whatever
- * the visitor sent (vercel.com/docs/headers/request-headers), so they can be trusted there; `next start` on your own
- * computer sets x-forwarded-for from the connection.
+ * Whether x-real-ip and x-forwarded-for name the visitor. On Vercel (VERCEL=1, one of the system environment
+ * variables Vercel exposes by default) the platform overwrites both with the visitor's address, whatever the visitor
+ * sent (vercel.com/docs/headers/request-headers). Anywhere else, `next start` passes on what the visitor sent, so they
+ * are believed only behind a proxy of your own that overwrites them (DIP_TRUSTED_PROXY=1).
  */
-export function clientIp(headers: Headers): string | null {
+export function trustsForwardedHeaders(env: Record<string, string | undefined> = process.env): boolean {
+  return env.VERCEL === "1" || env.DIP_TRUSTED_PROXY === "1";
+}
+
+/**
+ * The visitor's address for x-dip-client-ip, from x-real-ip (or the first x-forwarded-for entry) when the platform
+ * sets them (trusted, see trustsForwardedHeaders); otherwise null, and the Fly app counts the front door's own
+ * address instead, so a visitor can't pick the address the sign-in limits count.
+ */
+export function clientIp(headers: Headers, trusted: boolean): string | null {
+  if (!trusted) return null;
   const real = cleanIp(headers.get("x-real-ip"));
   if (real) return real;
   const forwarded = headers.get("x-forwarded-for");

@@ -7,6 +7,7 @@ import type { Metadata } from "next";
 import Link from "next/link";
 import IdeaFilters from "@/components/IdeaFilters";
 import IdeaList from "@/components/IdeaList";
+import NoIdeas from "@/components/NoIdeas";
 import { SiteShell } from "@/components/SiteShell";
 import StatusStrip from "@/components/StatusStrip";
 import ThesisChanges from "@/components/ThesisChanges";
@@ -29,7 +30,10 @@ async function load(query: IdeasQuery, here: string) {
       getIdeas(query, here),
       getThesisChanges(THESIS_DAYS, here),
     ]);
-    return { me, status, list, changes, error: null };
+    // Nothing in this period: were there ideas in the last 30 days at all? (a new site has none: say what to expect)
+    const monthHasIdeas =
+      list.total > 0 || (query.days !== 30 && (await getIdeas(ideasQueryFrom({ days: "30" }), here)).total > 0);
+    return { me, status, list, changes, monthHasIdeas, error: null };
   } catch (error) {
     if (error instanceof ApiRequestError) return { error };
     throw error; // a redirect to the sign-in page, or a bug (error.tsx)
@@ -137,19 +141,7 @@ export default async function Dashboard({ searchParams }: PageProps<"/">) {
             {plural(list.total, "idea")} in the last {plural(query.days, "day")} don&apos;t pass them.
           </EmptyState>
         ) : (
-          <EmptyState
-            title={`No ideas in the last ${plural(query.days, "day")}`}
-            action={
-              query.days !== 30 ? (
-                <Link className="btn btn-secondary" href="/?days=30">
-                  Show the last 30 days
-                </Link>
-              ) : undefined
-            }
-          >
-            The scanner lists every dip it analyses here; it checks the news every {status.interval_minutes} minutes.
-            Look up a stock to analyse one yourself.
-          </EmptyState>
+          <NoIdeas days={query.days} monthHasIdeas={data.monthHasIdeas} status={status} now={now} timeZone={timeZone} />
         )}
       </div>
 

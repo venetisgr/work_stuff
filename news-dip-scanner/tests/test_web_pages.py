@@ -817,6 +817,17 @@ def test_the_ticker_page(seeded):
     assert "Manual analyses aren&#39;t available right now." in page
 
 
+def test_an_idea_row_measures_the_target_from_the_entry_beside_it(seeded):
+    """ "Entry $X · +Y% to target": Y is from the entry (the limit orders), not from the price in the report."""
+    site, ids = seeded
+    opp = site.store.get_opportunity(ids["amd"])
+    assert round(opp.entry_upside_pct(), 1) != round(opp.upside_pct(), 1)
+    page = site.client().get("/tickers/AMD").text
+    row = r'<span class="idea-levels">Entry .*?</span> · <span class="num[^"]*">([^<]+)</span> to target'
+    shown = re.search(row, page)
+    assert shown is not None and shown.group(1) == f"{opp.entry_upside_pct():+.1f}%"
+
+
 def test_a_ticker_that_is_no_dip_says_so(site):
     site.prices.bars["KO"] = bars_until(TODAY, 60.0)
     original = site.prices.stats

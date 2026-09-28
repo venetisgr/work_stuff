@@ -33,11 +33,12 @@ export function apiUrl(origin: string, path: string): string {
 }
 
 /** The headers of a server-side call to Fly on behalf of the visitor: their session cookie only (dsid), their
- * browser's name, and the proxy's headers. */
+ * browser's name, and the proxy's headers (their address only where the platform vouches for it: trustForwarded,
+ * see forward.ts trustsForwardedHeaders). */
 export function apiRequestHeaders(
   incoming: Headers,
   sessionToken: string | undefined,
-  { secret, fallbackHost }: { secret: string; fallbackHost: string },
+  { secret, fallbackHost, trustForwarded }: { secret: string; fallbackHost: string; trustForwarded: boolean },
 ): Headers {
   const headers = new Headers({ accept: "application/json" });
   const agent = incoming.get("user-agent");
@@ -46,7 +47,7 @@ export function apiRequestHeaders(
   return withProxyHeaders(headers, {
     secret,
     host: visitorHost(incoming, fallbackHost),
-    clientIp: clientIp(incoming),
+    clientIp: clientIp(incoming, trustForwarded),
   });
 }
 

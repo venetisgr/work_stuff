@@ -10,7 +10,8 @@
  * Like the real app with PROXY_SECRET set, every request but /healthz needs x-dip-proxy-secret (DIP_PROXY_SECRET,
  * default MOCK_SECRET below), so the proxy's headers are exercised too. Sign in with any email and password.
  * MOCK_ROLE=member serves me-member.json; MOCK_STATUS=stopped serves status-stopped.json; MOCK_JOB=fail makes
- * "Analyse again" fail. Only for development: it binds to 127.0.0.1 and holds no real data.
+ * "Analyse again" fail; MOCK_IDEAS=none lists no ideas at all (a new site's dashboard). Only for development: it
+ * binds to 127.0.0.1 and holds no real data.
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, readdirSync } from "node:fs";
@@ -92,7 +93,8 @@ function ideas(url) {
   const verdict = verdicts.includes(q.get("verdict")) ? q.get("verdict") : null;
   const flag = (name) => ["1", "on", "true", "yes"].includes((q.get(name) || "").toLowerCase());
   const sort = q.get("sort") === "new" ? "new" : "score";
-  let list = pool.ideas.filter((idea) => now - Date.parse(idea.created) <= days * 86_400_000);
+  const all = process.env.MOCK_IDEAS === "none" ? [] : pool.ideas;
+  let list = all.filter((idea) => now - Date.parse(idea.created) <= days * 86_400_000);
   const total = list.length;
   if (minScore !== null) list = list.filter((idea) => idea.score >= minScore);
   if (verdict) list = list.filter((idea) => idea.verdict === verdict);

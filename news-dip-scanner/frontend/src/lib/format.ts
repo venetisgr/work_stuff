@@ -3,7 +3,7 @@
  * web/app.py filters), so the React pages and Fly's pages look like one site. The API sends plain numbers and
  * ISO dates; these turn them into text with Intl.
  */
-import type { ScoreBand, Verdict } from "./types";
+import type { Job, ScoreBand, Verdict } from "./types";
 
 const PENCE = new Set(["GBp", "GBX"]);
 const SYMBOLS: Record<string, string> = { USD: "$", EUR: "€", GBP: "£" };
@@ -72,6 +72,29 @@ export function formatTokens(value: number): string {
 /** "1 idea", "3 ideas" */
 export function plural(count: number, singular: string, pluralForm?: string): string {
   return `${formatCount(count)} ${count === 1 ? singular : (pluralForm ?? `${singular}s`)}`;
+}
+
+/** "45 s", "2 min 05 s": how long something has been going. */
+export function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.floor(ms / 1000));
+  if (seconds < 60) return `${seconds} s`;
+  return `${Math.floor(seconds / 60)} min ${String(seconds % 60).padStart(2, "0")} s`;
+}
+
+/**
+ * What "Analyse again" says while its analysis waits or runs (job: as last polled, null before the first answer).
+ * No promise of "under a minute": with LLM_ANALYSIS_MODE=debate (the Fly deployment's) two models make their case,
+ * answer each other and a judge rules, three rounds of model calls that take minutes.
+ */
+export function analysisProgress(job: Pick<Job, "status" | "ahead"> | null, elapsedMs: number): string {
+  if (job?.status === "done") return "Done. Opening the new analysis…";
+  if (job?.status === "running") {
+    return (
+      `Analysing now (${formatElapsed(elapsedMs)} so far): prices, headlines, then the models. A debate between two ` +
+      "models takes a few minutes; you can leave this page, and the new analysis will be in the ideas list."
+    );
+  }
+  return `Waiting to start${job?.ahead ? ` (${job.ahead} ahead)` : ""}. Analyses run one at a time.`;
 }
 
 /** report.SCORE_BANDS: 80+ strong, 65-80 good, 50-65 fair, under 50 weak. */
@@ -161,6 +184,39 @@ export function formatWhen(iso: string | null | undefined, timeZone: string | nu
 export function formatClock(iso: string | null | undefined, timeZone: string | null | undefined): string {
   const text = formatWhen(iso, timeZone);
   return text === "–" ? text : text.slice(11);
+}
+
+function offsetMinutes(moment: Date, timeZone: string): number {
+  const name = new Intl.DateTimeFormat("en-US", { timeZone, timeZoneName: "longOffset" })
+    .formatToParts(moment)
+    .find((part) => part.type === "timeZoneName")?.value;
+  const match = /GMT([+-])(\d{2}):?(\d{2})?/.exec(name ?? "");
+  return match ? (match[1] === "-" ? -1 : 1) * (Number(match[2]) * 60 + Number(match[3] ?? 0)) : 0;
+}
+
+/**
+ * The US exchanges' regular session (09:30 to 16:00 New York time) on the day of `now`, in the reader's time zone:
+ * "16:30–23:00 EEST" for Athens. When most of the scanner's dips happen.
+ */
+export function usSessionHours(now: number, timeZone: string | null | undefined): string {
+  const moment = new Date(now);
+  const day = Object.fromEntries(
+    new Intl.DateTimeFormat("en-US", { timeZone: "America/New_York", year: "numeric", month: "numeric", day: "numeric" })
+      .formatToParts(moment)
+      .map((part) => [part.type, part.value]),
+  );
+  const midnight = Date.UTC(Number(day.year), Number(day.month) - 1, Number(day.day));
+  const offset = offsetMinutes(moment, "America/New_York");
+  const at = (minutes: number) => new Date(midnight + (minutes - offset) * 60_000).toISOString();
+  const open = formatClock(at(9 * 60 + 30), timeZone);
+  return `${open.split(" ")[0]}–${formatClock(at(16 * 60), timeZone)}`;
+}
+
+/** What a cycle found, from its summary ("Cycle 2026-09-25 18:00 EEST: 19/20 feeds ok, 37 new articles, ...; took
+ * 41 s; ..."): the counts only. A failed cycle's summary stays whole. */
+export function cycleFindings(summary: string): string {
+  const match = /^Cycle .*?\d{1,2}:\d{2}(?: \S+)?: ([\s\S]*)$/.exec(summary);
+  return (match ? match[1] : summary).split("; ")[0];
 }
 
 const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];

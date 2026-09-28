@@ -79,9 +79,13 @@ Until both are set, every page answers "This site isn't set up yet"; `npm run de
 - **Production branch**: `main` (Settings, Environments, Production, "Branch Tracking"; Vercel picks `main` by
   itself when the repository has one). Every push to `main` becomes the production site, from the same commits
   GitHub Actions deploys to Fly. Every other branch and pull request gets a preview deployment (step 8).
-- **Only build when the front end changed** (optional; saves builds): Settings, Build and Deployment, "Ignored Build
-  Step", "Only build if there are changes in a folder", with the folder `.` (the command runs in the Root
-  Directory, `news-dip-scanner/frontend`). A change to the Python app alone then doesn't rebuild the front end.
+- **Ignored Build Step**: leave it at "Automatic" (Settings, Build and Deployment), so every push builds, including
+  one that only changed the Python app (a minute of building, and the same pages again). Don't pick "Only build if
+  there are changes in a folder": it compares only the last commit of a push with the one before it, so a push of
+  several commits whose last one is Python-only (a direct push, or GitHub's "Rebase and merge") cancels the front
+  end's release, and a "Redeploy" after changing a variable is cancelled too. A cancelled build saves nothing on
+  Hobby: it still counts toward the deployments of the day. If a front-end change ever didn't go live: Deployments,
+  the newest one, "Redeploy", with "Use project's Ignore Build Step" unchecked.
 - GitHub Actions checks the front end too (lint, type check, tests and a build, on every change to `frontend/`), so
   a pull request shows both Vercel's preview and the checks.
 
@@ -109,7 +113,11 @@ the last part of a preview's address. Setting secrets restarts the Machine. From
 - `https://<your-app>.fly.dev` answers "Not here" with a link to `BASE_URL` for every page, file and API call (only
   `/healthz` still answers, for Fly's health check);
 - the Fly app believes the visitor's address the front door names (`x-dip-client-ip`) only with the secret, so the
-  sign-in limits and the log count each visitor, not Vercel's servers;
+  sign-in limits and the log count each visitor, not Vercel's servers. The front door takes that address from the
+  headers Vercel sets (`x-real-ip`), and only on Vercel (the `VERCEL` system variable, exposed by default: keep
+  Settings, Environment Variables, "Enable access to System Environment Variables" checked). Run with `next start`
+  anywhere else, it names no address unless a proxy of your own in front of it overwrites `X-Real-IP` and
+  `X-Forwarded-For` and you set `DIP_TRUSTED_PROXY=1`; otherwise a visitor could pick the address the limits count;
 - invite and password links (`dip-scanner users invite`, the admin pages) point at the Vercel address. A link made
   before the switch pointed at `fly.dev` and no longer opens: make a new one (`dip-scanner users reset-link`).
 
@@ -153,6 +161,14 @@ Every push to a branch other than `main`, and every pull request, gets a preview
 - **Keep previews private**: Settings, Deployment Protection: check that "Vercel Authentication" is on with
   "Standard Protection" (available on every plan, Hobby included). Then only you, signed in to Vercel, can open a
   preview, while the production address stays open for your friends. Password Protection isn't available on Hobby.
+- **Never build a stranger's code with the secret**: the repository is public, so anyone can fork it and open a pull
+  request. A preview builds the pull request's code with the Preview variables, `DIP_PROXY_SECRET` included, and a
+  changed file could send the secret anywhere; with it, anyone could talk to the Fly app directly and name any
+  visitor address, which defeats the sign-in limits. Keep Settings, Security, "Git Fork Protection" on (the default),
+  and never authorize a deployment Vercel holds back as coming from a fork ("Authorization required to deploy"). If
+  you don't need previews at all, give the two variables to Production only: a preview then only says "This site
+  isn't set up yet". If the secret ever leaked, make a new one (step 1) and set it on both sides (see
+  [Updating](#updating)).
 
 ## Hobby plan
 
@@ -160,8 +176,11 @@ Free, for personal and non-commercial use only. Its monthly allowances include 1
 of active CPU, 100 GB of fast data transfer and 10 GB of fast origin transfer, and a function may run for up to 5
 minutes. Every React page and every request passed on to Fly (a page, a form, a stylesheet, an API call) is one
 function invocation that mostly waits for Fly, which costs little CPU: a few people reading the site on their phones
-use a small fraction of it. The proxy gives up on Fly after 30 seconds. Vercel's usage page (the team's Usage tab)
-shows where you are.
+use a small fraction of it. The proxy gives up on Fly after 120 seconds ("Send test alert" waits for each of a
+member's channels, a webhook for up to 30 seconds), and asks Vercel for 130 seconds (`maxDuration` in
+`src/app/[...path]/route.ts`), which needs Fluid compute: Settings, Functions, "Fluid Compute" on, the default for
+new projects (without it Hobby functions stop after 60 seconds). Vercel's usage page (the team's Usage tab) shows
+where you are.
 
 ## Updating
 
@@ -180,11 +199,12 @@ shows where you are.
 |---|---|
 | Every page says "This site isn't set up yet" | `DIP_API_ORIGIN` or `DIP_PROXY_SECRET` is missing or malformed in this environment (Production or Preview); the function log says which. Set it and redeploy. |
 | Every page says "Not here: This address only answers through the website's front door" | The two secrets differ: `DIP_PROXY_SECRET` on Vercel must equal `PROXY_SECRET` on Fly. Set both again and redeploy on Vercel. |
-| "The scanner's server can't be reached just now" or "took too long" | The Fly app is down or restarting: `fly status`, `fly logs`. A deploy restarts it for up to a minute. |
+| "The scanner's server can't be reached just now" or "took too long" (the front door's own page, with "Try again") | The Fly app is down or restarting: `fly status`, `fly logs`. A deploy restarts it for up to a minute. The Vercel function log says whether Fly didn't answer, took over 120 seconds, or Fly's edge answered for a stopped Machine. |
 | Signing in answers "This form was sent from another site" | The address you use isn't the Fly app's `BASE_URL` (or in `TRUSTED_ORIGINS` for a preview): `fly secrets set BASE_URL=https://<the address you use>`. |
 | Signed in, but the ideas page goes back to the sign-in page | The session cookie wasn't kept: open the site on `BASE_URL`'s exact address (with or without `www`), over https. |
 | An invite or password link opens "Not here" | It was made before `BASE_URL` pointed at Vercel: make a new one. |
 | A preview can't be opened by a friend | Deployment Protection keeps previews to you (step 8). Share the production address instead. |
+| A front-end change isn't live after a push | Settings, Build and Deployment, "Ignored Build Step" must be "Automatic" (step 4). Deployments, the newest one, "Redeploy", with "Use project's Ignore Build Step" unchecked. |
 | The build fails on Vercel | Settings, Build and Deployment: the Root Directory must be `news-dip-scanner/frontend`. `npm ci && npm run build` in that folder shows the same error locally. |
 
 ## What was checked, and when
@@ -197,8 +217,15 @@ All on 2026-09-28, with Next.js 16.3.6:
   https://vercel.com/docs/environment-variables/sensitive-environment-variables
 - The production branch and preview branches: https://vercel.com/docs/git and
   https://vercel.com/docs/deployments/preview-deployments
-- Ignored Build Step: https://vercel.com/docs/project-configuration/project-settings
+- Ignored Build Step (what the folder preset compares, that a cancelled build counts toward the deployments, and
+  "Use project's Ignore Build Step" on redeploy):
+  https://vercel.com/docs/project-configuration/project-settings and
+  https://vercel.com/kb/guide/how-do-i-use-the-ignored-build-step-field-on-vercel
 - Function regions (`regions` in `vercel.json`): https://vercel.com/docs/functions/configuring-functions/region
+- Function duration (`maxDuration`, 300 seconds on Hobby with Fluid compute):
+  https://vercel.com/docs/functions/configuring-functions/duration
+- System environment variables (`VERCEL`): https://vercel.com/docs/environment-variables/system-environment-variables
+- Git Fork Protection: https://vercel.com/docs/project-configuration/security-settings
 - Deployment Protection (Standard Protection, Vercel Authentication, what Hobby has):
   https://vercel.com/docs/deployment-protection
 - The Hobby plan and its limits: https://vercel.com/docs/plans/hobby and https://vercel.com/docs/limits

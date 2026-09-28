@@ -1,7 +1,9 @@
 // The formatters give the same text as the Fly app's (report.py, web/app.py), so both halves read alike.
 import { describe, expect, it } from "vitest";
 import {
+  analysisProgress,
   formatApprox,
+  formatElapsed,
   formatClock,
   formatDay,
   formatPct,
@@ -142,5 +144,28 @@ describe("links", () => {
     expect(safeUrl(null)).toBeNull();
     expect(hostOf("https://www.reuters.com/x")).toBe("reuters.com");
     expect(hostOf("javascript:x")).toBe("");
+  });
+});
+
+describe("Analyse again's progress", () => {
+  it("counts the time and promises no 'under a minute' while the models work", () => {
+    const running = analysisProgress({ status: "running", ahead: 0 }, 63_300);
+    expect(running).toContain("1 min 03 s so far");
+    expect(running).toContain("A debate between two models takes a few minutes");
+    expect(running).toContain("you can leave this page");
+    expect(running).not.toContain("under a minute");
+  });
+
+  it("says what it waits for, and when it is done", () => {
+    expect(analysisProgress(null, 0)).toBe("Waiting to start. Analyses run one at a time.");
+    expect(analysisProgress({ status: "queued", ahead: 2 }, 4000)).toBe("Waiting to start (2 ahead). Analyses run one at a time.");
+    expect(analysisProgress({ status: "done", ahead: null }, 9000)).toBe("Done. Opening the new analysis…");
+  });
+
+  it("formats elapsed time", () => {
+    expect(formatElapsed(0)).toBe("0 s");
+    expect(formatElapsed(59_999)).toBe("59 s");
+    expect(formatElapsed(125_000)).toBe("2 min 05 s");
+    expect(formatElapsed(-5)).toBe("0 s");
   });
 });

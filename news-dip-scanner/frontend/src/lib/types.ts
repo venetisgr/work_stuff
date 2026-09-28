@@ -100,6 +100,7 @@ export interface Me {
 export interface Status {
   state: ScannerState;
   label: string;
+  /** Why it is stopped, off or stalled: the operator's reason for admins, plain words for members. */
   reason: string | null;
   interval_minutes: number;
   cycle_running_since: IsoDateTime | null;
@@ -229,6 +230,7 @@ export interface Participant {
 /** DEBATE_SPEC Debate, as stored (Opportunity.debate). */
 export interface Debate {
   mode: DebateMode;
+  /** As stored for admins; for members in plain words, without the provider's error. */
   reason: string | null;
   rounds: number;
   participants: Participant[];
@@ -255,6 +257,7 @@ export interface DebateParticipantView extends Participant {
 /** The debate card, with the texts of the Fly idea page's card (pages.debate_view) so both sites word it alike. */
 export interface DebateView {
   mode: DebateMode;
+  /** The stored reason (with the provider's error): admins only, null for members. Show reason_label. */
   reason: string | null;
   /** reason as a sentence for people, with model names instead of provider:model labels. */
   reason_label: string | null;
@@ -418,6 +421,7 @@ export interface Job {
   created: IsoDateTime;
   finished: IsoDateTime | null;
   opportunity_id: number | null;
+  /** Why it failed, for people (a setup failure's detail for admins only). */
   error: string | null;
   ahead: number | null;
   remaining: number | null;

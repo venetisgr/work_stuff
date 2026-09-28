@@ -11,7 +11,7 @@
   <p class="muted">{% if ahead %}{{ ahead|plural("analysis is", "analyses are") }} ahead of it. {% endif %}Analyses run one at a time. This page reloads itself every {{ refresh }} seconds.</p>
   {% elif job.status == "running" %}
   <div class="cluster"><span class="spinner" aria-hidden="true"></span><strong>Analysing now</strong></div>
-  <p class="muted">Fetching prices and headlines and asking the model: this usually takes under a minute. This page reloads itself every {{ refresh }} seconds and shows the idea when it is ready.</p>
+  <p class="muted">{% if debate %}Fetching prices and headlines, then two models each make their case, answer each other, and a judge rules: this usually takes a few minutes. You can leave this page: the new idea will be in the list when it is ready.{% else %}Fetching prices and headlines and asking the model: this usually takes under a minute.{% endif %} This page reloads itself every {{ refresh }} seconds and shows the idea when it is ready.</p>
   {% elif job.status == "failed" %}
   <div class="callout callout-bad" role="alert"><p><strong>The analysis didn't finish.</strong> {{ error or "No reason was recorded." }}{% if not job.counts %} It doesn't count toward your limit.{% endif %}</p></div>
   {% else %}

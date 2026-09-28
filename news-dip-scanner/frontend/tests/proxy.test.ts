@@ -2,7 +2,7 @@
 // and the renewed session cookie.
 import { unstable_doesMiddlewareMatch } from "next/experimental/testing/server";
 import { NextRequest } from "next/server";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { contentSecurityPolicy, makeNonce, securityHeaders } from "@/lib/csp";
 import {
   FORWARDED_REQUEST_HEADERS,
@@ -11,6 +11,7 @@ import {
   downstreamResponseHeaders,
   hasBody,
   stripPrivateHeaders,
+  trustsForwardedHeaders,
   upstreamRequestHeaders,
   upstreamUrl,
   visitorHost,
@@ -53,6 +54,25 @@ describe("which paths run proxy.ts (the React pages)", () => {
 });
 
 describe("proxy.ts", () => {
+  beforeEach(() => {
+    vi.stubEnv("DIP_API_ORIGIN", "https://my-dips.fly.dev");
+    vi.stubEnv("DIP_PROXY_SECRET", SECRET);
+  });
+  afterEach(() => {
+    vi.unstubAllEnvs();
+  });
+
+  it("answers the React pages with the catch-all's 'not set up' page until both settings are there", async () => {
+    vi.stubEnv("DIP_PROXY_SECRET", "");
+    const response = proxy(new NextRequest("https://dips.example.com/", { headers: { accept: "text/html" } }));
+    expect(response.status).toBe(503);
+    expect(response.headers.get("content-type")).toBe("text/html; charset=utf-8");
+    expect(response.headers.get("x-middleware-next")).toBeNull(); // the page doesn't render (and doesn't throw)
+    const html = await response.text();
+    expect(html).toContain("This site isn&#39;t set up yet");
+    expect(html).toContain('name="viewport"');
+  });
+
   it("sets a nonce CSP and the security headers, and strips x-dip-* from the page's request", () => {
     const request = new NextRequest("https://dips.example.com/ideas/7", {
       headers: { "x-dip-proxy-secret": "forged", "x-dip-client-ip": "6.6.6.6", cookie: "dsid=" + "a".repeat(43) },
@@ -169,10 +189,25 @@ describe("headers to Fly", () => {
 });
 
 describe("the visitor's address and host", () => {
-  it("prefers x-real-ip, then the first x-forwarded-for", () => {
-    expect(clientIp(new Headers({ "x-real-ip": "198.51.100.4", "x-forwarded-for": "1.1.1.1" }))).toBe("198.51.100.4");
-    expect(clientIp(new Headers({ "x-forwarded-for": "2001:db8::1, 10.0.0.1" }))).toBe("2001:db8::1");
-    expect(clientIp(new Headers())).toBeNull();
+  it("prefers x-real-ip, then the first x-forwarded-for, where the platform sets them", () => {
+    const ip = (init: Record<string, string>) => clientIp(new Headers(init), true);
+    expect(ip({ "x-real-ip": "198.51.100.4", "x-forwarded-for": "1.1.1.1" })).toBe("198.51.100.4");
+    expect(ip({ "x-forwarded-for": "2001:db8::1, 10.0.0.1" })).toBe("2001:db8::1");
+    expect(ip({})).toBeNull();
+  });
+
+  it("believes neither header elsewhere: next start passes on what the visitor sent", () => {
+    // A visitor who could name their address would pick the one the Fly app's sign-in limits count.
+    const forged = new Headers({ "x-real-ip": "8.8.4.4", "x-forwarded-for": "9.9.9.9" });
+    expect(clientIp(forged, false)).toBeNull();
+    expect(upstreamRequestHeaders(forged, { secret: SECRET, host: "h", clientIp: clientIp(forged, false) }).get("x-dip-client-ip")).toBeNull();
+  });
+
+  it("trusts them on Vercel, or behind a proxy of your own that says so", () => {
+    expect(trustsForwardedHeaders({ VERCEL: "1" })).toBe(true);
+    expect(trustsForwardedHeaders({ DIP_TRUSTED_PROXY: "1" })).toBe(true);
+    expect(trustsForwardedHeaders({})).toBe(false);
+    expect(trustsForwardedHeaders({ VERCEL: "0", DIP_TRUSTED_PROXY: "yes" })).toBe(false);
   });
 
   it("refuses anything that isn't an address", () => {

@@ -295,6 +295,7 @@ def job_page(request: Request, job_id: int, user: auth.SignedIn, ctx: auth.Ctx) 
             "ahead": ahead,
             "refresh": REFRESH_SECONDS if not job.done else None,
             "remaining": ctx.jobs.remaining(user),
+            "debate": ctx.settings.llm.analysis_mode == "debate",
             "page_title": f"Analysis of {job.ticker}",
         },
     )

@@ -25,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from dip_scanner import cli
 from dip_scanner.config import DATABASE_NAME, ScannerConfig, Settings, WebSettings, load_settings
+from dip_scanner.notify import USER_WEBHOOK_DEADLINE
 from dip_scanner.web import server
 from dip_scanner.web.app import create_app
 from dip_scanner.web.control import SHUTDOWN_BUDGET
@@ -295,6 +296,10 @@ def test_the_health_check_path_answers_200_over_plain_http(tmp_path):
     response = client.get(check["path"])
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+    # The front door tells the app's own errors (a 503 of /healthz or the API) from Fly's edge's 502/503/504 for a
+    # stopped Machine by the app's CSP, which every answer of the app carries (frontend/src/lib/unavailable.ts).
+    assert "content-security-policy" in response.headers
+    assert 'headers.has("content-security-policy")' in (FRONTEND / "src" / "lib" / "unavailable.ts").read_text()
 
 
 # --- the GitHub Actions workflow -----------------------------------------------------------------------------------
@@ -519,6 +524,39 @@ def test_vercel_guide_matches_the_front_end_and_the_fly_app():
     assert "(VERCEL.md)" in DEPLOY_MD.read_text(encoding="utf-8") and "(DEPLOY.md)" in text
     readme = (PROJECT / "README.md").read_text(encoding="utf-8")
     assert "(docs/VERCEL.md)" in readme and "(docs/DEPLOY.md)" in readme
+
+
+def test_vercel_guide_never_skips_a_front_end_release():
+    """Vercel's "Only build if there are changes in a folder" preset runs `git diff HEAD^ HEAD --quiet -- <folder>`,
+    which sees only the last commit of a push: a front-end commit followed by a Python-only one, pushed together,
+    cancels the production build while Fly deploys. The guide keeps "Automatic" and warns against the preset; a custom
+    command, if it ever returns, must compare with the last deployment and build whenever it can't."""
+    text = " ".join(VERCEL_MD.read_text(encoding="utf-8").split())
+    preset = "Only build if there are changes in a folder"
+    for match in re.finditer(re.escape(preset), text):
+        assert "Don't pick" in text[max(0, match.start() - 20) : match.start()], "the preset is only warned against"
+    assert "HEAD^" not in text and "git diff HEAD" not in text
+    assert 'leave it at "Automatic"' in text
+    assert "Use project's Ignore Build Step" in text  # how to recover from a skipped release
+    if "VERCEL_GIT_PREVIOUS_SHA" in text or "git diff" in text:
+        assert "VERCEL_GIT_PREVIOUS_SHA" in text and "exit 1" in text
+
+
+def test_vercel_guide_covers_forks_timeouts_and_the_visitors_address():
+    """The repository is public: a fork's pull request must never get the Preview secret. The proxy's timeout is
+    the one the guide names, and the visitor's address is only believed where the platform sets it."""
+    text = " ".join(VERCEL_MD.read_text(encoding="utf-8").split())
+    assert "Git Fork Protection" in text and "never authorize" in text.lower()
+    forward = (FRONTEND / "src" / "lib" / "forward.ts").read_text(encoding="utf-8")
+    timeout = int(re.search(r"UPSTREAM_TIMEOUT_MS = ([\d_]+);", forward).group(1).replace("_", ""))
+    assert f"after {timeout // 1000} seconds" in text
+    assert timeout / 1000 >= 3 * USER_WEBHOOK_DEADLINE  # a test alert to email, Telegram and a webhook
+    route = (FRONTEND / "src" / "app" / "[...path]" / "route.ts").read_text(encoding="utf-8")
+    max_duration = int(re.search(r"export const maxDuration = (\d+);", route).group(1))
+    assert timeout / 1000 < max_duration <= 300  # Vercel's Hobby limit with Fluid compute
+    assert "Fluid compute" in text
+    assert "DIP_TRUSTED_PROXY" in text and 'process.env.VERCEL === "1"' not in forward  # read through the helper
+    assert 'env.VERCEL === "1"' in forward
 
 
 def test_readme_links_and_screenshots_resolve():

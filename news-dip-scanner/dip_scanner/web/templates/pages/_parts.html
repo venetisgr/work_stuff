@@ -13,7 +13,8 @@
 {% if whole %}<span class="nowrap">{{ part }} of {{ whole }} <span class="muted">({{ (part / whole * 100)|percent }})</span></span>{% else %}–{% endif %}
 {%- endmacro %}
 
-{#- One idea in a list: score, ticker, verdict, company, entry and upside, chance up, age, and the debate in one line
+{#- One idea in a list: score, ticker, verdict, company, entry and the way from it to the target (what the two limit
+    orders would make, as the React list shows it), chance up, age, and the debate in one line
     when two models argued over it. counts: analyses per ticker (or {}), watchlist: the reader's symbols, matching:
     ids of ideas that pass the reader's alert rules, lines: pages.debate_lines (id -> the debate's line). -#}
 {% macro idea_row(opp, counts={}, watchlist=(), matching=(), current=none, lines={}) -%}
@@ -22,7 +23,7 @@
   <span class="idea-main">
     <span class="idea-line"><span class="idea-name"><span class="ticker">{{ opp.ticker }}</span>{% if opp.ticker in watchlist %} <span class="marker marker-watch" title="On your watchlist"><span aria-hidden="true">★</span><span class="visually-hidden">On your watchlist</span></span>{% endif %}{% if opp.id in matching %} <span class="marker marker-rules" title="Passes your alert rules"><span aria-hidden="true">✓</span><span class="visually-hidden">Passes your alert rules</span></span>{% endif %}</span> {{ ui.verdict_badge(opp.analysis.verdict) }}</span>
     <span class="idea-company truncate">{{ opp.company }}</span>
-    <span class="idea-levels">Entry <span class="num">{{ opp.analysis.entry_price|price(opp.currency) }}</span> · target {{ ui.pct(opp.upside_pct()) }}{% if counts.get(opp.ticker, 1) > 1 %} · {{ counts[opp.ticker] }} analyses{% endif %}</span>
+    <span class="idea-levels">Entry <span class="num">{{ opp.analysis.entry_price|price(opp.currency) }}</span> · {{ ui.pct(opp.entry_upside_pct()) }} to target{% if counts.get(opp.ticker, 1) > 1 %} · {{ counts[opp.ticker] }} analyses{% endif %}</span>
   </span>
   <span class="idea-figures">
     <span class="idea-chance num">{{ opp.analysis.probability_up_6m|percent }}</span>

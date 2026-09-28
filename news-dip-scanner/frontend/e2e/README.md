@@ -6,7 +6,9 @@ signing in on the Fly page through the proxy, the React ideas and an idea with i
 the Fly news, track record and admin pages, and signing out. No page may log an error, break its
 Content-Security-Policy, send the browser to the Fly app or redirect it there; the session cookie must be set on the
 front end's host. `front-door.spec.ts` checks that the Fly app refuses everything but `/healthz` without the proxy
-secret.
+secret. `fly-down.spec.ts` starts a second `next start` of the same build (on free ports) whose Fly app can't be
+reached, and checks on an iPhone-sized screen, light and dark, that every page still answers something readable with
+a way back.
 
 The tests don't start the servers: they need three, each in its own terminal.
 

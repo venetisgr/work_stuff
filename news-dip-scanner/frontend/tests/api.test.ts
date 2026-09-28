@@ -42,7 +42,7 @@ describe("apiRequestHeaders", () => {
     "x-real-ip": "203.0.113.7",
     "x-dip-proxy-secret": "forged",
   });
-  const headers = apiRequestHeaders(incoming, "tok", { secret: SECRET, fallbackHost: "localhost" });
+  const headers = apiRequestHeaders(incoming, "tok", { secret: SECRET, fallbackHost: "localhost", trustForwarded: true });
 
   it("sends only the session cookie, the browser's name and JSON", () => {
     expect(headers.get("cookie")).toBe("dsid=tok");
@@ -57,8 +57,14 @@ describe("apiRequestHeaders", () => {
     expect(headers.get("x-forwarded-proto")).toBe("https");
   });
 
+  it("names the visitor's address only where the platform sets it", () => {
+    const untrusted = apiRequestHeaders(incoming, "tok", { secret: SECRET, fallbackHost: "x", trustForwarded: false });
+    expect(untrusted.get("x-dip-client-ip")).toBeNull();
+    expect(untrusted.get("x-dip-proxy-secret")).toBe(SECRET);
+  });
+
   it("never sends a token that could break the header", () => {
-    const odd = apiRequestHeaders(new Headers(), "a;b", { secret: SECRET, fallbackHost: "localhost" });
+    const odd = apiRequestHeaders(new Headers(), "a;b", { secret: SECRET, fallbackHost: "localhost", trustForwarded: true });
     expect(odd.get("cookie")).toBeNull();
     expect(odd.get("x-forwarded-host")).toBe("localhost");
   });

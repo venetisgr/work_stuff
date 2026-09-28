@@ -65,6 +65,7 @@ responses against it.
 |---|---|---|
 | `DIP_API_ORIGIN` | Vercel: Production and Preview | The Fly app's address without a path, `https://<app>.fly.dev` (http only for 127.0.0.1/localhost). |
 | `DIP_PROXY_SECRET` | Vercel: Production and Preview, marked Sensitive | The same value as the Fly app's `PROXY_SECRET` (32+ characters). |
+| `DIP_TRUSTED_PROXY` | Only when self-hosting | `1` when a proxy of your own in front of `next start` overwrites `X-Real-IP` and `X-Forwarded-For` with the visitor's address. On Vercel (`VERCEL=1`) it isn't needed. |
 
 Both are server-only: never prefix them with `NEXT_PUBLIC_`. `.env.example` has a template for `.env.local`.
 `vercel.json` pins the functions to Frankfurt (`fra1`), next to the Fly app's region; Vercel runs `proxy.ts`
@@ -78,7 +79,8 @@ npm run dev:mock     # next dev + the mock Fly app: http://localhost:3000, sign 
 npm run dev          # next dev against DIP_API_ORIGIN (.env.local)
 npm run lint         # ESLint (next/core-web-vitals + TypeScript)
 npm run typecheck    # next typegen && tsc --noEmit
-npm test             # Vitest: contract, proxy headers, API helpers, formatters, chart geometry
+npm test             # Vitest: contract, proxy headers, the "can't reach Fly" page, API helpers, formatters,
+                     # chart geometry, components rendered on the server
 npm run build        # next build
 npm start            # next start (production mode, e.g. against a local Fly app)
 npm run e2e          # Playwright through next start and a real Fly app (needs both running: e2e/README.md)
@@ -101,7 +103,12 @@ and `BASE_URL=http://localhost:3000` (`dip-scanner serve --no-scanner` serves an
   No inline `style` attributes anywhere (the chart's geometry is SVG attributes; its colours are classes).
 - **Headers to Fly**: an allow-list of the visitor's headers; every incoming `x-dip-*` header is dropped, and the
   platform's own (`x-vercel-*`, including OIDC tokens) never leave Vercel. The visitor's IP comes from `x-real-ip` /
-  `x-forwarded-for`, which Vercel sets itself and doesn't take from the visitor.
+  `x-forwarded-for` only on Vercel (`VERCEL=1`), which sets them itself and doesn't take them from the visitor, or
+  with `DIP_TRUSTED_PROXY=1`. `next start` on its own passes on whatever the visitor sent, so there no address is
+  named and the Fly app counts the front door's own.
+- **When Fly can't be asked** (not configured, unreachable, over 120 seconds, or Fly's edge answering for a stopped
+  Machine), the front door answers a small page of its own (`src/lib/unavailable.ts`: viewport, light and dark, a
+  "Try again" link, its one inline style allowed by hash in its own CSP), or the contract's JSON error on `/api/`.
 - **Paths can't leave Fly**: the target is `DIP_API_ORIGIN` + path + query joined as text, checked to stay on that
   origin.
 - **Untrusted text** (headlines, the models' text, names) is rendered by React (escaped); links only for `http`

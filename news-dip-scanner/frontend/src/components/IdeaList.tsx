@@ -1,7 +1,9 @@
 /**
  * The ideas of the dashboard: cards on a phone and a tablet, a table on a wide screen (both drawn; CSS shows one).
  * An idea that passes the reader's alert rules has an accent bar down its left edge and a ✓; ★ marks their
- * watchlist. The ticker's link stretches over the whole card or row.
+ * watchlist. The ticker's link stretches over the whole card or row. "Reported price" is the price in the analysis
+ * (it may be days old); the percentages next to the entry are from the entry, what the two limit orders (buy at the
+ * entry, sell at the target) would make, and how far the potential low is below the entry, as on the idea page.
  */
 import Link from "next/link";
 import { formatPercent } from "@/lib/format";
@@ -77,7 +79,7 @@ function IdeaCard({ idea, now, timeZone }: { idea: IdeaSummary; now: number; tim
 
       <dl className="m-0 grid grid-cols-3 gap-2 border-t border-line pt-3 text-sm">
         <div>
-          <dt className="text-xs text-muted">Price</dt>
+          <dt className="text-xs text-muted">Reported price</dt>
           <dd className="m-0 font-semibold">
             <Money value={idea.price} currency={idea.currency} approxCurrency={approx} className="flex flex-col" />
           </dd>
@@ -89,11 +91,11 @@ function IdeaCard({ idea, now, timeZone }: { idea: IdeaSummary; now: number; tim
           </dd>
         </div>
         <div>
-          <dt className="text-xs text-muted">To target</dt>
+          <dt className="text-xs text-muted">Entry to target</dt>
           <dd className="m-0 font-semibold">
-            <Pct value={idea.upside_pct} />
+            <Pct value={idea.entry_upside_pct} />
             <span className="block text-[0.8125rem] font-medium text-muted">
-              low <Pct value={idea.downside_pct} className="text-muted" />
+              low <Pct value={idea.entry_downside_pct} className="text-muted" />
             </span>
           </dd>
         </div>
@@ -130,13 +132,13 @@ function IdeaTable({ ideas, now, timeZone }: ListProps) {
               Chance up
             </th>
             <th scope="col" className="px-3 py-2.5 text-right font-semibold">
-              Price
+              Reported
             </th>
             <th scope="col" className="px-3 py-2.5 text-right font-semibold">
               Entry
             </th>
             <th scope="col" className="px-3 py-2.5 text-right font-semibold">
-              To target
+              Entry to target
             </th>
             <th scope="col" className="px-4 py-2.5 text-right font-semibold">
               Analysed
@@ -178,9 +180,9 @@ function IdeaTable({ ideas, now, timeZone }: ListProps) {
                   <Money value={idea.entry} currency={idea.currency} approxCurrency={approx} stacked />
                 </td>
                 <td className="px-3 py-3 text-right">
-                  <Pct value={idea.upside_pct} className="font-semibold" />
+                  <Pct value={idea.entry_upside_pct} className="font-semibold" />
                   <div className="text-[0.8125rem] text-muted">
-                    low <Pct value={idea.downside_pct} className="text-muted" />
+                    low <Pct value={idea.entry_downside_pct} className="text-muted" />
                   </div>
                 </td>
                 <td className="whitespace-nowrap px-4 py-3 text-right text-sm text-muted">

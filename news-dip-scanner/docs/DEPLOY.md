@@ -474,6 +474,8 @@ What changes:
 - **Limits and the log.** The front door names the visitor's address in `x-dip-client-ip`, and this app believes it
   only on a request that carried the secret: the sign-in limits then count each visitor, not Vercel's servers, and
   the log shows the visitor.
+- **Forks**: the repository is public, so never authorize a Vercel deployment of a stranger's pull request: it would
+  build their code with `PROXY_SECRET` (VERCEL.md step 8).
 - **Preview deployments use this app**: the data they show is real and so is everything done on them (settings
   saved, "Analyse again", which costs a model analysis like any other). The session cookie belongs to one address, so
   on a preview you sign in again. Keep previews private with Vercel's Deployment Protection. A pattern in

@@ -159,7 +159,7 @@
       }
     },
     "Error": {
-      "description": "Every error of /api/v1, with the HTTP status of the code: not_signed_in 401; forbidden, csrf, origin 403; not_found 404; method_not_allowed 405; bad_request 400 or 422; rate_limited and limit_reached 429 (with a Retry-After header too); unavailable 503; server_error 500.",
+      "description": "Every error of /api/v1, with the HTTP status of the code: not_signed_in 401; forbidden, csrf, origin 403; not_found 404; method_not_allowed 405; bad_request 400 or 422; rate_limited and limit_reached 429 (with a Retry-After header too); unavailable 503 (and 502 or 504, with retry_after and a Retry-After header, from the front end itself when the Fly app can't be reached or is too slow); server_error 500.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -426,7 +426,7 @@
             "string",
             "null"
           ],
-          "description": "Why it is stopped, off or stalled."
+          "description": "Why it is stopped, off or stalled. For members a stopped or disabled scanner's reason is in plain words; the operator's reason (e.g. a missing API key) is for admins."
         },
         "interval_minutes": {
           "type": "number",
@@ -1085,7 +1085,7 @@
             "string",
             "null"
           ],
-          "description": "Why single, or why no judge ran."
+          "description": "Why single, or why no judge ran. As stored for admins; for members, in plain words without the provider's error (the same text as DebateView.reason_label)."
         },
         "rounds": {
           "type": "integer",
@@ -1250,7 +1250,8 @@
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "description": "The stored reason, with the provider's error, for admins only: null for members (reason_label says it in plain words)."
         },
         "reason_label": {
           "type": [
@@ -2122,7 +2123,7 @@
             "string",
             "null"
           ],
-          "description": "Why it failed, for people."
+          "description": "Why it failed, for people. A failure of the server's setup is described in detail to admins only."
         },
         "ahead": {
           "type": [

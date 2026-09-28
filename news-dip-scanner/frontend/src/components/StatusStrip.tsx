@@ -20,6 +20,9 @@ export default function StatusStrip({ status, now, timeZone }: { status: Status;
           <span className="spinner" aria-hidden="true" />
           Cycle running since <TimeAgo iso={running} now={now} timeZone={timeZone} />
         </span>
+      ) : status.next_cycle_at && Date.parse(status.next_cycle_at) <= now ? (
+        // due (the page's clock is the API's): "Next cycle just now" would read as if it had run
+        status.state === "running" ? <span>Next cycle starting</span> : null
       ) : status.next_cycle_at && (status.state === "running" || status.state === "paused") ? (
         <span>
           Next cycle <TimeAgo iso={status.next_cycle_at} now={now} timeZone={timeZone} />
