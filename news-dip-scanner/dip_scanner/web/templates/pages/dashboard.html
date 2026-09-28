@@ -80,7 +80,7 @@
     <p class="small muted list-count">{% if shown != total %}{{ shown }} of {{ total|plural("idea") }} match the filters.{% else %}{{ total|plural("idea") }}.{% endif %}{% if watchlist or matching %} <span class="legend"><span class="marker marker-watch" aria-hidden="true">★</span> on your watchlist · <span class="marker marker-rules" aria-hidden="true">✓</span> passes your alert rules</span>{% endif %}</p>
     <div class="card card-flush ideas-list">
       {% for opp in ideas %}
-      {{ parts.idea_row(opp, counts=counts, watchlist=watchlist, matching=matching) }}
+      {{ parts.idea_row(opp, counts=counts, watchlist=watchlist, matching=matching, lines=debate_lines) }}
       {% endfor %}
     </div>
     {{ ui.pagination(page) }}

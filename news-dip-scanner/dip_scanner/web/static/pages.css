@@ -263,6 +263,10 @@
   order: 7;
 }
 
+.order-8 {
+  order: 8;
+}
+
 @media (min-width: 960px) {
   .split-layout {
     display: grid;
@@ -472,6 +476,39 @@
 
 .ideas-compact .idea-row {
   padding: 10px var(--space-4);
+}
+
+/* the debate in one line, under the idea's own lines and as wide as the row's text and figures */
+.idea-row .debate-line {
+  grid-column: 2 / -1;
+}
+
+.debate-line {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.35;
+  text-wrap: pretty;
+}
+
+/* two overlapping models: the first filled, the second an outline */
+.debate-mark {
+  flex: none;
+  margin-top: 2px;
+}
+
+.debate-mark-a {
+  fill: var(--accent);
+  opacity: 0.85;
+}
+
+.debate-mark-b {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
 }
 
 /* ★ on the reader's watchlist, ✓ passes their alert rules (the legend above the list says so) */
@@ -705,6 +742,10 @@
   font-weight: 550;
 }
 
+.stat-hero .debate-line {
+  margin-top: var(--space-1);
+}
+
 @media (min-width: 640px) {
   .idea-glance {
     grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(0, 1fr));
@@ -881,6 +922,255 @@ li.ladder-row + li.ladder-row {
   color: var(--muted);
 }
 
+/* the debate card: how two models argued over the idea. The two debaters sit side by side once the card is wide
+   enough (a container query, so the side column's width on a desktop counts, not the screen's), one after the other
+   on a phone; then the ruling. */
+.debate-card {
+  container-type: inline-size;
+}
+
+.debate-how {
+  margin: calc(-1 * var(--space-2)) 0 var(--space-4);
+}
+
+.debate-alone {
+  margin-bottom: var(--space-4);
+}
+
+.debate-reason {
+  overflow-wrap: anywhere;
+}
+
+.debate-sides {
+  display: grid;
+  gap: var(--space-3);
+}
+
+@container (min-width: 520px) {
+  .debate-sides.is-pair {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+}
+
+.debate-side {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  padding: var(--space-3) var(--space-4) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+}
+
+.debate-side > * {
+  margin: 0;
+}
+
+/* the side the judge found stronger: a band of the accent along the top */
+.debate-side.is-favoured {
+  border-top: 3px solid var(--accent);
+  padding-top: calc(var(--space-3) - 2px);
+}
+
+.debate-side-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* "A" / "B": how the judge saw the two, without their names */
+.analyst-mark {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  background: var(--surface-3);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 700;
+}
+
+.debate-who {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.debate-who h3 {
+  margin: 0;
+  font-size: 1.0625rem;
+  overflow-wrap: anywhere;
+}
+
+.debate-provider {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.debate-tags {
+  gap: 6px;
+}
+
+.debate-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  font-size: 0.875rem;
+}
+
+.debate-verdict .was,
+.debate-figures s {
+  color: var(--muted);
+  text-decoration-thickness: 1px;
+}
+
+.debate-arrow {
+  color: var(--muted);
+}
+
+/* opening and final, one row per figure; a change is struck through and the new value marked */
+.debate-figures {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.875rem;
+}
+
+.debate-figures th,
+.debate-figures td {
+  padding: 5px 0;
+  border-top: 1px solid var(--line);
+  text-align: right;
+  vertical-align: baseline;
+}
+
+.debate-figures tbody tr:first-child th,
+.debate-figures tbody tr:first-child td {
+  border-top: 0;
+}
+
+.debate-figures.is-compared tbody tr:first-child th,
+.debate-figures.is-compared tbody tr:first-child td {
+  border-top: 1px solid var(--line);
+}
+
+.debate-figures thead th {
+  padding-top: 0;
+  border-top: 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.debate-figures th[scope="row"] {
+  padding-right: var(--space-2);
+  color: var(--muted);
+  font-weight: 400;
+  text-align: left;
+}
+
+.debate-figures td + td {
+  padding-left: var(--space-3);
+}
+
+.debate-figures td.was {
+  color: var(--muted);
+}
+
+.debate-figures td:last-child {
+  font-weight: 600;
+}
+
+.debate-figures mark {
+  padding: 1px 6px;
+  margin-right: -6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.debate-points h4 {
+  margin: 0 0 var(--space-1);
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.debate-points ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: 0.875rem;
+}
+
+.debate-points li {
+  position: relative;
+  padding-left: 16px;
+  overflow-wrap: anywhere;
+}
+
+.debate-points li + li {
+  margin-top: var(--space-1);
+}
+
+/* a critique point in the colour of a fall, a concession in that of a rise */
+.debate-points li::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 0.55em;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--down);
+}
+
+.debate-points.is-concession li::before {
+  background: var(--up);
+}
+
+.debate-ruling {
+  margin-top: var(--space-4);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--line);
+  border-left: 4px solid var(--accent);
+  border-radius: var(--radius-sm);
+}
+
+.debate-ruling > * {
+  margin: 0 0 var(--space-2);
+}
+
+.debate-ruling > :last-child {
+  margin-bottom: 0;
+}
+
+.debate-ruling h3 {
+  font-size: 1.0625rem;
+}
+
+.debate-outcome {
+  font-size: 0.875rem;
+  line-height: 1.7;
+}
+
+.debate-outcome .badge {
+  margin-right: 4px;
+}
+
+.debate-summary {
+  max-width: 70ch;
+  font-size: 0.9375rem;
+}
+
 /* --- a ticker ---------------------------------------------------------------------------------------------------- */
 
 .price-block {
@@ -1030,6 +1320,50 @@ li.ladder-row + li.ladder-row {
   .table-stack.outcomes td[data-label="Score"]::before,
   .table-stack.outcomes td[data-label="Status"]::before {
     content: none;
+  }
+}
+
+/* the debate's model scoreboard: the debate's outcome is the last row, set apart */
+.scoreboard .card-note {
+  padding-top: 0;
+}
+
+.scoreboard-wait {
+  padding-top: var(--space-3);
+}
+
+@media (min-width: 640px) {
+  .scoreboard .card-note {
+    padding-left: var(--space-5);
+    padding-right: var(--space-5);
+  }
+
+  .scoreboard-table tr.scoreboard-final td {
+    border-top: 2px solid var(--line-strong);
+    background: var(--surface-2);
+  }
+}
+
+/* on a phone each model takes three lines of two figures instead of six stacked rows */
+@media (max-width: 639.98px) {
+  .table-stack.scoreboard-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: var(--space-5);
+  }
+
+  .table-stack.scoreboard-table td {
+    width: calc(50% - var(--space-5) / 2);
+  }
+
+  .table-stack.scoreboard-table td.primary {
+    width: 100%;
+  }
+
+  .table-stack.scoreboard-table tr.scoreboard-final {
+    border-top: 2px solid var(--line-strong);
+    background: var(--surface-2);
   }
 }
 

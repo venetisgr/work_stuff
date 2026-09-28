@@ -87,7 +87,7 @@
       </div>
       {% if ideas %}
       <div class="ideas-list ideas-compact">
-        {% for opp in ideas %}{{ parts.idea_row(opp) }}{% endfor %}
+        {% for opp in ideas %}{{ parts.idea_row(opp, lines=debate_lines) }}{% endfor %}
       </div>
       {% else %}
       <p class="card-note muted">The scanner hasn't analysed {{ symbol }} yet.</p>

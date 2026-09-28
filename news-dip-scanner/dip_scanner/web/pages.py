@@ -14,6 +14,7 @@ rest is shown.
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable, Hashable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field, replace
@@ -28,13 +29,28 @@ from ..accounts import AccountError, User
 from ..config import ScannerConfig
 from ..detect import dip_reasons
 from ..fx import main_currency, same_money
-from ..models import VERDICTS, Article, Impact, Opportunity, PriceBar, PriceStats, Split, utc
+from ..models import (
+    VERDICTS,
+    Analysis,
+    Article,
+    Debate,
+    Impact,
+    Opportunity,
+    Participant,
+    PriceBar,
+    PriceStats,
+    Split,
+    utc,
+)
+from ..notices import provider_name
 from ..pipeline import THESIS_DROP_POINTS, THESIS_WINDOW
 from ..prices import PriceError, PriceFetchError
 from ..recipients import preferred_symbols
-from ..report import superseded_by, verdict_label
+from ..report import debate_line, format_price, model_display_name, superseded_by, verdict_label
 from ..symbols import current_symbol, symbol_aliases
 from ..track import (
+    FINAL_ROW,
+    HORIZON_DAYS,
     STATUS_LABELS,
     Outcome,
     benchmark_for,
@@ -408,6 +424,174 @@ def index_name(symbol: str | None) -> str:
     return INDEX_NAMES.get(symbol or "", symbol or "the index")
 
 
+# --- the debate behind an idea -------------------------------------------------------------------------------------
+
+AGREEMENT_BADGES = {"high": "badge-ok", "medium": "badge-warn", "low": "badge-bad"}
+_ROUND_WORDS = {1: "once", 2: "twice"}
+_MODEL_LABEL = re.compile(r"(?<![\w:/])(?:openai|anthropic|azure):[A-Za-z0-9][\w.\-]*")
+
+
+@dataclass(frozen=True)
+class Figure:
+    """One figure of a debater's position as the page shows it: its opening and its final value."""
+
+    label: str
+    opening: str
+    final: str
+
+    @property
+    def changed(self) -> bool:
+        return self.opening != self.final
+
+
+@dataclass(frozen=True)
+class DebateSide:
+    """One debater on the idea page: its final position (next to its opening when a rebuttal ran), its critique of
+    the other and what it accepted from it."""
+
+    participant: Participant
+    name: str  # "GPT-5" (with its service when both debaters would read the same)
+    provider: str  # "OpenAI"
+    other: str | None  # the other debater's name; None when it stood alone
+    favoured: bool  # the judge found its case stronger
+    compare: bool  # a rebuttal ran: the opening is shown next to the final
+    figures: list[Figure]
+
+    @property
+    def verdict_changed(self) -> bool:
+        return self.compare and self.participant.opening.verdict != self.participant.final.verdict
+
+
+@dataclass(frozen=True)
+class DebateView:
+    """What the idea page's debate card shows (debate_view)."""
+
+    debate: Debate
+    title: str  # the card's heading
+    how: str | None  # how it went, in a sentence; None when one model stood alone (the callout says so)
+    reason: str | None  # debate.reason with its "provider:model" labels as model names
+    line: str | None  # report.debate_line, for the idea's headline figures
+    sides: list[DebateSide]  # in LLM_DEBATERS order
+    ruling_title: str | None  # the heading of the outcome's box; None when one model stood alone
+    judge_note: str | None  # whose case the judge favoured and what it knew; None without a judge
+    agreement_badge: str  # the badge class of debate.agreement
+
+
+def position_figures(opening: Analysis, final: Analysis, currency: str) -> list[Figure]:
+    """A debater's chance up, target, entry, potential low and confidence, opening and final, as shown (highest level
+    first, like the levels card)."""
+
+    def cells(analysis: Analysis) -> tuple[str, ...]:
+        return (
+            f"{analysis.probability_up_6m}%",
+            format_price(analysis.target_price, currency),
+            format_price(analysis.entry_price, currency),
+            format_price(analysis.potential_low, currency),
+            analysis.confidence.capitalize(),
+        )
+
+    labels = ("Chance up", "Target", "Entry", "Potential low", "Confidence")
+    return [
+        Figure(label, before, after) for label, before, after in zip(labels, cells(opening), cells(final), strict=True)
+    ]
+
+
+def debater_names(debate: Debate) -> dict[str, str]:
+    """ "provider:model" -> the name the page uses: "GPT-5", or "GPT-5 (Azure AI Foundry)" when both debaters' models
+    would read the same."""
+    models = [side.model for side in debate.participants]
+    plain = {model: model_display_name(model) for model in models}
+    clash = len(set(plain.values())) < len(set(models))
+    return {model: f"{name} ({provider_name(model)})" if clash else name for model, name in plain.items()}
+
+
+def readable_reason(text: str | None) -> str | None:
+    """A debate's reason as a sentence, with its "provider:model" labels as model names: "anthropic:claude-sonnet-5
+    failed, so openai:gpt-5 analysed it alone: no credit" -> "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no
+    credit."."""
+    text = " ".join((text or "").split())
+    if not text:
+        return None
+    text = _MODEL_LABEL.sub(lambda match: model_display_name(match.group(0)), text)
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _how(debate: Debate, names: list[str], judge: str | None) -> str | None:
+    """How the debate went, in a sentence (None for a lone model: its callout says what happened)."""
+    both = " and ".join(names)
+    if debate.mode == "single":
+        return None
+    if debate.mode == "agreed":
+        return f"{both} analysed it separately and agreed, so no rebuttal or judge was needed."
+    rounds = debate.rounds
+    argued = f"answered each other {_ROUND_WORDS.get(rounds, f'in {rounds} rounds')}" if rounds else ""
+    if judge is None:
+        return f"{both} analysed it separately{f' and {argued}' if argued else ''}, but the judge failed."
+    if argued:
+        return f"{both} analysed it separately, {argued}, and {judge} ruled."
+    return f"{both} analysed it separately, and {judge} ruled on their analyses without a rebuttal."
+
+
+def debate_view(opp: Opportunity) -> DebateView | None:
+    """The idea page's debate card, or None for a single model's analysis (and records from before debates)."""
+    debate = opp.debate
+    if debate is None or not debate.participants:
+        return None
+    names = debater_names(debate)
+    compare = debate.mode == "debate" and debate.rounds > 0
+    sides = []
+    for side in debate.participants:
+        others = [names[other.model] for other in debate.participants if other is not side]
+        sides.append(
+            DebateSide(
+                participant=side,
+                name=names[side.model],
+                provider=provider_name(side.model),
+                other=others[0] if others else None,
+                favoured=debate.favoured is not None and debate.favoured == side.model,
+                compare=compare,
+                figures=position_figures(side.opening, side.final, opp.currency),
+            )
+        )
+    judge = names.get(debate.judge, model_display_name(debate.judge)) if debate.judge else None
+    ruling_title = None
+    judge_note = None
+    if debate.mode == "agreed":
+        ruling_title = "The merged analysis"
+    elif debate.mode == "debate" and judge is None:
+        ruling_title = "Merged by rule, without a judge"
+    elif debate.mode == "debate":
+        ruling_title = f"The ruling by {judge}"
+        favoured = names.get(debate.favoured, model_display_name(debate.favoured)) if debate.favoured else None
+        own = debate.judge in names
+        judge_note = (
+            (f"It found {favoured}'s case stronger. " if favoured else "It favoured neither side. ")
+            + "It saw the two only as Analyst A and Analyst B"
+            + (", so it couldn't tell which one was its own model." if own else ", without their names.")
+        )
+    return DebateView(
+        debate=debate,
+        title="The models" if debate.mode == "single" else "The debate",
+        how=_how(debate, [names[side.model] for side in debate.participants], judge),
+        reason=readable_reason(debate.reason),
+        line=debate_line(opp),
+        sides=sides,
+        ruling_title=ruling_title,
+        judge_note=judge_note,
+        agreement_badge=AGREEMENT_BADGES.get(debate.agreement or "", "badge-outline"),
+    )
+
+
+def debate_lines(opps: Sequence[Opportunity]) -> dict[int | None, str]:
+    """The one-line debate of every debated idea (report.debate_line), by id, for the lists of ideas."""
+    lines = {}
+    for opp in opps:
+        line = debate_line(opp)
+        if line:
+            lines[opp.id] = line
+    return lines
+
+
 # --- thesis changes ------------------------------------------------------------------------------------------------
 
 
@@ -478,13 +662,15 @@ def dashboard(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Response:
     page = paginate(len(ideas), query.get("page"), PAGE_SIZE)
     currency = user.settings.currency
     narrowed = any(value for value in (min_score, verdict, only_watchlist, only_rules)) or sort != "score"
+    shown = page.slice(ideas)
     return render(
         request,
         "pages/dashboard.html",
         {
             "status": ctx.control.status(now=now),
             "calls_today": sum(row.calls for row in ctx.store.model_usage(since=_utc_midnight(now))),
-            "ideas": [opp.in_currency(currency) for opp in page.slice(ideas)],
+            "ideas": [opp.in_currency(currency) for opp in shown],
+            "debate_lines": debate_lines(shown),
             "page": page,
             "counts": counts,
             "total": total,
@@ -535,6 +721,8 @@ def idea(request: Request, opportunity_id: int, user: auth.SignedIn, ctx: auth.C
             "opp": view,
             "newer": newest if newest.id != opp.id else None,
             "history": [item.in_currency(currency) for item in history],
+            "debate_lines": debate_lines(history),
+            "debate": debate_view(view),
             "ladder": ladder(opp),
             "prices": prices,
             "outcome": prices.outcome,
@@ -649,6 +837,7 @@ def ticker(request: Request, symbol: str, user: auth.SignedIn, ctx: auth.Ctx) ->
             "chart_caption": caption,
             "dip_rules": ctx.config.dip,
             "ideas": [opp.in_currency(currency) for opp in ideas],
+            "debate_lines": debate_lines(ideas),
             "news": news,
             "news_days": TICKER_NEWS_DAYS,
             "preferred": preferred.get(wanted),
@@ -877,6 +1066,30 @@ def _ideas(count: int) -> str:
     return f"{count} idea{'s' if count != 1 else ''}"
 
 
+def scoreboard_rows(summary: dict) -> list[dict[str, Any]]:
+    """The debate's model scoreboard (track.model_scoreboard) with each model's service ("OpenAI"; None for the row
+    of the debate's outcome); [] when no idea was debated."""
+    return [
+        {**row, "provider": None if row.get("model") == FINAL_ROW else provider_name(str(row.get("model") or ""))}
+        for row in summary.get("scoreboard") or []
+    ]
+
+
+def next_scored(outcomes: Sequence[Outcome], today: date) -> date | None:
+    """About when the next debated idea gets its 6-month result (its signal day + 6 months), or None when none is
+    due from today on."""
+    due = [
+        signal_day(outcome.opportunity) + timedelta(days=HORIZON_DAYS)
+        for outcome in outcomes
+        if outcome.opportunity.debate is not None
+        and outcome.opportunity.debate.participants
+        and not outcome.price_mismatch
+        and outcome.up_after_6m is None
+    ]
+    upcoming = [day for day in due if day >= today]
+    return min(upcoming) if upcoming else None
+
+
 def _group_rows(summary: dict) -> tuple[list[tuple[str, dict]], list[tuple[str, dict]]]:
     by_verdict = [(verdict_label(verdict), group) for verdict, group in (summary.get("by_verdict") or {}).items()]
     by_score = [(label, group) for label, group in (summary.get("by_score") or {}).items() if group.get("count")]
@@ -907,6 +1120,8 @@ def track(request: Request, user: auth.SignedIn, ctx: auth.Ctx) -> Response:
         {
             "record": record,
             "summary": record.summary,
+            "scoreboard": scoreboard_rows(record.summary),
+            "next_scored": next_scored(record.outcomes, utc(now).date()),
             "rows": rows,
             "page": page,
             "stored": len(opps),

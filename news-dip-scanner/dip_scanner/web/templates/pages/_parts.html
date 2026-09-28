@@ -13,9 +13,10 @@
 {% if whole %}<span class="nowrap">{{ part }} of {{ whole }} <span class="muted">({{ (part / whole * 100)|percent }})</span></span>{% else %}–{% endif %}
 {%- endmacro %}
 
-{#- One idea in a list: score, ticker, verdict, company, entry and upside, chance up, age. counts: analyses per
-    ticker (or {}), watchlist: the reader's symbols, matching: ids of ideas that pass the reader's alert rules. -#}
-{% macro idea_row(opp, counts={}, watchlist=(), matching=(), current=none) -%}
+{#- One idea in a list: score, ticker, verdict, company, entry and upside, chance up, age, and the debate in one line
+    when two models argued over it. counts: analyses per ticker (or {}), watchlist: the reader's symbols, matching:
+    ids of ideas that pass the reader's alert rules, lines: pages.debate_lines (id -> the debate's line). -#}
+{% macro idea_row(opp, counts={}, watchlist=(), matching=(), current=none, lines={}) -%}
 <a class="idea-row{% if current is not none and opp.id == current %} is-current{% endif %}" href="/ideas/{{ opp.id }}"{% if current is not none and opp.id == current %} aria-current="page"{% endif %}>
   {{ ui.score_badge(opp.score) }}
   <span class="idea-main">
@@ -28,7 +29,14 @@
     <span class="idea-chance-label">up in 6m</span>
     <span class="idea-age">{{ ui.time(opp.created) }}</span>
   </span>
+  {% if lines.get(opp.id) %}{{ debate_line(lines[opp.id]) }}{% endif %}
 </a>
+{%- endmacro %}
+
+{#- A debate in one line ("GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)", report.debate_line) with a
+    small mark of two overlapping models in front. -#}
+{% macro debate_line(text) -%}
+<span class="debate-line"><svg class="debate-mark" viewBox="0 0 16 12" width="16" height="12" aria-hidden="true" focusable="false"><circle class="debate-mark-a" cx="5" cy="6" r="3.5"/><circle class="debate-mark-b" cx="11" cy="6" r="3.5"/></svg><span><span class="visually-hidden">Debate: </span>{{ text }}</span></span>
 {%- endmacro %}
 
 {#- Add a ticker to the reader's watchlist, or take it off. -#}

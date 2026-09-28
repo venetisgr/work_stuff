@@ -1,9 +1,92 @@
 {#- One idea (GET /ideas/<id>): pages.idea. opp is the reader's view (≈ amounts in their currency). On a phone the
     cards stack in reading order (the order-* classes); on a wide screen the analysis runs on the left and the
-    levels, outcome and other analyses on the right. -#}
+    levels, outcome and other analyses on the right. debate: pages.debate_view, None for a single model's analysis. -#}
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
 {% import "pages/_parts.html" as parts with context %}
+
+{#- One debater (pages.DebateSide): its final position, next to its opening with the changes marked when a rebuttal
+    ran, its critique of the other and what it accepted. number: 1 or 2, for the heading's id. -#}
+{% macro debate_side(side, number, judged) -%}
+{% set p = side.participant %}
+<article class="debate-side{% if side.favoured %} is-favoured{% endif %}" aria-labelledby="debater-{{ number }}">
+  <header class="debate-side-head">
+    {% if judged %}<span class="analyst-mark" aria-hidden="true">{{ p.label }}</span>{% endif %}
+    <span class="debate-who">
+      <h3 id="debater-{{ number }}">{{ side.name }}</h3>
+      <span class="debate-provider">{{ side.provider }}{% if judged %} · Analyst {{ p.label }}{% endif %}</span>
+    </span>
+  </header>
+  {% if side.favoured or (side.compare and p.changed_mind) %}
+  <p class="cluster debate-tags">{% if side.favoured %}<span class="badge badge-info">Favoured by the judge</span>{% endif %}{% if side.compare and p.changed_mind %}<span class="badge badge-outline">Changed its mind</span>{% endif %}</p>
+  {% endif %}
+  <p class="debate-verdict">
+    {% if side.verdict_changed %}<span class="visually-hidden">Opening verdict: </span><s class="was">{{ p.opening.verdict|verdict }}</s><span class="debate-arrow" aria-hidden="true">→</span><span class="visually-hidden">final verdict: </span>{% endif %}
+    {{ ui.verdict_badge(p.final.verdict) }}
+  </p>
+  <table class="debate-figures{% if side.compare %} is-compared{% endif %}">
+    <caption class="visually-hidden">{{ side.name }}: {{ "opening and final position" if side.compare else "its position" }}</caption>
+    {% if side.compare %}
+    <thead><tr><th scope="col"><span class="visually-hidden">Figure</span></th><th scope="col">Opening</th><th scope="col">Final</th></tr></thead>
+    {% endif %}
+    <tbody>
+      {% for figure in side.figures %}
+      {% set changed = side.compare and figure.changed %}
+      <tr{% if changed %} class="is-changed"{% endif %}>
+        <th scope="row">{{ figure.label }}</th>
+        {% if side.compare %}<td class="num was">{% if changed %}<s>{{ figure.opening }}</s>{% else %}{{ figure.opening }}{% endif %}</td>{% endif %}
+        <td class="num">{% if changed %}<mark>{{ figure.final }}</mark><span class="visually-hidden"> (changed)</span>{% else %}{{ figure.final }}{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% if p.critique %}
+  <div class="debate-points is-critique">
+    <h4>Its critique{% if side.other %} of {{ side.other }}{% endif %}</h4>
+    <ul>{% for point in p.critique[:5] %}<li>{{ point }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+  {% if p.concessions %}
+  <div class="debate-points is-concession">
+    <h4>What it accepts{% if side.other %} from {{ side.other }}{% endif %}</h4>
+    <ul>{% for point in p.concessions[:5] %}<li>{{ point }}</li>{% endfor %}</ul>
+  </div>
+  {% endif %}
+</article>
+{%- endmacro %}
+
+{#- The debate card (view: pages.DebateView): how it went, the two models side by side (one after the other on a
+    phone), then the ruling or the merged analysis, which is the idea's own analysis (opp). -#}
+{% macro debate_card(view, opp) -%}
+{% set d = view.debate %}
+{% set a = opp.analysis %}
+<section class="card order-3 debate-card" id="debate" aria-labelledby="debate-title">
+  <div class="card-header">
+    <h2 id="debate-title">{{ view.title }}</h2>
+    {% if d.agreement %}<span class="badge {{ view.agreement_badge }}">{{ d.agreement|capitalize }} agreement</span>{% endif %}
+  </div>
+  {% if view.how %}<p class="small muted debate-how">{{ view.how }}</p>{% endif %}
+  {% if d.mode == "single" %}
+  <div class="callout small debate-alone" role="note">
+    <p><strong>Only {{ view.sides[0].name }} answered.</strong>{% if view.reason %} <span class="debate-reason">{{ view.reason }}</span>{% endif %}</p>
+    <p>No second model checked this analysis, so read it with more care.</p>
+  </div>
+  {% endif %}
+  <div class="debate-sides{% if view.sides|length > 1 %} is-pair{% endif %}">
+    {% for side in view.sides %}{{ debate_side(side, loop.index, d.mode == "debate") }}{% endfor %}
+  </div>
+  {% if view.ruling_title %}
+  <div class="debate-ruling">
+    <h3>{{ view.ruling_title }}</h3>
+    <p class="debate-outcome">{{ ui.verdict_badge(a.verdict) }} <span class="nowrap"><strong class="num">{{ a.probability_up_6m|percent }}</strong> chance up</span> · <span class="nowrap">target <span class="num">{{ a.target_price|price(opp.currency) }}</span></span> · <span class="nowrap">entry <span class="num">{{ a.entry_price|price(opp.currency) }}</span></span> · <span class="nowrap">low <span class="num">{{ a.potential_low|price(opp.currency) }}</span></span> · <span class="nowrap">{{ a.confidence }} confidence</span></p>
+    {% if d.summary %}<p class="debate-summary">{{ d.summary }}</p>{% endif %}
+    {% if view.judge_note %}<p class="small muted">{{ view.judge_note }}</p>{% endif %}
+    {% if d.mode == "debate" and view.reason %}<p class="small muted debate-reason">{{ view.reason }}</p>{% endif %}
+  </div>
+  {% endif %}
+</section>
+{%- endmacro %}
+
 {% block content %}
 {% set a = opp.analysis %}
 {% set here = "/ideas/" ~ opp.id %}
@@ -37,6 +120,7 @@
     <div class="stat stat-hero">
       <span class="stat-value">{{ a.probability_up_6m|percent }}</span>
       <span class="stat-label">chance of being higher in 6 months</span>
+      {% if debate and debate.line %}{{ parts.debate_line(debate.line) }}{% endif %}
     </div>
     <div class="stat">
       <span class="stat-label">Price at the analysis</span>
@@ -70,16 +154,18 @@
       {{ parts.chart_figure(prices.chart, prices.problem, caption="Dashed and dotted lines: this idea's levels (their key is in Levels). The dot on the Reported line marks the report.", note=prices.split_note) }}
     </section>
 
-    <section class="card order-4 prose" aria-labelledby="analysis-title">
+    {% if debate %}{{ debate_card(debate, opp) }}{% endif %}
+
+    <section class="card order-5 prose" aria-labelledby="analysis-title">
       <h2 id="analysis-title">The analysis</h2>
       {% if a.fear %}<h3>What the market fears</h3><p>{{ a.fear }}</p>{% endif %}
       {% if a.fundamental_impact %}<h3>Fundamental impact</h3><p>{{ a.fundamental_impact }}</p>{% endif %}
       {% if a.thesis %}<h3>Thesis</h3><p>{{ a.thesis }}</p>{% endif %}
-      <p class="small muted">By {{ opp.model or "an unknown model" }}, with prices as of {{ opp.stats.as_of|when }}. A language model's reading of the news: check it before you act.</p>
+      <p class="small muted">{% if debate and debate.debate.mode != "single" %}The outcome of the debate above ({{ opp.model }}){% else %}By {{ opp.model or "an unknown model" }}{% endif %}, with prices as of {{ opp.stats.as_of|when }}. {{ "Language models' reading" if debate and debate.debate.mode != "single" else "A language model's reading" }} of the news: check it before you act.</p>
     </section>
 
     {% if a.risks or a.catalysts or a.checks %}
-    <section class="card order-5 point-lists" aria-labelledby="points-title">
+    <section class="card order-6 point-lists" aria-labelledby="points-title">
       <h2 class="visually-hidden" id="points-title">Checks, risks and catalysts</h2>
       {% if a.checks %}
       <div class="point-list point-checks">
@@ -102,7 +188,7 @@
     </section>
     {% endif %}
 
-    <section class="card order-6" aria-labelledby="flagged-title">
+    <section class="card order-7" aria-labelledby="flagged-title">
       <h2 id="flagged-title">Why it was flagged</h2>
       {% if opp.dip_reasons %}<p>The price: {{ opp.dip_reasons|join("; ") }}.</p>{% endif %}
       {% if opp.news_after_session %}<p class="callout callout-info small">All of this news came out after the last session in the price data: the price hadn't reacted to it yet when this was analysed.</p>{% endif %}
@@ -149,7 +235,7 @@
       <p class="small muted">The potential low is an estimate, not a floor; the statistical low is where the price is 1 in 20 times after 6 months.</p>
     </section>
 
-    <section class="card order-3" aria-labelledby="outcome-title">
+    <section class="card order-4" aria-labelledby="outcome-title">
       <div class="card-header">
         <h2 id="outcome-title">Outcome so far</h2>
         {% if outcome and outcome.priced and not outcome.price_mismatch %}<span class="badge {{ status_badges.get(outcome.status, 'badge-outline') }}">{{ status_labels.get(outcome.status, outcome.status)|capitalize }}</span>{% endif %}
@@ -179,14 +265,14 @@
       {% for note in prices.notes %}<p class="small muted">{{ note }}</p>{% endfor %}
     </section>
 
-    <section class="card card-flush order-7" aria-labelledby="history-title">
+    <section class="card card-flush order-8" aria-labelledby="history-title">
       <div class="card-header">
         <h2 id="history-title">Analyses of {{ opp.ticker }}</h2>
         <span class="small muted">{{ history|length|plural("analysis", "analyses") }}</span>
       </div>
       <div class="ideas-list ideas-compact">
         {% for item in history %}
-        {{ parts.idea_row(item, current=opp.id) }}
+        {{ parts.idea_row(item, current=opp.id, lines=debate_lines) }}
         {% endfor %}
       </div>
     </section>

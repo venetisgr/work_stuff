@@ -15,14 +15,14 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
-from conftest import make_analysis, make_article, make_bars, make_impact, make_opportunity, make_stats
+from conftest import make_analysis, make_article, make_bars, make_debate, make_impact, make_opportunity, make_stats
 from fastapi.testclient import TestClient
 
 from dip_scanner import accounts as accounts_module
 from dip_scanner.config import DATABASE_NAME, ScannerConfig, Settings, UniverseConfig, WebSettings
 from dip_scanner.models import PriceBar, Split
 from dip_scanner.prices import PriceError, PriceFetchError
-from dip_scanner.track import BENCHMARKS, DEFAULT_BENCHMARK, EUROPE_BENCHMARK
+from dip_scanner.track import BENCHMARKS, DEFAULT_BENCHMARK, EUROPE_BENCHMARK, HORIZON_DAYS, signal_day
 from dip_scanner.web import pages
 from dip_scanner.web.app import create_app
 from dip_scanner.web.jobs import InlineExecutor
@@ -496,6 +496,234 @@ def test_untrusted_text_on_the_idea_page_is_escaped(site):
     assert "javascript:" not in page
 
 
+# --- the debate behind an idea -------------------------------------------------------------------------------------
+
+JUDGED_MODEL = "debate: gpt-5 vs claude-sonnet-5, judged by claude-sonnet-5"
+
+
+def debate_card(page: str) -> str:
+    """The debate card of an idea page."""
+    start = page.index('<section class="card order-3 debate-card" id="debate"')
+    return page[start : page.index("</section>", start)]
+
+
+def debater(card: str, number: int) -> str:
+    """The number-th debater's column of a debate card (1 or 2)."""
+    start = card.index(f'aria-labelledby="debater-{number}"')
+    return card[start : card.index("</article>", start)]
+
+
+def agreed_debate(**overrides):
+    """Two openings that agreed: merged without a rebuttal or a judge (each final is its opening)."""
+    sides = [
+        replace(side, final=side.opening, critique=[], concessions=[], changed_mind=False)
+        for side in make_debate().participants
+    ]
+    values = {
+        "mode": "agreed",
+        "rounds": 0,
+        "participants": sides,
+        "judge": None,
+        "favoured": None,
+        "agreement": "high",
+        "summary": "Both analysts called it Temporary fear with close numbers, so their analyses were merged.",
+    }
+    return make_debate(**{**values, **overrides})
+
+
+def lone_debate(**overrides):
+    """GPT-5 alone: Claude Sonnet 5 failed."""
+    gpt = make_debate().participants[0]
+    values = {
+        "mode": "single",
+        "rounds": 0,
+        "participants": [replace(gpt, final=gpt.opening, critique=[], concessions=[], changed_mind=False)],
+        "judge": None,
+        "favoured": None,
+        "agreement": None,
+        "summary": None,
+        "reason": "anthropic:claude-sonnet-5 failed, so openai:gpt-5 analysed it alone: no credit left",
+    }
+    return make_debate(**{**values, **overrides})
+
+
+def test_the_idea_page_shows_a_judged_debate(site):
+    opp = site.add(
+        debate=make_debate(),
+        analysis=make_analysis(verdict="mixed", probability_up_6m=64, target_price=165.0),
+        model=JUDGED_MODEL,
+    )
+    page = site.client().get(f"/ideas/{opp.id}").text
+    card = debate_card(page)
+    assert '<h2 id="debate-title">The debate</h2>' in card
+    assert '<span class="badge badge-warn">Medium agreement</span>' in card
+    how = "GPT-5 and Claude Sonnet 5 analysed it separately, answered each other once, and Claude Sonnet 5 ruled."
+    assert how in card
+    # in LLM_DEBATERS order, each with the label the judge saw
+    gpt, claude = debater(card, 1), debater(card, 2)
+    assert '<h3 id="debater-1">GPT-5</h3>' in gpt and "OpenAI · Analyst B" in gpt
+    assert '<h3 id="debater-2">Claude Sonnet 5</h3>' in claude and "Anthropic · Analyst A" in claude
+    assert '<article class="debate-side is-favoured"' in card and "Favoured by the judge" in gpt
+    assert "Favoured by the judge" not in claude
+    assert "Changed its mind" in gpt and "Changed its mind" not in claude
+    # opening -> final: what changed is struck through and marked
+    assert '<s class="was">Temporary fear</s>' in gpt and "Mixed</span>" in gpt
+    assert "<s>72%</s>" in gpt and "<mark>66%</mark>" in gpt
+    assert "<s>$118.00</s>" in gpt and "<mark>$115.00</mark>" in gpt
+    assert "<s>" not in claude and "<mark>" not in claude and "58%" in claude  # it kept its position
+    assert '<th scope="col">Opening</th><th scope="col">Final</th>' in gpt
+    # each side's critique of the other and what it accepts
+    assert "Its critique of Claude Sonnet 5" in gpt and "Uses a revenue figure the input doesn&#39;t give" in gpt
+    assert "<li>4th</li>" in gpt  # up to 5 points, all of them here
+    assert "What it accepts from Claude Sonnet 5" in gpt and "The guidance cut is real" in gpt
+    assert "Its critique of GPT-5" in claude and "Too optimistic about the recovery" in claude
+    assert "What it accepts" not in claude
+    # then the ruling: the idea's own analysis
+    ruling = card[card.index('<div class="debate-ruling">') :]
+    assert "<h3>The ruling by Claude Sonnet 5</h3>" in ruling
+    assert "64%</strong> chance up</span>" in ruling and 'target <span class="num">$165.00</span>' in ruling
+    assert "They agree the drop is partly sentiment; the crux is the guidance cut" in ruling
+    assert "It found GPT-5&#39;s case stronger." in ruling
+    assert "so it couldn&#39;t tell which one was its own model." in ruling
+    # the headline figures carry the debate in one line, and the analysis says whose it is
+    start = page.index('<header class="card idea-hero">')
+    hero = page[start : page.index("</header>", start)]
+    assert "GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)" in hero
+    assert f"The outcome of the debate above ({JUDGED_MODEL})" in page
+    # on a phone the card comes after the chart, before the outcome and the analysis
+    assert page.index('id="chart-title"') < page.index('id="debate-title"') < page.index('id="outcome-title"')
+    assert 'class="card order-4" aria-labelledby="outcome-title"' in page
+
+
+def test_the_debate_card_shows_at_most_five_points_a_side(site):
+    debate = make_debate()
+    gpt = replace(debate.participants[0], critique=[f"point {n}" for n in range(1, 8)])
+    opp = site.add(debate=replace(debate, participants=[gpt, debate.participants[1]]))
+    card = debate_card(site.client().get(f"/ideas/{opp.id}").text)
+    assert "<li>point 5</li>" in card and "point 6" not in card
+
+
+def test_an_agreed_debate_shows_the_merged_analysis(site):
+    opp = site.add(debate=agreed_debate(), model="debate: gpt-5 vs claude-sonnet-5, agreed")
+    page = site.client().get(f"/ideas/{opp.id}").text
+    card = debate_card(page)
+    assert '<span class="badge badge-ok">High agreement</span>' in card
+    assert "GPT-5 and Claude Sonnet 5 analysed it separately and agreed, so no rebuttal or judge was needed." in card
+    assert "Opening</th>" not in card and "<s>" not in card and "<mark>" not in card  # no rebuttal: nothing changed
+    assert "Analyst A" not in card and "analyst-mark" not in card  # no judge saw them
+    assert "Changed its mind" not in card and "Favoured by the judge" not in card
+    assert "<h3>The merged analysis</h3>" in card and "so their analyses were merged.</p>" in card
+    assert "The ruling" not in card and "It found" not in card
+    assert "GPT-5 72% · Claude Sonnet 5 58% → 68% (agreed)" in page
+
+
+def test_a_debate_without_rebuttals_goes_straight_to_the_judge(site):
+    sides = agreed_debate().participants
+    opp = site.add(debate=make_debate(rounds=0, participants=sides))
+    card = debate_card(site.client().get(f"/ideas/{opp.id}").text)
+    assert "GPT-5 and Claude Sonnet 5 analysed it separately, and Claude Sonnet 5 ruled on their analyses" in card
+    assert "Opening</th>" not in card and "<h3>The ruling by Claude Sonnet 5</h3>" in card
+    assert "Analyst B" in card  # the judge still saw them as A and B
+
+
+def test_a_failed_judge_leaves_a_merge_by_rule(site):
+    debate = make_debate(
+        judge=None,
+        favoured=None,
+        rounds=2,
+        summary="The judge wasn't available, so the two final positions were merged by rule: Mixed, 62% chance up.",
+        reason="The judge anthropic:claude-sonnet-5 failed: the request timed out",
+    )
+    opp = site.add(debate=debate, model="debate: gpt-5 vs claude-sonnet-5, merged without a judge")
+    page = site.client().get(f"/ideas/{opp.id}").text
+    card = debate_card(page)
+    assert "analysed it separately and answered each other twice, but the judge failed." in card
+    assert "<h3>Merged by rule, without a judge</h3>" in card
+    assert "The judge Claude Sonnet 5 failed: the request timed out.</p>" in card  # names, not provider labels
+    assert "<mark>66%</mark>" in card and "Changed its mind" in card  # the rebuttal still ran
+    assert "Favoured by the judge" not in card and "It found" not in card
+    assert "(medium agreement, no judge)" in page
+
+
+def test_when_one_model_failed_the_other_stands_alone(site):
+    opp = site.add(debate=lone_debate(), model="gpt-5 alone (claude-sonnet-5 unavailable)")
+    page = site.client().get(f"/ideas/{opp.id}").text
+    card = debate_card(page)
+    assert '<h2 id="debate-title">The models</h2>' in card and "agreement</span>" not in card
+    assert "<strong>Only GPT-5 answered.</strong>" in card
+    assert "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no credit left." in card
+    assert "No second model checked this analysis, so read it with more care." in card
+    assert card.count("<article") == 1 and "debate-sides is-pair" not in card
+    assert "Opening</th>" not in card and "72%" in card
+    assert "debate-ruling" not in card and "Analyst A" not in card
+    assert "GPT-5 alone: 68% (the other model failed)" in page
+    assert "By gpt-5 alone (claude-sonnet-5 unavailable)" in page
+
+
+def test_single_model_ideas_have_no_debate_card(site):
+    plain = site.add()  # LLM_ANALYSIS_MODE=single, and every record from before debates
+    page = site.client().get(f"/ideas/{plain.id}").text
+    assert 'id="debate"' not in page and "debate-line" not in page and "By fake-model" in page
+    empty = site.add(debate=make_debate(participants=[]))  # a stored debate that lost its participants
+    assert 'id="debate"' not in site.client().get(f"/ideas/{empty.id}").text
+
+
+def test_model_text_in_the_debate_is_escaped(site):
+    evil = "<script>alert(1)</script>"
+    image = '<img src=x onerror="alert(2)">'
+    debate = make_debate(
+        summary=f"Summary {evil}",
+        reason=f"Reason {image}",
+        judge=f"anthropic:{image}",
+        favoured=f"anthropic:{image}",
+    )
+    gpt, claude = debate.participants
+    gpt = replace(gpt, critique=[f"Critique {evil}"], concessions=[f"Concession {image}"])
+    claude = replace(claude, model=f"anthropic:{image}", critique=["[x](javascript:alert(3))"])
+    opp = site.add(
+        debate=replace(debate, participants=[gpt, claude]),
+        analysis=make_analysis(probability_up_6m=64),
+        model=f"debate: gpt-5 vs {image}",
+    )
+    client = site.client()
+    for page in (client.get(f"/ideas/{opp.id}").text, client.get("/").text):
+        assert evil not in page and image not in page and "<img" not in page
+    page = client.get(f"/ideas/{opp.id}").text
+    assert "Summary &lt;script&gt;alert(1)&lt;/script&gt;" in page
+    assert "Critique &lt;script&gt;" in page and "Concession &lt;img src=x onerror=&#34;alert(2)&#34;&gt;" in page
+    assert '<h3 id="debater-2">&lt;img src=x onerror=&#34;alert(2)&#34;&gt;</h3>' in page
+    assert "The ruling by &lt;img" in page and "Its critique of &lt;img" in page
+    assert "<li>[x](javascript:alert(3))</li>" in page  # text, never a link
+    assert 'href="javascript' not in page
+
+
+def test_idea_lists_show_the_debate_in_one_line(seeded):
+    site, ids = seeded
+    debated = site.add(
+        ticker="SAP.DE",
+        company="SAP SE",
+        created=NOW - timedelta(minutes=30),
+        price=190.0,
+        currency="EUR",
+        stats=make_stats(ticker="SAP.DE", price=190.0, currency="EUR", name="SAP SE", exchange="XETRA"),
+        analysis=make_analysis(probability_up_6m=64, potential_low=160.0, entry_price=180.0, target_price=225.0),
+        debate=make_debate(),
+        model=JUDGED_MODEL,
+    )
+    line = "GPT-5 66% · Claude Sonnet 5 58% → 64% (medium agreement)"
+    client = site.client()
+    dashboard = client.get("/").text
+    assert dashboard.count('<span class="debate-line">') == 1  # the other ideas had one model
+    row = dashboard[dashboard.index(f'href="/ideas/{debated.id}"') :]
+    row = row[: row.index("</a>")]
+    assert f'<span class="visually-hidden">Debate: </span>{line}</span>' in row
+    assert 'class="debate-mark"' in row and 'aria-hidden="true"' in row
+    ticker = client.get("/tickers/SAP.DE").text
+    assert ticker.count(line) == 1
+    history = client.get(f"/ideas/{ids['sap']}").text  # the older idea lists the newer, debated one
+    assert history.count(line) == 1 and 'id="debate"' not in history
+
+
 # --- a ticker ------------------------------------------------------------------------------------------------------
 
 
@@ -710,6 +938,57 @@ def test_the_track_record(tmp_path):
     assert re.search(r'data-label="In EUR">\s*<span class="num (up|down)">[+-]\d', page)
 
 
+def scoreboard_on(page: str) -> str:
+    start = page.index('aria-labelledby="scoreboard-title"')
+    return page[start : page.index("</section>", start)]
+
+
+def scoreboard_row(board: str, label: str) -> list[str]:
+    """The cells of a scoreboard row after its model cell, as text."""
+    row = board[board.index(f"<strong>{label}</strong>") :]
+    row = row[: row.index("</tr>")]
+    return [re.sub(r"<[^>]+>", "", cell).strip() for cell in re.findall(r'data-label="[^"]+">(.*?)</td>', row)]
+
+
+def test_the_track_record_scores_the_debating_models(site):
+    old = NOW - timedelta(days=200)  # 6 months of results: AMD rose from about 141 to 149, so it was higher
+    site.add(
+        created=old, stats=make_stats(as_of=old), debate=make_debate(), analysis=make_analysis(probability_up_6m=64)
+    )
+    recent = NOW - timedelta(days=10)  # waiting for its result
+    waiting = site.add(created=recent, stats=make_stats(as_of=recent), debate=make_debate())
+    site.add(created=NOW - timedelta(days=20), stats=make_stats(as_of=NOW - timedelta(days=20)))  # one model
+    page = site.client().get("/track").text
+    board = scoreboard_on(page)
+    assert "Model scoreboard" in board and "2 debated ideas" in board
+    assert board.index("Claude Sonnet 5") < board.index("GPT-5") < board.index("After the debate")
+    assert '<strong>GPT-5</strong> <span class="small muted">OpenAI</span>' in board
+    # GPT-5: final 66% and opening 72% on a stock that was higher: (0.66 - 1)² = 0.1156, (0.72 - 1)² = 0.0784
+    assert scoreboard_row(board, "GPT-5") == ["2", "1", "0.116", "0.078", "66%", "100%"]
+    # Claude Sonnet 5 kept its 58%: (0.58 - 1)² = 0.1764 for both
+    assert scoreboard_row(board, "Claude Sonnet 5") == ["2", "1", "0.176", "0.176", "58%", "100%"]
+    # the debate's outcome, 64%: (0.64 - 1)² = 0.1296; it has no opening
+    assert scoreboard_row(board, "After the debate") == ["2", "1", "0.130", "–", "64%", "100%"]
+    due = signal_day(waiting) + timedelta(days=HORIZON_DAYS)
+    wait = f"1 more debated idea waits for 6 months of results; the next is due about {due:%a} {due.day} {due:%b %Y}."
+    assert wait in board
+
+
+def test_the_scoreboard_shows_dashes_until_six_months_have_passed(site):
+    recent = NOW - timedelta(days=10)
+    site.add(created=recent, stats=make_stats(as_of=recent), debate=lone_debate())
+    board = scoreboard_on(site.client().get("/track").text)
+    assert scoreboard_row(board, "GPT-5") == ["1", "0", "–", "–", "–", "–"]
+    assert scoreboard_row(board, "After the debate") == ["1", "0", "–", "–", "–", "–"]
+    assert "No debated idea has 6 months of results yet, so the scores show – until then; the next is due" in board
+
+
+def test_the_track_record_has_no_scoreboard_without_debates(site):
+    site.add(created=NOW - timedelta(days=10), stats=make_stats(as_of=NOW - timedelta(days=10)))
+    page = site.client().get("/track").text
+    assert "Every idea" in page and "Model scoreboard" not in page
+
+
 def test_track_prices_are_downloaded_once_an_hour(site):
     site.add(created=NOW - timedelta(days=10), stats=make_stats(as_of=NOW - timedelta(days=10)))
     client = site.client()
@@ -769,6 +1048,52 @@ def test_rule_misses_explain_why_an_idea_would_not_alert(site):
     ]
     watcher = site.accounts.update_settings(user.id, replace(user.settings, only_watchlist=True, watchlist=("SAP",)))
     assert pages.rule_misses(good, watcher, config) == ["it isn't on your watchlist, and you alert only on those"]
+
+
+def test_debater_names_tell_two_services_apart():
+    assert pages.debater_names(make_debate()) == {
+        "openai:gpt-5": "GPT-5",
+        "anthropic:claude-sonnet-5": "Claude Sonnet 5",
+    }
+    gpt, claude = make_debate().participants
+    twins = make_debate(participants=[gpt, replace(claude, model="azure:gpt-5")])
+    assert pages.debater_names(twins) == {"openai:gpt-5": "GPT-5 (OpenAI)", "azure:gpt-5": "GPT-5 (Azure AI Foundry)"}
+    view = pages.debate_view(make_opportunity(debate=replace(twins, judge="azure:gpt-5", favoured="azure:gpt-5")))
+    assert view.judge_note.startswith("It found GPT-5 (Azure AI Foundry)'s case stronger.")
+    assert [side.other for side in view.sides] == ["GPT-5 (Azure AI Foundry)", "GPT-5 (OpenAI)"]
+
+
+def test_a_judge_from_outside_the_debate_is_named_so():
+    view = pages.debate_view(make_opportunity(debate=make_debate(judge="openai:o3", favoured=None)))
+    assert view.ruling_title == "The ruling by o3"
+    assert (
+        view.judge_note
+        == "It favoured neither side. It saw the two only as Analyst A and Analyst B, without their names."
+    )
+    assert pages.debate_view(make_opportunity()) is None
+
+
+def test_readable_reasons_name_the_models():
+    assert (
+        pages.readable_reason("anthropic:claude-sonnet-5 failed, so openai:gpt-5 analysed it alone: no credit")
+        == "Claude Sonnet 5 failed, so GPT-5 analysed it alone: no credit."
+    )
+    assert pages.readable_reason("The judge azure:my-deploy failed: 429.") == "The judge my-deploy failed: 429."
+    assert pages.readable_reason("see https://x.test/openai:gpt-5 ") == "see https://x.test/openai:gpt-5."
+    assert pages.readable_reason(None) is None and pages.readable_reason("  ") is None
+
+
+def test_position_figures_mark_what_changed():
+    figures = pages.position_figures(
+        make_analysis(), make_analysis(probability_up_6m=60, confidence="low", target_price=168.004), "USD"
+    )
+    assert [(f.label, f.opening, f.final, f.changed) for f in figures] == [
+        ("Chance up", "68%", "60%", True),
+        ("Target", "$168.00", "$168.00", False),  # the same as shown
+        ("Entry", "$132.00", "$132.00", False),
+        ("Potential low", "$118.00", "$118.00", False),
+        ("Confidence", "Medium", "Low", True),
+    ]
 
 
 def test_newest_per_ticker():

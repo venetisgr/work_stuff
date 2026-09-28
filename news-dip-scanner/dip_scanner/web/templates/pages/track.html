@@ -1,4 +1,4 @@
-{#- The track record (GET /track): pages.track. -#}
+{#- The track record (GET /track): pages.track. scoreboard: pages.scoreboard_rows, [] when no idea was debated. -#}
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
 {% import "pages/_parts.html" as parts with context %}
@@ -28,6 +28,41 @@
       </tbody>
     </table>
   </div>
+</section>
+{%- endmacro %}
+
+{#- The debate's models scored against what happened (track.model_scoreboard): a row per model, then the debate's
+    outcome. A figure over nothing shows "–". -#}
+{% macro scoreboard_table(rows, next_day) -%}
+{% set waiting = rows[-1].waiting if rows else 0 %}
+{% set scored = rows[-1].scored if rows else 0 %}
+<section class="card card-flush scoreboard" aria-labelledby="scoreboard-title">
+  <div class="card-header">
+    <h2 id="scoreboard-title">Model scoreboard</h2>
+    <span class="small muted">{{ rows[-1].debates|plural("debated idea") }}</span>
+  </div>
+  <p class="card-note small muted">Each model's chance of being higher in 6 months, scored once a debated idea has 6 months of results. The Brier score is the average of (chance − outcome)², the outcome being 1 when the stock was higher and 0 when not: 0 is perfect, 0.25 is what always saying 50% scores, lower is better. “Opening” scores each model's first analysis, before any rebuttal.</p>
+  <div class="table-wrap">
+    <table class="table table-stack scoreboard-table">
+      <thead>
+        <tr><th scope="col">Model</th><th scope="col" class="num">Debates</th><th scope="col" class="num">With 6 months</th><th scope="col" class="num">Brier</th><th scope="col" class="num">Brier, opening</th><th scope="col" class="num">Said on average</th><th scope="col" class="num">Higher after 6m</th></tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+        <tr{% if not row.provider %} class="scoreboard-final"{% endif %}>
+          <td class="primary"><strong>{{ row.label }}</strong>{% if row.provider %} <span class="small muted">{{ row.provider }}</span>{% else %} <span class="small muted">the ruling or merged analysis</span>{% endif %}</td>
+          <td class="num" data-label="Debates">{{ row.debates }}</td>
+          <td class="num" data-label="With 6 months">{{ row.scored }}</td>
+          <td class="num" data-label="Brier"><strong>{{ "%.3f"|format(row.brier) if row.brier is not none else "–" }}</strong></td>
+          <td class="num" data-label="Brier, opening">{{ "%.3f"|format(row.brier_opening) if row.brier_opening is not none else "–" }}</td>
+          <td class="num" data-label="Said on average">{{ row.mean_probability|percent }}</td>
+          <td class="num" data-label="Higher after 6m">{{ row.hit_rate|percent }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if waiting %}<p class="card-note small muted scoreboard-wait">{% if not scored %}No debated idea has 6 months of results yet, so the scores show – until then{% else %}{{ waiting|plural("more debated idea waits", "more debated ideas wait") }} for 6 months of results{% endif %}{% if next_day %}; the next is due about {{ parts.day(next_day) }}{% endif %}.</p>{% endif %}
 </section>
 {%- endmacro %}
 
@@ -104,6 +139,7 @@
 <div class="stack">
   {% if by_verdict %}{{ group_table("By verdict", "Verdict", by_verdict) }}{% endif %}
   {% if by_score %}{{ group_table("By score", "Score", by_score) }}{% endif %}
+  {% if scoreboard %}{{ scoreboard_table(scoreboard, next_scored) }}{% endif %}
 
   <section class="card card-flush" aria-labelledby="outcomes-title">
     <div class="card-header"><h2 id="outcomes-title">Every idea</h2><span class="small muted">newest first</span></div>
