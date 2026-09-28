@@ -1,0 +1,139 @@
+{#- The track record (GET /track): pages.track. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% import "pages/_parts.html" as parts with context %}
+
+{% macro group_table(title, first, groups) -%}
+<section class="card card-flush" aria-label="{{ title }}">
+  <div class="card-header"><h2>{{ title }}</h2></div>
+  <div class="table-wrap">
+    <table class="table table-stack">
+      <thead>
+        <tr><th scope="col">{{ first }}</th><th scope="col" class="num">Ideas</th><th scope="col" class="num">Entry filled</th><th scope="col" class="num">Target hit</th><th scope="col" class="num">Below the low</th><th scope="col" class="num">Higher after 6m</th><th scope="col" class="num">Average return</th><th scope="col" class="num">vs index</th>{% if account %}<th scope="col" class="num">In {{ account }}</th>{% endif %}</tr>
+      </thead>
+      <tbody>
+        {% for label, group in groups %}
+        <tr>
+          <td class="primary"><strong>{{ label }}</strong></td>
+          <td class="num" data-label="Ideas">{{ group.count }}</td>
+          <td class="num" data-label="Entry filled">{{ parts.of(group.filled, group.priced) }}</td>
+          <td class="num" data-label="Target hit">{{ parts.of(group.target_hit, group.filled) }}</td>
+          <td class="num" data-label="Below the low">{{ parts.of(group.below_low, group.priced) }}</td>
+          <td class="num" data-label="Higher after 6m">{{ parts.of(group.up_after_6m, group.matured) }}</td>
+          <td class="num" data-label="Average return">{{ ui.pct(group.avg_return_pct) }}</td>
+          <td class="num" data-label="vs index">{{ ui.pct(group.avg_excess_return_pct) }}</td>
+          {% if account %}<td class="num" data-label="In {{ account }}">{{ ui.pct(group.avg_account_return_pct) }}</td>{% endif %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+{%- endmacro %}
+
+{% block content %}
+<div class="page-header">
+  <h1>Track record</h1>
+  <p class="lede">How the ideas reported since {{ since|day }} played out: their limit orders, their returns next to their exchange's index{% if account %}, and in {{ account }}{% endif %}.</p>
+</div>
+
+<nav class="segmented" aria-label="Period">
+  {% for choice in day_choices %}
+  <a href="{{ url_with(request, days=choice if choice != default_days else none, page=none) }}"{% if choice == days %} aria-current="true"{% endif %}>{{ day_labels[choice] }}</a>
+  {% endfor %}
+</nav>
+
+{% if not stored %}
+{{ ui.empty_state("No ideas since " ~ since|day, "Once the scanner has analysed some dips, this page shows how they played out.", "/track?days=" ~ day_choices[-1] if days != day_choices[-1] else none, "Look at " ~ day_labels[day_choices[-1]]) }}
+{% else %}
+
+{% if record.missing %}
+<div class="callout small" role="note"><p><strong>Left out:</strong> {% for ticker, count in record.missing %}<a class="ticker" href="/tickers/{{ ticker|urlencode }}">{{ ticker }}</a> ({{ count }}){% if not loop.last %}, {% endif %}{% endfor %}: Yahoo Finance has no prices for them (delisted, renamed or taken over?). Failed companies are often among them, so the figures below may look better than what really happened.</p></div>
+{% endif %}
+{% for problem in record.problems %}<div class="callout callout-bad small" role="note"><p>No prices just now for {{ problem }}. Try again in a few minutes.</p></div>{% endfor %}
+{% for note in record.notes %}<p class="small muted">{{ note }}</p>{% endfor %}
+{% if waiting %}<p class="small muted">{{ waiting|plural("idea has", "ideas have") }} had no trading since the report yet: shown with – and left out of the figures until the next session.</p>{% endif %}
+{% if summary.get("price_mismatch") %}<p class="small muted">{{ summary.price_mismatch|plural("idea is", "ideas are") }} left out of the figures: the price in the report doesn't match Yahoo Finance's history (probably a split Yahoo doesn't report).</p>{% endif %}
+
+{% if summary.get("count") %}
+<section class="track-tiles" aria-label="Summary">
+  <div class="card stat tile">
+    <span class="stat-label">Higher now than reported</span>
+    <span class="stat-value">{{ summary.positive_rate|percent }}</span>
+    <span class="small muted">{{ parts.of(summary.positive, summary.priced) }}</span>
+  </div>
+  <div class="card stat tile">
+    <span class="stat-label">Average return since the report</span>
+    <span class="stat-value">{{ ui.pct(summary.avg_return_pct) }}</span>
+    <span class="small muted">median {{ summary.median_return_pct|pct }}</span>
+  </div>
+  <div class="card stat tile">
+    <span class="stat-label">Versus the index</span>
+    <span class="stat-value">{{ ui.pct(summary.avg_excess_return_pct) }}</span>
+    <span class="small muted">the index made {{ summary.avg_benchmark_return_pct|pct }} on average</span>
+  </div>
+  {% if account %}
+  <div class="card stat tile">
+    <span class="stat-label">Average return in {{ account }}</span>
+    <span class="stat-value">{{ ui.pct(summary.avg_account_return_pct) }}</span>
+    <span class="small muted">exchange-rate moves included</span>
+  </div>
+  {% endif %}
+  <div class="card stat tile">
+    <span class="stat-label">Entry filled</span>
+    <span class="stat-value">{{ summary.fill_rate|percent }}</span>
+    <span class="small muted">{{ parts.of(summary.filled, summary.priced) }}</span>
+  </div>
+  <div class="card stat tile">
+    <span class="stat-label">Target hit after the fill</span>
+    <span class="stat-value">{{ summary.target_hit_rate|percent }}</span>
+    <span class="small muted">{{ parts.of(summary.target_hit, summary.filled) }}; limit orders {{ summary.avg_trade_return_pct|pct }}</span>
+  </div>
+  <div class="card stat tile">
+    <span class="stat-label">Fell below the potential low</span>
+    <span class="stat-value">{{ summary.below_low_rate|percent }}</span>
+    <span class="small muted">{{ parts.of(summary.below_low, summary.priced) }}</span>
+  </div>
+  <div class="card stat tile">
+    <span class="stat-label">Higher after 6 months</span>
+    <span class="stat-value">{{ summary.up_rate_6m|percent }}</span>
+    <span class="small muted">{{ parts.of(summary.up_after_6m, summary.matured) }}{% if summary.predicted_up_6m is not none %}; the model said {{ summary.predicted_up_6m|percent }}{% endif %}</span>
+  </div>
+</section>
+
+<div class="stack">
+  {% if by_verdict %}{{ group_table("By verdict", "Verdict", by_verdict) }}{% endif %}
+  {% if by_score %}{{ group_table("By score", "Score", by_score) }}{% endif %}
+
+  <section class="card card-flush" aria-labelledby="outcomes-title">
+    <div class="card-header"><h2 id="outcomes-title">Every idea</h2><span class="small muted">newest first</span></div>
+    <div class="table-wrap">
+      <table class="table table-stack outcomes">
+        <thead>
+          <tr><th scope="col">Idea</th><th scope="col" class="num">Score</th><th scope="col">Status</th><th scope="col" class="num">Return</th>{% if account %}<th scope="col" class="num">In {{ account }}</th>{% endif %}<th scope="col" class="num">Index</th><th scope="col" class="num">vs index</th></tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+          {% set o = row.outcome %}
+          {% set opp = o.opportunity %}
+          <tr>
+            <td class="primary"><a class="ticker" href="/ideas/{{ opp.id }}">{{ opp.ticker }}</a> {{ ui.verdict_badge(opp.analysis.verdict) }}<br><span class="small muted">{{ opp.created|day }} · entry {{ opp.analysis.entry_price|price(opp.currency) }}, target {{ opp.analysis.target_price|price(opp.currency) }}</span></td>
+            <td class="num" data-label="Score">{{ ui.score_badge(opp.score) }}</td>
+            <td data-label="Status"><span class="badge {{ status_badges.get(o.status, 'badge-outline') }}">{{ status_labels.get(o.status, o.status) }}</span>{% if row.newer %} <span class="small muted">superseded {{ row.newer.created|day }}: {{ row.newer.analysis.verdict|verdict }}</span>{% endif %}{% if o.split_factor != 1 %} <span class="small muted">after a split</span>{% endif %}{% if o.price_mismatch %} <span class="small muted">price mismatch, left out</span>{% endif %}</td>
+            <td class="num" data-label="Return">{{ ui.pct(o.return_pct if o.priced else none) }}</td>
+            {% if account %}<td class="num" data-label="In {{ account }}">{{ ui.pct(o.account_return_pct if o.priced else none) }}</td>{% endif %}
+            <td class="num" data-label="{{ index_names.get(o.benchmark, o.benchmark or 'Index') }}">{{ ui.pct(o.benchmark_return_pct if o.priced else none) }}</td>
+            <td class="num" data-label="vs index">{{ ui.pct(o.excess_return_pct) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+  {{ ui.pagination(page) }}
+</div>
+{% endif %}
+
+<p class="small muted track-notes">Returns are from the price in the report to the last close within 6 months; limit orders from the entry to the target (when hit) or that close, and a target only counts on a day after the entry filled. The index is the exchange's benchmark (the S&amp;P 500 for US listings, the Athens General index for Athens, the DAX for Xetra...) over the same days.{% if account %} The {{ account }} return adds the exchange-rate move; broker fees are not in it.{% endif %} Prices are downloaded at most once an hour. Past results say little about future ones, and this is not investment advice.</p>
+{% endif %}
+{% endblock %}

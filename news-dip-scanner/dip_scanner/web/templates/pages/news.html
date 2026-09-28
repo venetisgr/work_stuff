@@ -1,0 +1,72 @@
+{#- The news digest (GET /news): pages.news. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% import "pages/_parts.html" as parts with context %}
+{% block content %}
+<div class="page-header">
+  <h1>News{% if ticker %} about <span class="ticker">{{ ticker }}</span>{% endif %}</h1>
+  <p class="lede">{{ everything|plural("article") }} from {{ sources|plural("source") }} in the last {{ hours }} hours{% if company_count %}, {{ company_count|plural("company", "companies") }} flagged by the language model{% endif %}. It can match the wrong company: check before you act.</p>
+</div>
+
+<nav class="segmented" aria-label="Period">
+  {% for choice in hour_choices %}
+  <a href="{{ url_with(request, hours=choice if choice != default_hours else none, page=none) }}"{% if choice == hours %} aria-current="true"{% endif %}>{{ choice }} hours</a>
+  {% endfor %}
+</nav>
+
+<form class="filters news-filters" method="get" action="/news">
+  {% if hours != default_hours %}<input type="hidden" name="hours" value="{{ hours }}">{% endif %}
+  <div class="field">
+    <label for="f-ticker">Company</label>
+    <input class="input mono" id="f-ticker" name="ticker" type="text" value="{{ typed }}" placeholder="Symbol, e.g. AMD" autocapitalize="characters" autocomplete="off" spellcheck="false">
+  </div>
+  <label class="check"><input type="checkbox" name="companies" value="1"{% if only_companies %} checked{% endif %} data-auto-submit> <span>Only articles about listed companies</span></label>
+  <div class="form-actions">
+    <button class="btn btn-small" type="submit">Show</button>
+    {% if ticker or only_companies or typed %}<a class="btn btn-small btn-ghost" href="{{ '/news?hours=' ~ hours if hours != default_hours else '/news' }}">Clear</a>{% endif %}
+  </div>
+</form>
+
+{% if problem %}<div class="flash flash-error" role="alert"><p>{{ problem }}</p></div>{% endif %}
+
+{% if companies and not ticker %}
+<section class="card companies-card" aria-labelledby="companies-title">
+  <div class="card-header">
+    <h2 id="companies-title">Companies in the news</h2>
+    <span class="small muted">most worrying first</span>
+  </div>
+  <p class="chips">
+    {% for row in companies %}<a class="chip chip-{{ row.direction }}" href="{{ url_with(request, ticker=row.ticker, page=none) }}" title="{{ row.company }}: {{ row.count|plural('article') }}, strongest {{ row.direction }} {{ row.magnitude }}/5"><span class="ticker">{{ row.ticker }}</span> <span class="chip-dir chip-dir-{{ row.direction }}" aria-hidden="true">{{ {"negative": "▼", "positive": "▲", "mixed": "◆"}.get(row.direction, "•") }}</span><span class="visually-hidden">{{ row.direction }}</span><span class="num">{{ row.magnitude }}/5</span>{% if row.count > 1 %} <span class="chip-count">×{{ row.count }}</span>{% endif %}</a> {% endfor %}
+    {% if more_companies %}<span class="small muted">and {{ more_companies }} more</span>{% endif %}
+  </p>
+</section>
+{% endif %}
+
+{% if ticker %}
+<p class="small"><a href="/tickers/{{ ticker|urlencode }}">Prices, chart and ideas of {{ ticker }} <span aria-hidden="true">→</span></a></p>
+{% endif %}
+
+{% if items %}
+<section class="card card-flush" aria-label="Articles">
+  <ul class="list articles articles-flush">
+    {% for article, impacts in items %}
+    <li class="article">
+      <span class="headline-title">{{ ui.headline_link(article.title, article.link) }}</span>
+      <span class="meta"><span>{{ article.source_name or article.source }}</span><span>{{ ui.time(article.published) }}</span>{% if article.link|host %}<span>{{ article.link|host }}</span>{% endif %}</span>
+      {% for impact in impacts %}
+      <div class="impact">
+        {{ parts.impact_chip(impact) }}
+        <span class="impact-text"><span class="muted">{{ impact.company }}{% if impact.company %} · {% endif %}{{ impact.relation }}{% if impact.event_type %}, {{ impact.event_type|replace("_", " ") }}{% endif %}.</span> {{ impact.rationale }}</span>
+      </div>
+      {% endfor %}
+    </li>
+    {% endfor %}
+  </ul>
+</section>
+{{ ui.pagination(page) }}
+{% elif ticker %}
+{{ ui.empty_state("No news about " ~ ticker ~ " in the last " ~ hours ~ " hours", "Only the scanner's feeds are searched.", "/news?hours=72&ticker=" ~ ticker|urlencode if hours != 72 else none, "Look at 72 hours") }}
+{% else %}
+{{ ui.empty_state("No articles in the last " ~ hours ~ " hours", "The scanner collects the feeds at every cycle; nothing has come in yet.") }}
+{% endif %}
+{% endblock %}

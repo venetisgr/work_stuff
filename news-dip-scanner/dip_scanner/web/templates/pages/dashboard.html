@@ -1,29 +1,123 @@
-{#- A first dashboard from the website's foundation; the member pages replace it. -#}
+{#- The ideas (GET /): pages.dashboard. -#}
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
+{% import "pages/_parts.html" as parts with context %}
 {% block content %}
 <div class="page-header">
   <h1>Ideas</h1>
-  <p class="lede">Dips the scanner analysed in the last {{ days }} days, best score first.</p>
+  <p class="lede">The newest analysis of every dip in the last {{ filters.days|plural("day") }}, {{ "best score first" if filters.sort == "score" else "newest first" }}.</p>
 </div>
-{{ ui.status_strip(status) }}
-{% if ideas %}
-<div class="card card-flush ideas-list">
-  {% for opp in ideas %}
-  <a class="idea-row" href="/ideas/{{ opp.id }}">
-    {{ ui.score_badge(opp.score) }}
-    <span class="idea-main">
-      <span class="ticker">{{ opp.ticker }}</span> {{ ui.verdict_badge(opp.analysis.verdict) }}
-      <span class="idea-company truncate">{{ opp.company }}</span>
-    </span>
-    <span class="idea-figures">
-      <span class="num">{{ opp.analysis.probability_up_6m|percent }} up</span><br>
-      <span class="muted">{{ ui.time(opp.created) }}</span>
-    </span>
-  </a>
-  {% endfor %}
-</div>
-{% else %}
-{{ ui.empty_state("No ideas yet", "The scanner lists every dip it analyses here. It checks the news every " ~ status.interval_minutes|number ~ " minutes.") }}
+
+{{ ui.status_strip(status, calls_today=calls_today) }}
+
+{% if changes %}
+<section class="card thesis-card" aria-labelledby="changes-title">
+  <div class="card-header">
+    <h2 id="changes-title">Thesis changes</h2>
+    <span class="badge badge-warn">Review open orders</span>
+  </div>
+  <p class="small muted">A newer analysis undercuts an idea that passed your alert rules. If you placed orders on the earlier idea, check them.</p>
+  <ul class="list">
+    {% for change in changes %}
+    {% set now_a = change.current.analysis %}
+    {% set was = change.previous.analysis %}
+    <li>
+      <p class="change-line"><a class="ticker" href="/ideas/{{ change.current.id }}">{{ change.current.ticker }}</a> {{ change.reason }}: now {{ ui.verdict_badge(now_a.verdict) }} <span class="num">{{ now_a.probability_up_6m|percent }}</span> chance up, score <span class="num">{{ change.current.score|score }}</span>.</p>
+      <p class="meta"><span>Was {{ was.verdict|verdict }}, {{ was.probability_up_6m|percent }}, entry {{ was.entry_price|price(change.previous.currency) }}, target {{ was.target_price|price(change.previous.currency) }}</span><span>analysed {{ ui.time(change.current.created) }}</span><a href="/ideas/{{ change.previous.id }}">the earlier idea</a></p>
+    </li>
+    {% endfor %}
+  </ul>
+</section>
 {% endif %}
+
+<div class="split-layout">
+  <div class="split-main">
+    <nav class="segmented" aria-label="Period">
+      {% for choice in day_choices %}
+      <a href="{{ url_with(request, days=choice if choice != default_days else none, page=none) }}"{% if choice == filters.days %} aria-current="true"{% endif %}>{{ choice|plural("day") }}</a>
+      {% endfor %}
+    </nav>
+
+    <details class="card filter-card"{% if filters.open %} open{% endif %}>
+      <summary>
+        <span class="filter-title">Filters</span>
+        <span class="filter-summary">{% if filters.score %}score {{ filters.score }}+{% else %}any score{% endif %} · {% if filters.verdict %}{{ filters.verdict|verdict }}{% else %}all verdicts{% endif %}{% if filters.watchlist %} · my watchlist{% endif %}{% if filters.rules %} · my alert rules{% endif %} · {{ sorts[filters.sort]|lower }}</span>
+      </summary>
+      <form class="filters" method="get" action="/">
+        {% if filters.days != default_days %}<input type="hidden" name="days" value="{{ filters.days }}">{% endif %}
+        <div class="field">
+          <label for="f-score">Score</label>
+          <select class="select" id="f-score" name="score" data-auto-submit>
+            <option value="">Any score</option>
+            {% for choice in score_choices %}<option value="{{ choice }}"{% if choice == filters.score %} selected{% endif %}>{{ choice }} or more</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="f-verdict">Verdict</label>
+          <select class="select" id="f-verdict" name="verdict" data-auto-submit>
+            <option value="">All verdicts</option>
+            {% for value, label in verdict_choices %}<option value="{{ value }}"{% if value == filters.verdict %} selected{% endif %}>{{ label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="field">
+          <label for="f-sort">Order</label>
+          <select class="select" id="f-sort" name="sort" data-auto-submit>
+            {% for value, label in sorts.items() %}<option value="{{ value }}"{% if value == filters.sort %} selected{% endif %}>{{ label }}</option>{% endfor %}
+          </select>
+        </div>
+        <div class="check-list filter-checks">
+          <label class="check"><input type="checkbox" name="watchlist" value="1"{% if filters.watchlist %} checked{% endif %} data-auto-submit> <span>Only my watchlist</span></label>
+          <label class="check"><input type="checkbox" name="rules" value="1"{% if filters.rules %} checked{% endif %} data-auto-submit> <span>Only ideas that pass my alert rules</span></label>
+        </div>
+        <div class="form-actions">
+          <button class="btn btn-small no-js-only" type="submit">Show</button>
+          {% if filters.active %}<a class="btn btn-small btn-ghost" href="/">Clear the filters</a>{% endif %}
+        </div>
+      </form>
+    </details>
+
+    {% if ideas %}
+    <p class="small muted list-count">{% if shown != total %}{{ shown }} of {{ total|plural("idea") }} match the filters.{% else %}{{ total|plural("idea") }}.{% endif %}{% if watchlist or matching %} <span class="legend"><span class="marker marker-watch" aria-hidden="true">★</span> on your watchlist · <span class="marker marker-rules" aria-hidden="true">✓</span> passes your alert rules</span>{% endif %}</p>
+    <div class="card card-flush ideas-list">
+      {% for opp in ideas %}
+      {{ parts.idea_row(opp, counts=counts, watchlist=watchlist, matching=matching) }}
+      {% endfor %}
+    </div>
+    {{ ui.pagination(page) }}
+    {% elif total %}
+    {{ ui.empty_state("No idea matches these filters", total|plural("idea") ~ " in the last " ~ filters.days|plural("day") ~ " don't pass them.", "/?days=" ~ filters.days if filters.days != default_days else "/", "Show them all") }}
+    {% else %}
+    {{ ui.empty_state("No ideas in the last " ~ filters.days|plural("day"), "The scanner lists every dip it analyses here; it checks the news every " ~ status.interval_minutes|number ~ " minutes. Look up a stock to analyse one yourself.", "/?days=30" if filters.days != 30 else none, "Show the last 30 days") }}
+    {% endif %}
+  </div>
+
+  <div class="split-side">
+    <section class="card" aria-labelledby="lookup-title">
+      <h2 class="section-title" id="lookup-title">Look up a stock</h2>
+      <form class="lookup" method="get" action="/tickers">
+        <label class="visually-hidden" for="f-symbol">Yahoo Finance symbol</label>
+        <input class="input mono" id="f-symbol" name="symbol" type="text" placeholder="AMD, SAP.DE, ALWN.AT" autocapitalize="characters" autocomplete="off" spellcheck="false" required>
+        <button class="btn" type="submit">Open</button>
+      </form>
+      <p class="help">Prices, news and ideas of one stock, and "Analyse now".</p>
+    </section>
+
+    <section class="card" aria-labelledby="watch-title">
+      <h2 class="section-title" id="watch-title">Your watchlist</h2>
+      {% if user.settings.watchlist %}
+      <p class="chips">
+        {% for symbol in user.settings.watchlist %}<a class="chip" href="/tickers/{{ symbol|urlencode }}"><span class="ticker">{{ symbol }}</span></a> {% endfor %}
+      </p>
+      {% else %}
+      <p class="small muted">Empty. Any negative news about a stock on it can make it a candidate: add symbols on a stock's page or in <a href="/settings#watchlist">Settings</a>.</p>
+      {% endif %}
+    </section>
+
+    <section class="card" aria-labelledby="rules-title">
+      <h2 class="section-title" id="rules-title">Your alert rules</h2>
+      <p class="small">Score {{ "%g"|format(user.settings.min_score) }} or more, a chance up of {{ user.settings.min_probability }}% or more{% if user.settings.verdicts %}, {% for verdict in user.settings.verdicts %}{{ verdict|verdict|lower }}{% if not loop.last %} or {% endif %}{% endfor %}{% endif %}{% if user.settings.only_watchlist %}, on your watchlist only{% endif %}.</p>
+      <p class="small muted">{% if user.settings.has_channel %}Ideas that pass them are sent to you.{% else %}No alert channel yet.{% endif %} <a href="/settings">Change them</a></p>
+    </section>
+  </div>
+</div>
 {% endblock %}

@@ -1,0 +1,1059 @@
+/* Dip scanner: the member pages (ideas, an idea, a ticker, the news, the track record) and the price chart.
+   Mobile first (a 390px phone), then wider screens. Builds on the tokens and pieces of app.css; no inline styles
+   anywhere (the Content-Security-Policy forbids them). */
+
+/* --- price chart (charts.py) ------------------------------------------------------------------------------------- */
+
+/* The chart's own steps of the price, up and down colours: validated as a set (dataviz) against the card surface,
+   light and dark. Text in the chart always wears the text tokens, never these. */
+.chart {
+  --chart-price: var(--accent);
+  --chart-up: var(--up);
+  --chart-down: var(--down);
+  --chart-grid: var(--line);
+  --chart-axis: var(--line-strong);
+  --chart-wash: rgba(11, 92, 173, 0.08);
+  margin: 0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .chart {
+    --chart-price: #3987e5;
+    --chart-up: #34a853;
+    --chart-down: #e5534b;
+    --chart-wash: rgba(57, 135, 229, 0.16);
+  }
+}
+
+.chart-svg {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--font);
+}
+
+/* Two drawings of every chart: an SVG's text scales with its viewBox, so phones get their own. */
+.chart-wide {
+  display: none;
+}
+
+.chart-narrow {
+  max-width: 440px;
+  margin: 0 auto;
+}
+
+.chart-wide {
+  max-width: 760px;
+  margin: 0 auto;
+}
+
+@media (min-width: 600px) {
+  .chart-wide {
+    display: block;
+  }
+
+  .chart-narrow {
+    display: none;
+  }
+}
+
+.chart-grid,
+.chart-grid-tick {
+  stroke: var(--chart-grid);
+  stroke-width: 1;
+}
+
+.chart-baseline {
+  stroke: var(--chart-axis);
+  stroke-width: 1;
+}
+
+.chart-tick,
+.chart-marker-label {
+  fill: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-line {
+  fill: none;
+  stroke: var(--chart-price);
+  stroke-width: 2;
+  stroke-linejoin: round;
+  stroke-linecap: round;
+}
+
+.chart-end {
+  fill: var(--chart-price);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+.chart-level {
+  fill: none;
+  stroke-width: 1.25;
+}
+
+.chart-level-target {
+  stroke: var(--chart-up);
+  stroke-dasharray: 7 4;
+}
+
+.chart-level-price {
+  stroke: var(--muted);
+  stroke-dasharray: 2 3;
+}
+
+.chart-level-entry {
+  stroke: var(--ink);
+  stroke-dasharray: 7 4;
+}
+
+.chart-level-stat-low {
+  stroke: var(--faint);
+  stroke-dasharray: 1 4;
+  stroke-linecap: round;
+}
+
+.chart-level-low {
+  stroke: var(--chart-down);
+  stroke-dasharray: 7 4;
+}
+
+/* the short connector from a line to its label: the line's colour, solid */
+.chart-leader {
+  fill: none;
+  stroke-width: 1;
+  stroke-dasharray: none;
+}
+
+.chart-leader-last {
+  stroke: var(--chart-price);
+}
+
+.chart-label-name {
+  fill: var(--muted);
+}
+
+.chart-label-value {
+  fill: var(--ink);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-label-last .chart-label-name {
+  fill: var(--ink);
+  font-weight: 600;
+}
+
+.chart-marker-line {
+  stroke: var(--line-strong);
+  stroke-width: 1;
+}
+
+.chart-marker-dot {
+  fill: var(--ink);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+
+/* hover (mouse devices): each day is a column; the column washes and a dot shows the close, with a tooltip */
+.chart-hit rect {
+  fill: transparent;
+  pointer-events: all;
+}
+
+.chart-hit circle {
+  fill: var(--chart-price);
+  stroke: var(--surface);
+  stroke-width: 2;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.chart-hit:hover rect {
+  fill: var(--chart-wash);
+}
+
+.chart-hit:hover circle {
+  opacity: 1;
+}
+
+.chart-caption {
+  margin-top: var(--space-3);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+/* the key of a level (the levels card doubles as the chart's legend): a short stroke in the line's style */
+.level-key {
+  display: inline-block;
+  width: 18px;
+  height: 0;
+  border-top: 2px dashed var(--muted);
+  vertical-align: middle;
+  flex: none;
+}
+
+.level-key-target {
+  border-top-color: var(--up);
+}
+
+.level-key-price {
+  border-top-style: dotted;
+}
+
+.level-key-entry {
+  border-top-color: var(--ink);
+}
+
+.level-key-stat-low {
+  border-top-style: dotted;
+  border-top-color: var(--faint);
+}
+
+.level-key-low {
+  border-top-color: var(--down);
+}
+
+.level-key-last {
+  border-top-style: solid;
+  border-top-color: var(--accent);
+}
+
+/* --- layout: one reading order on a phone, two columns on a wide screen ------------------------------------------ */
+
+/* On a phone both columns dissolve (display: contents) and their cards line up by their order-* class; from 960px the
+   main column (chart, analysis, news) sits left of the side column (levels, outcome, lists of ideas). */
+.split-layout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.split-main,
+.split-side {
+  display: contents;
+}
+
+.order-1 {
+  order: 1;
+}
+
+.order-2 {
+  order: 2;
+}
+
+.order-3 {
+  order: 3;
+}
+
+.order-4 {
+  order: 4;
+}
+
+.order-5 {
+  order: 5;
+}
+
+.order-6 {
+  order: 6;
+}
+
+.order-7 {
+  order: 7;
+}
+
+@media (min-width: 960px) {
+  .split-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 1.75fr) minmax(0, 1fr);
+    gap: var(--space-5);
+    align-items: start;
+  }
+
+  .split-main,
+  .split-side {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-4);
+    min-width: 0;
+  }
+}
+
+/* a row of pill links for the period (days, hours) */
+.segmented {
+  display: flex;
+  gap: 2px;
+  width: fit-content;
+  max-width: 100%;
+  overflow-x: auto;
+  padding: 3px;
+  margin-bottom: var(--space-4);
+  background: var(--surface-3);
+  border-radius: var(--radius-pill);
+  scrollbar-width: none;
+}
+
+.segmented::-webkit-scrollbar {
+  display: none;
+}
+
+.segmented a:focus-visible {
+  outline-offset: -3px;
+}
+
+.split-layout .segmented {
+  margin-bottom: 0;
+}
+
+.segmented a {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: var(--radius-pill);
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.segmented a:hover {
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.segmented a[aria-current] {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: var(--shadow);
+}
+
+/* --- the dashboard ----------------------------------------------------------------------------------------------- */
+
+.filter-card {
+  padding: 0;
+}
+
+.filter-card > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 46px;
+  padding: var(--space-2) var(--space-4);
+  cursor: pointer;
+}
+
+.filter-card > summary::-webkit-details-marker {
+  display: none;
+}
+
+.filter-card > summary::after {
+  content: "";
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-right: 2px solid var(--muted);
+  border-bottom: 2px solid var(--muted);
+  transform: rotate(45deg) translateY(-2px);
+  flex: none;
+}
+
+.filter-card[open] > summary::after {
+  transform: rotate(-135deg) translateY(-2px);
+}
+
+.filter-title {
+  font-weight: 650;
+  flex: none;
+}
+
+.filter-summary {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.filter-card .filters {
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+.filter-checks {
+  flex-basis: 100%;
+}
+
+.list-count {
+  margin: 0;
+}
+
+.thesis-card {
+  border-left: 4px solid var(--warn);
+  margin-bottom: var(--space-4);
+}
+
+.change-line {
+  margin: 0 0 2px;
+}
+
+.lookup {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.lookup .input {
+  flex: 1;
+  min-width: 0;
+  text-transform: uppercase;
+}
+
+.lookup .input::placeholder {
+  text-transform: none;
+}
+
+/* rows of ideas (app.css has the grid): a second and third line, the chance up large on the right */
+.idea-row .idea-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 6px;
+}
+
+/* the ticker and its ★ / ✓ markers stay on one line; the verdict wraps below them when it must */
+.idea-row .idea-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.idea-row .idea-company,
+.idea-row .idea-levels {
+  display: block;
+}
+
+.idea-row .idea-levels {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.idea-row .idea-figures {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.idea-chance {
+  font-size: 1.125rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.idea-chance-label,
+.idea-age {
+  color: var(--muted);
+  font-size: 0.75rem;
+  white-space: nowrap;
+}
+
+.idea-age {
+  margin-top: 2px;
+}
+
+.ideas-list .idea-row.is-current {
+  background: var(--accent-soft);
+}
+
+.ideas-compact .idea-row {
+  padding: 10px var(--space-4);
+}
+
+/* ★ on the reader's watchlist, ✓ passes their alert rules (the legend above the list says so) */
+.marker {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  font-size: 0.75rem;
+  font-weight: 700;
+  line-height: 1;
+  flex: none;
+}
+
+.marker-watch {
+  color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.marker-rules {
+  color: var(--info);
+  background: var(--info-soft);
+}
+
+.legend {
+  white-space: nowrap;
+}
+
+@media (max-width: 479.98px) {
+  .ideas-list .idea-row {
+    gap: var(--space-1) 10px;
+    padding-left: var(--space-3);
+    padding-right: var(--space-3);
+  }
+
+  /* the period pills share the full width, so five of them fit a 390px screen */
+  .segmented {
+    width: 100%;
+  }
+
+  .segmented a {
+    flex: 1 1 auto;
+    justify-content: center;
+    padding: 0 6px;
+    font-size: 0.8125rem;
+  }
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 30px;
+  padding: 2px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-pill);
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.chip:hover {
+  background: var(--surface-2);
+  text-decoration: none;
+}
+
+/* on a phone every chip is a 40px target, with room between the rows */
+@media (pointer: coarse), (max-width: 639.98px) {
+  .chip {
+    min-height: 40px;
+    padding: 2px 12px;
+  }
+
+  .chips {
+    gap: var(--space-2);
+  }
+}
+
+.chip .ticker {
+  font-size: 0.8125rem;
+}
+
+.chip-negative {
+  background: var(--bad-soft);
+  border-color: transparent;
+}
+
+.chip-mixed {
+  background: var(--warn-soft);
+  border-color: transparent;
+}
+
+.chip-positive {
+  background: var(--ok-soft);
+  border-color: transparent;
+}
+
+.chip-dir-negative,
+.dir-negative {
+  color: var(--down);
+}
+
+.chip-dir-positive,
+.dir-positive {
+  color: var(--up);
+}
+
+.chip-dir-mixed,
+.dir-mixed {
+  color: var(--warn);
+}
+
+.chip-dir-neutral {
+  color: var(--muted);
+}
+
+.chip-count {
+  color: var(--muted);
+}
+
+.dir {
+  font-weight: 600;
+}
+
+/* --- an idea ----------------------------------------------------------------------------------------------------- */
+
+.superseded {
+  margin-bottom: var(--space-4);
+}
+
+.idea-hero {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.idea-hero > * {
+  margin: 0;
+}
+
+.idea-hero-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.idea-name {
+  min-width: 0;
+}
+
+.idea-name h1 {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 10px;
+  margin: 0 0 var(--space-1);
+}
+
+.idea-name h1 .ticker {
+  font-size: 1.625rem;
+}
+
+.idea-company {
+  color: var(--muted);
+  font-size: 1rem;
+  font-weight: 500;
+  letter-spacing: 0;
+}
+
+.score-block {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  min-width: 78px;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+}
+
+.score-number {
+  font-size: 1.625rem;
+  font-weight: 750;
+  line-height: 1.1;
+}
+
+.score-word {
+  font-size: 0.6875rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.idea-glance {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3) var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+}
+
+.idea-glance .stat-value {
+  font-size: 1.375rem;
+  font-variant-numeric: normal;
+}
+
+.idea-glance .stat-hero {
+  grid-column: 1 / -1;
+}
+
+.idea-glance .stat-hero .stat-value {
+  font-size: 3rem;
+  line-height: 1;
+  letter-spacing: -0.02em;
+}
+
+.idea-glance .stat-hero .stat-label {
+  font-size: 0.9375rem;
+  color: var(--ink);
+  font-weight: 550;
+}
+
+@media (min-width: 640px) {
+  .idea-glance {
+    grid-template-columns: minmax(0, 1.3fr) repeat(2, minmax(0, 1fr));
+  }
+
+  .idea-glance .stat-hero {
+    grid-column: auto;
+  }
+}
+
+.idea-actions {
+  padding-top: var(--space-1);
+}
+
+.analyse-note {
+  margin: 0;
+}
+
+/* the levels card: the idea's limit-order levels, highest first; its keys are the chart's legend */
+.ladder {
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+}
+
+.ladder-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  padding: 10px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+li.ladder-row + li.ladder-row {
+  margin-top: 0;
+}
+
+.ladder-row.ladder-price {
+  margin: 0 calc(-1 * var(--space-2));
+  padding-left: var(--space-2);
+  padding-right: var(--space-2);
+  background: var(--surface-2);
+  border-radius: var(--radius-sm);
+}
+
+.ladder-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.ladder-label {
+  font-weight: 600;
+  font-size: 0.9375rem;
+}
+
+.ladder-change {
+  color: var(--muted);
+  font-size: 0.8125rem;
+}
+
+.ladder-amount {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.ladder-figure {
+  font-size: 1.0625rem;
+  font-weight: 700;
+}
+
+.ladder-amount .approx {
+  font-size: 0.8125rem;
+}
+
+.prose h3 {
+  margin: var(--space-4) 0 var(--space-1);
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.prose h2 + h3 {
+  margin-top: 0;
+}
+
+.prose p {
+  max-width: 70ch;
+}
+
+/* checks, risks and catalysts: one card; the checks across the top, risks and catalysts side by side */
+.point-lists {
+  display: grid;
+  gap: var(--space-4) var(--space-5);
+}
+
+@media (min-width: 640px) {
+  .point-lists {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .point-checks {
+    grid-column: 1 / -1;
+  }
+}
+
+.point-list h3 {
+  font-size: 1.0625rem;
+  margin-bottom: var(--space-2);
+}
+
+.point-list ul {
+  margin-bottom: 0;
+}
+
+.kv-note {
+  display: block;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  font-weight: 400;
+}
+
+.checklist {
+  list-style: none;
+  padding: 0;
+}
+
+.checklist li {
+  position: relative;
+  padding-left: 28px;
+}
+
+.checklist li::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 3px;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--line-strong);
+  border-radius: 4px;
+}
+
+.headline,
+.article {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.headline-title {
+  font-weight: 550;
+  overflow-wrap: anywhere;
+}
+
+.warnings {
+  margin-top: var(--space-3);
+}
+
+.warnings ul {
+  margin: var(--space-1) 0 0;
+}
+
+.outcome-kv {
+  margin-bottom: var(--space-3);
+}
+
+.rule-note {
+  color: var(--muted);
+}
+
+/* --- a ticker ---------------------------------------------------------------------------------------------------- */
+
+.price-block {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+}
+
+.price-now {
+  font-size: 1.5rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+
+.dip-verdict {
+  padding: 10px var(--space-3);
+  border-left: 4px solid var(--line-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface-2);
+  font-size: 0.9375rem;
+}
+
+.dip-verdict p {
+  margin: 0;
+}
+
+.dip-verdict.is-dip {
+  border-left-color: var(--warn);
+  background: var(--warn-soft);
+}
+
+.ticker-stats {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--line);
+}
+
+.card-note {
+  margin: 0;
+  padding: 0 var(--space-4) var(--space-4);
+}
+
+/* --- the news ---------------------------------------------------------------------------------------------------- */
+
+.news-filters .field {
+  flex: 1 1 180px;
+}
+
+.companies-card {
+  margin-bottom: var(--space-4);
+}
+
+.articles-flush > li,
+.articles-flush > li:first-child,
+.articles-flush > li:last-child {
+  padding: var(--space-3) var(--space-4);
+}
+
+.impact {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-1) 0 0;
+  font-size: 0.875rem;
+}
+
+.impact .chip {
+  flex: none;
+}
+
+.impact-text {
+  min-width: 0;
+  padding-top: 4px;
+}
+
+.impact-line {
+  margin: var(--space-1) 0 0;
+  font-size: 0.875rem;
+}
+
+.card-more {
+  margin: var(--space-3) 0 0;
+}
+
+/* --- the track record -------------------------------------------------------------------------------------------- */
+
+.track-tiles {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: var(--space-4) 0;
+}
+
+@media (min-width: 800px) {
+  .track-tiles {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+  }
+}
+
+.track-tiles .tile {
+  padding: var(--space-3) var(--space-4);
+}
+
+.tile .stat-value {
+  font-size: 1.375rem;
+  font-variant-numeric: normal;
+}
+
+.outcomes td.primary {
+  min-width: 13rem;
+}
+
+/* On a phone every idea of the track record takes two columns instead of seven stacked rows: the score and status
+   badges side by side (they need no label), then the returns in pairs. */
+@media (max-width: 639.98px) {
+  .table-stack.outcomes tr {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: var(--space-5);
+  }
+
+  .table-stack.outcomes td {
+    width: calc(50% - var(--space-5) / 2);
+  }
+
+  .table-stack.outcomes td.primary {
+    width: 100%;
+    min-width: 0;
+  }
+
+  .table-stack.outcomes td[data-label="Score"],
+  .table-stack.outcomes td[data-label="Status"] {
+    width: auto;
+    justify-content: flex-start;
+    padding-bottom: var(--space-2);
+  }
+
+  .table-stack.outcomes td[data-label="Status"] {
+    flex: 1 1 0;
+    flex-wrap: wrap;
+    column-gap: var(--space-2);
+    row-gap: 2px;
+    text-align: left;
+  }
+
+  .table-stack.outcomes td[data-label="Score"]::before,
+  .table-stack.outcomes td[data-label="Status"]::before {
+    content: none;
+  }
+}
+
+.track-notes {
+  margin-top: var(--space-5);
+}
+
+/* the table twin of a chart */
+.chart-table {
+  margin-top: var(--space-3);
+}
+
+.table-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.table-compact th,
+.table-compact td {
+  padding: 6px var(--space-3);
+}
+
+.chart-empty {
+  padding: var(--space-5) var(--space-4);
+}

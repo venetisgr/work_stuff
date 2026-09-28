@@ -1,0 +1,98 @@
+{#- One stock (GET /tickers/<symbol>): pages.ticker. -#}
+{% extends "base.html" %}
+{% import "_macros.html" as ui with context %}
+{% import "pages/_parts.html" as parts with context %}
+{% block content %}
+{% set here = "/tickers/" ~ symbol|urlencode %}
+<header class="card idea-hero ticker-hero">
+  <div class="idea-hero-head">
+    <div class="idea-name">
+      <h1><span class="ticker">{{ symbol }}</span>{% if company %} <span class="idea-company">{{ company }}</span>{% endif %}</h1>
+      {% if stats %}<p class="meta"><span>{{ stats.exchange or "Yahoo Finance" }}</span><span>{{ stats.currency }}</span><span>as of {{ ui.time(stats.as_of) }}</span></p>{% endif %}
+    </div>
+    {% if stats %}
+    <div class="price-block">
+      <span class="price-now num">{{ stats.price|price(stats.currency) }}</span>
+      <span class="small">{{ ui.pct(stats.change_1d_pct) }} today</span>
+    </div>
+    {% endif %}
+  </div>
+
+  {% if preferred %}
+  <p class="callout callout-info small">The scanner reads {{ symbol }}'s news as <a class="ticker" href="/tickers/{{ preferred|urlencode }}">{{ preferred }}</a>, the listing chosen in the scanner's settings ([universe] preferred_listings).</p>
+  {% endif %}
+
+  {% if stats %}
+  <div class="dip-verdict {{ 'is-dip' if dip else 'no-dip' }}">
+    {% if dip %}<p><strong>A dip by the scanner's rules:</strong> {{ dip|join("; ") }}.</p>{% else %}<p><strong>Not a dip by the scanner's rules</strong>: a fall of {{ dip_rules.min_drop_1d_pct|number(1) }}% on the day, {{ dip_rules.min_drop_5d_pct|number(1) }}% in 5 days or {{ dip_rules.min_drawdown_20d_pct|number(1) }}% below the 20-day high.</p>{% endif %}
+  </div>
+  <dl class="kv ticker-stats">
+    <div><dt>5 days</dt><dd>{{ ui.pct(stats.change_5d_pct) }}</dd></div>
+    <div><dt>20 days</dt><dd>{{ ui.pct(stats.change_20d_pct) }}</dd></div>
+    <div><dt>From the 20-day high</dt><dd>{{ ui.pct(stats.drawdown_20d_pct) }}</dd></div>
+    <div><dt>52-week range</dt><dd class="num">{{ stats.low_52w|price(stats.currency) }} – {{ stats.high_52w|price(stats.currency) }}</dd></div>
+    <div><dt>Volatility</dt><dd>{{ stats.volatility_pct|percent(1) }} a year</dd></div>
+    <div><dt>Statistical 6-month low</dt><dd class="num">{{ stats.stat_low_6m|price(stats.currency) }}</dd></div>
+  </dl>
+  {% else %}
+  <p class="callout small">{{ price_problem }}</p>
+  {% endif %}
+
+  <div class="form-actions idea-actions">
+    {{ parts.analyse(symbol, analyse, next=here) }}
+    {{ parts.watchlist_button(symbol, on_watchlist, next=here) }}
+  </div>
+  {% if analyse.available and analyse.remaining is not none %}<p class="small muted">An analysis asks the model now, whatever the price did, and shows the idea when it is ready. You have {{ analyse.remaining }} of {{ analyse.limit }} left in the last 24 hours.</p>{% endif %}
+</header>
+
+<div class="split-layout">
+  <div class="split-main">
+    <section class="card order-1" aria-labelledby="chart-title">
+      <div class="card-header">
+        <h2 id="chart-title">The last 6 months</h2>
+        <span class="small muted">daily closes</span>
+      </div>
+      {{ parts.chart_figure(chart, chart_problem, caption=chart_caption) }}
+    </section>
+
+    <section class="card order-3" aria-labelledby="news-title">
+      <div class="card-header">
+        <h2 id="news-title">News</h2>
+        <span class="small muted">last {{ news_days }} days</span>
+      </div>
+      {% if news %}
+      <ul class="list articles">
+        {% for article, impacts in news %}
+        <li class="article">
+          <span class="headline-title">{{ ui.headline_link(article.title, article.link) }}</span>
+          <span class="meta"><span>{{ article.source_name or article.source }}</span><span>{{ ui.time(article.published) }}</span></span>
+          {% for impact in impacts %}
+          <p class="impact-line"><span class="dir dir-{{ impact.direction }}">{{ impact.direction }} {{ impact.magnitude }}/5</span> <span class="muted small">{{ impact.relation }}{% if impact.event_type %}, {{ impact.event_type|replace("_", " ") }}{% endif %}.</span>{% if impact.rationale %} <span class="small">{{ impact.rationale }}</span>{% endif %}</p>
+          {% endfor %}
+        </li>
+        {% endfor %}
+      </ul>
+      <p class="small card-more"><a href="/news?ticker={{ symbol|urlencode }}&amp;hours=72">The last 72 hours in the news digest <span aria-hidden="true">→</span></a></p>
+      {% else %}
+      <p class="muted">No news about {{ symbol }} in the scanner's feeds in the last {{ news_days }} days.</p>
+      {% endif %}
+    </section>
+  </div>
+
+  <div class="split-side">
+    <section class="card card-flush order-2" aria-labelledby="ideas-title">
+      <div class="card-header">
+        <h2 id="ideas-title">Ideas</h2>
+        <span class="small muted">{{ ideas|length|plural("analysis", "analyses") }}</span>
+      </div>
+      {% if ideas %}
+      <div class="ideas-list ideas-compact">
+        {% for opp in ideas %}{{ parts.idea_row(opp) }}{% endfor %}
+      </div>
+      {% else %}
+      <p class="card-note muted">The scanner hasn't analysed {{ symbol }} yet.</p>
+      {% endif %}
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -1,23 +1,195 @@
-{#- A first idea page from the website's foundation; the member pages replace it. -#}
+{#- One idea (GET /ideas/<id>): pages.idea. opp is the reader's view (≈ amounts in their currency). On a phone the
+    cards stack in reading order (the order-* classes); on a wide screen the analysis runs on the left and the
+    levels, outcome and other analyses on the right. -#}
 {% extends "base.html" %}
 {% import "_macros.html" as ui with context %}
+{% import "pages/_parts.html" as parts with context %}
 {% block content %}
-<div class="page-header">
-  <h1><span class="ticker">{{ opp.ticker }}</span> <span class="muted">{{ opp.company }}</span></h1>
-  <div class="cluster">{{ ui.score_badge(opp.score) }} {{ ui.verdict_badge(opp.analysis.verdict) }}</div>
+{% set a = opp.analysis %}
+{% set here = "/ideas/" ~ opp.id %}
+
+{% if newer %}
+<div class="callout callout-info superseded" role="note">
+  <p><strong>There is a newer analysis of {{ opp.ticker }}</strong> ({{ ui.time(newer.created) }}): {{ newer.analysis.verdict|verdict }}, {{ newer.analysis.probability_up_6m|percent }} chance up, score {{ newer.score|score }}. If you placed orders on this idea, review them. <a href="/ideas/{{ newer.id }}">See the newest analysis</a></p>
 </div>
-<div class="card stack">
-  <dl class="kv">
-    <div><dt>Price at the analysis</dt><dd>{{ ui.money(opp.price, opp) }}</dd></div>
-    <div><dt>Chance higher in 6 months</dt><dd>{{ opp.analysis.probability_up_6m|percent }}</dd></div>
-    <div><dt>Entry (limit buy)</dt><dd>{{ ui.money(opp.analysis.entry_price, opp) }}</dd></div>
-    <div><dt>Target (limit sell)</dt><dd>{{ ui.money(opp.analysis.target_price, opp) }}</dd></div>
-    <div><dt>Potential low</dt><dd>{{ ui.money(opp.analysis.potential_low, opp) }}</dd></div>
-    <div><dt>Upside to the target</dt><dd>{{ ui.pct(opp.upside_pct()) }}</dd></div>
-  </dl>
-  {% if opp|fx_note %}<p class="small muted">{{ opp|fx_note }}.</p>{% endif %}
-  <p>{{ opp.analysis.thesis }}</p>
-  <p class="small muted">Analysed {{ opp.created|when }} by {{ opp.model }}.</p>
-  <div class="form-actions">{{ ui.analyse_button(opp.ticker, label="Analyse again now", next="/ideas/" ~ opp.id) }}</div>
+{% endif %}
+
+<header class="card idea-hero">
+  <div class="idea-hero-head">
+    <div class="idea-name">
+      <h1><span class="ticker">{{ opp.ticker }}</span> <span class="idea-company">{{ opp.company }}</span></h1>
+      <p class="meta"><span>Analysed {{ ui.time(opp.created) }}</span>{% if opp.stats.exchange %}<span>{{ opp.stats.exchange }}</span>{% endif %}<span>{{ opp.currency }}</span></p>
+    </div>
+    <div class="score-block band-{{ opp.score|band }}" title="Score {{ opp.score|score }} of 100">
+      <span class="score-number">{{ opp.score|score }}</span>
+      <span class="score-word">score · {{ opp.score|band }}</span>
+    </div>
+  </div>
+
+  <div class="cluster idea-badges">
+    {{ ui.verdict_badge(a.verdict) }}
+    <span class="badge badge-outline">{{ a.confidence|capitalize }} confidence</span>
+    {% if not misses %}<span class="badge badge-info">Passes your alert rules</span>{% endif %}
+    {% if on_watchlist %}<span class="badge badge-outline"><span aria-hidden="true">★</span> On your watchlist</span>{% endif %}
+  </div>
+
+  <div class="idea-glance">
+    <div class="stat stat-hero">
+      <span class="stat-value">{{ a.probability_up_6m|percent }}</span>
+      <span class="stat-label">chance of being higher in 6 months</span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">Price at the analysis</span>
+      <span class="stat-value num">{{ opp.price|price(opp.currency) }}</span>
+      {% if opp.price|approx(opp) %}<span class="approx num">{{ opp.price|approx(opp) }}</span>{% endif %}
+      <span class="small"><span class="nowrap">{{ ui.pct(opp.stats.change_1d_pct) }} 1 day</span> · <span class="nowrap">{{ ui.pct(opp.stats.change_5d_pct) }} 5 days</span></span>
+    </div>
+    <div class="stat">
+      <span class="stat-label">To the target</span>
+      <span class="stat-value">{{ ui.pct(opp.upside_pct()) }}</span>
+      <span class="small">{{ ui.pct(opp.downside_pct()) }} to the potential low</span>
+    </div>
+  </div>
+
+  {% if misses %}<p class="small muted rule-note">No alert under your rules: {{ misses|join("; ") }}.</p>{% endif %}
+
+  <div class="form-actions idea-actions">
+    {{ parts.analyse(opp.ticker, analyse, label="Analyse again now", next=here) }}
+    {{ parts.watchlist_button(opp.ticker, on_watchlist, next=here) }}
+    <a class="btn btn-ghost" href="/tickers/{{ opp.ticker|urlencode }}">All about {{ opp.ticker }} <span aria-hidden="true">→</span></a>
+  </div>
+</header>
+
+<div class="split-layout idea-layout">
+  <div class="split-main">
+    <section class="card order-2" aria-labelledby="chart-title">
+      <div class="card-header">
+        <h2 id="chart-title">Price since {{ prices.chart.points[0][0].strftime("%b %Y") if prices.chart else "the report" }}</h2>
+        <span class="small muted">daily closes, {{ opp.currency }}</span>
+      </div>
+      {{ parts.chart_figure(prices.chart, prices.problem, caption="Dashed and dotted lines: this idea's levels (their key is in Levels). The dot on the Reported line marks the report.", note=prices.split_note) }}
+    </section>
+
+    <section class="card order-4 prose" aria-labelledby="analysis-title">
+      <h2 id="analysis-title">The analysis</h2>
+      {% if a.fear %}<h3>What the market fears</h3><p>{{ a.fear }}</p>{% endif %}
+      {% if a.fundamental_impact %}<h3>Fundamental impact</h3><p>{{ a.fundamental_impact }}</p>{% endif %}
+      {% if a.thesis %}<h3>Thesis</h3><p>{{ a.thesis }}</p>{% endif %}
+      <p class="small muted">By {{ opp.model or "an unknown model" }}, with prices as of {{ opp.stats.as_of|when }}. A language model's reading of the news: check it before you act.</p>
+    </section>
+
+    {% if a.risks or a.catalysts or a.checks %}
+    <section class="card order-5 point-lists" aria-labelledby="points-title">
+      <h2 class="visually-hidden" id="points-title">Checks, risks and catalysts</h2>
+      {% if a.checks %}
+      <div class="point-list point-checks">
+        <h3>Check before buying</h3>
+        <ul class="checklist">{% for item in a.checks %}<li>{{ item }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+      {% if a.risks %}
+      <div class="point-list">
+        <h3>Risks</h3>
+        <ul>{% for item in a.risks %}<li>{{ item }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+      {% if a.catalysts %}
+      <div class="point-list">
+        <h3>Catalysts</h3>
+        <ul>{% for item in a.catalysts %}<li>{{ item }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+    </section>
+    {% endif %}
+
+    <section class="card order-6" aria-labelledby="flagged-title">
+      <h2 id="flagged-title">Why it was flagged</h2>
+      {% if opp.dip_reasons %}<p>The price: {{ opp.dip_reasons|join("; ") }}.</p>{% endif %}
+      {% if opp.news_after_session %}<p class="callout callout-info small">All of this news came out after the last session in the price data: the price hadn't reacted to it yet when this was analysed.</p>{% endif %}
+      {% if opp.headlines %}
+      <h3 class="section-title">Headlines</h3>
+      <ul class="list headlines">{% for item in opp.headlines %}{{ parts.headline(item) }}{% endfor %}</ul>
+      {% elif not opp.dip_reasons %}
+      <p>Nothing flagged it: this analysis was asked for by hand ("Analyse now"), and the price wasn't down by the scanner's rules.</p>
+      {% else %}
+      <p class="small muted">No headlines were stored with this analysis.</p>
+      {% endif %}
+      {% if a.warnings %}
+      <div class="callout small warnings">
+        <p><strong>Numbers fixed after the analysis</strong></p>
+        <ul>{% for item in a.warnings %}<li>{{ item }}</li>{% endfor %}</ul>
+      </div>
+      {% endif %}
+    </section>
+  </div>
+
+  <div class="split-side">
+    <section class="card order-1 levels-card" aria-labelledby="levels-title">
+      <div class="card-header">
+        <h2 id="levels-title">Levels</h2>
+        <span class="small muted">limit-order ideas</span>
+      </div>
+      <ol class="ladder">
+        {% for row in ladder %}
+        <li class="ladder-row ladder-{{ row.key }}">
+          <span class="level-key level-key-{{ row.key }}" aria-hidden="true"></span>
+          <span class="ladder-text">
+            <span class="ladder-label">{{ row.label }}</span>
+            <span class="ladder-change">{% if row.change is not none %}{{ ui.pct(row.change) }} from the report{% else %}{{ ui.pct(opp.stats.change_1d_pct) }} on the day{% endif %}</span>
+          </span>
+          <span class="ladder-amount">
+            <span class="num ladder-figure">{{ row.value|price(opp.currency) }}</span>
+            {% if row.value|approx(opp) %}<span class="num approx">{{ row.value|approx(opp) }}</span>{% endif %}
+          </span>
+        </li>
+        {% endfor %}
+      </ol>
+      <p class="small">From the entry: target {{ ui.pct(opp.entry_upside_pct()) }}, potential low {{ ui.pct(opp.entry_downside_pct()) }}, what the two limit orders would make or lose.</p>
+      {% if opp|fx_note %}<p class="small muted">{{ opp|fx_note }}.</p>{% elif currency and currency != opp.currency %}<p class="small muted">No {{ opp.currency }}/{{ currency }} rate is known, so the amounts are in {{ opp.currency }} only.</p>{% endif %}
+      <p class="small muted">The potential low is an estimate, not a floor; the statistical low is where the price is 1 in 20 times after 6 months.</p>
+    </section>
+
+    <section class="card order-3" aria-labelledby="outcome-title">
+      <div class="card-header">
+        <h2 id="outcome-title">Outcome so far</h2>
+        {% if outcome and outcome.priced and not outcome.price_mismatch %}<span class="badge {{ status_badges.get(outcome.status, 'badge-outline') }}">{{ status_labels.get(outcome.status, outcome.status)|capitalize }}</span>{% endif %}
+      </div>
+      {% if not outcome %}
+      <p class="muted">{{ prices.problem or "No prices to measure it with." }}</p>
+      {% elif outcome.price_mismatch %}
+      <p class="callout small">The price in the report doesn't match Yahoo Finance's price history (probably a split Yahoo doesn't report), so the outcome can't be measured.</p>
+      {% elif not outcome.priced %}
+      <p class="muted">Nothing has traded since the report yet: the outcome starts with the next session.</p>
+      {% else %}
+      <dl class="kv outcome-kv">
+        <div><dt>Last close</dt><dd><span class="num">{{ outcome.last_price|price(opp.currency) }}</span><span class="kv-note">{{ parts.day(outcome.last_day) }}</span></dd></div>
+        <div><dt>Since the report</dt><dd>{{ ui.pct(outcome.return_pct) }}</dd></div>
+        {% if outcome.account_currency %}<div><dt>In {{ outcome.account_currency }}</dt><dd>{{ ui.pct(outcome.account_return_pct) }}</dd></div>{% endif %}
+        <div><dt><abbr title="{{ outcome.benchmark }}">{{ index_name }}</abbr> meanwhile</dt><dd>{{ ui.pct(outcome.benchmark_return_pct) }}</dd></div>
+        <div><dt>Versus the index</dt><dd>{{ ui.pct(outcome.excess_return_pct) }}</dd></div>
+        <div><dt>Entry filled</dt><dd>{{ parts.day(outcome.entry_filled) if outcome.entry_filled else "Not yet" }}</dd></div>
+        <div><dt>Target hit</dt><dd>{{ parts.day(outcome.target_hit) if outcome.target_hit else ("Not yet" if outcome.entry_filled else "–") }}</dd></div>
+        <div><dt>Below the potential low</dt><dd>{{ parts.day(outcome.low_breached) if outcome.low_breached else "No" }}</dd></div>
+        <div><dt>Best and worst since</dt><dd>{{ ui.pct(outcome.max_gain_pct) }} / {{ ui.pct(outcome.max_loss_pct) }}</dd></div>
+        {% if outcome.trade_return_pct is not none %}<div><dt>The limit orders</dt><dd>{{ ui.pct(outcome.trade_return_pct) }}</dd></div>{% endif %}
+        {% if outcome.up_after_6m is not none %}<div><dt>Higher after 6 months</dt><dd>{{ "Yes" if outcome.up_after_6m else "No" }}</dd></div>{% endif %}
+      </dl>
+      <p class="small muted">Day {{ outcome.days }} of the 6-month idea. Returns from the price in the report; the limit orders from the entry to the target (when hit) or the last close.</p>
+      {% endif %}
+      {% for note in prices.notes %}<p class="small muted">{{ note }}</p>{% endfor %}
+    </section>
+
+    <section class="card card-flush order-7" aria-labelledby="history-title">
+      <div class="card-header">
+        <h2 id="history-title">Analyses of {{ opp.ticker }}</h2>
+        <span class="small muted">{{ history|length|plural("analysis", "analyses") }}</span>
+      </div>
+      <div class="ideas-list ideas-compact">
+        {% for item in history %}
+        {{ parts.idea_row(item, current=opp.id) }}
+        {% endfor %}
+      </div>
+    </section>
+  </div>
 </div>
 {% endblock %}
