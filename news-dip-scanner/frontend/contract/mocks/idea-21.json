@@ -1,0 +1,747 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 21,
+    "ticker": "BAS.DE",
+    "company": "BASF SE",
+    "exchange": "XETRA",
+    "currency": "EUR",
+    "created": "2026-09-11T16:00:00+00:00",
+    "age_seconds": 1433560,
+    "score": 76.0,
+    "score_band": "good",
+    "verdict": "temporary_fear",
+    "verdict_label": "Temporary fear",
+    "confidence": "high",
+    "probability_up_6m": 82,
+    "price": {
+      "amount": 51.83,
+      "approx": null
+    },
+    "entry": {
+      "amount": 49.4,
+      "approx": null
+    },
+    "target": {
+      "amount": 60.5,
+      "approx": null
+    },
+    "potential_low": {
+      "amount": 46.5,
+      "approx": null
+    },
+    "stat_low": {
+      "amount": 40.8672,
+      "approx": null
+    },
+    "fx": null,
+    "upside_pct": 16.7278,
+    "downside_pct": -10.2836,
+    "entry_upside_pct": 22.4696,
+    "entry_downside_pct": -5.8704,
+    "change_1d_pct": -2.8309,
+    "change_5d_pct": -2.8673,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": true,
+    "on_my_watchlist": false,
+    "debate": null
+  },
+  "opportunity": {
+    "ticker": "BAS.DE",
+    "company": "BASF SE",
+    "created": "2026-09-11T16:00:00+00:00",
+    "price": 51.83000183105469,
+    "currency": "EUR",
+    "score": 76.0,
+    "analysis": {
+      "verdict": "temporary_fear",
+      "probability_up_6m": 82,
+      "potential_low": 46.5,
+      "entry_price": 49.4,
+      "target_price": 60.5,
+      "confidence": "high",
+      "fear": "Weak demand from the chemicals industry in Germany and higher energy prices.",
+      "fundamental_impact": "Limited: volumes are weak, but cost cuts are on track and the dividend is covered.",
+      "thesis": "A cyclical low with the cost programme working; a rebound is likely within six months.",
+      "risks": [
+        "The news develops further.",
+        "A weak market drags the shares lower."
+      ],
+      "catalysts": [
+        "The next results."
+      ],
+      "checks": [
+        "Read the company's statement on the news.",
+        "Check the date of the next results."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "BAS.DE",
+      "name": "BASF SE",
+      "currency": "EUR",
+      "exchange": "XETRA",
+      "as_of": "2026-09-11T15:25:00+00:00",
+      "price": 51.83000183105469,
+      "previous_close": 53.34000015258789,
+      "change_1d_pct": -2.830892983152611,
+      "change_5d_pct": -2.867314021357159,
+      "change_20d_pct": 1.3294238218775734,
+      "high_20d": 54.2400016784668,
+      "high_52w": 55.04999923706055,
+      "low_52w": 41.47999954223633,
+      "drawdown_20d_pct": -4.443214920417072,
+      "drawdown_52w_pct": -5.849223343563836,
+      "above_low_52w_pct": 24.951789785531787,
+      "sma_50": 50.61149978637695,
+      "sma_200": 49.14284984588623,
+      "volatility_pct": 20.430185314394915,
+      "volume_ratio": 1.2991674261998298,
+      "stat_low_6m": 40.86717449164466,
+      "worst_6m_drawdown_pct": -27.186064571531865,
+      "session_elapsed": null,
+      "timezone": "Europe/Berlin",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [],
+    "headlines": [],
+    "dip_reasons": [
+      "down 2.8% on Fri 11 Sep"
+    ],
+    "model": "gpt-5",
+    "news_after_session": false,
+    "account_currency": "EUR",
+    "fx_rate": 1.0,
+    "benchmark": "^GDAXI",
+    "benchmark_level": 25568.560546875,
+    "fx_rates": {
+      "EUR": 1.0
+    },
+    "id": 21,
+    "debate": null
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 60.5,
+        "approx": null
+      },
+      "change_pct": 16.7278,
+      "from_entry_pct": 22.4696
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 51.83,
+        "approx": null
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 49.4,
+        "approx": null
+      },
+      "change_pct": -4.6884,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 46.5,
+        "approx": null
+      },
+      "change_pct": -10.2836,
+      "from_entry_pct": -5.8704
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 40.8672,
+        "approx": null
+      },
+      "change_pct": -21.1515,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": null,
+  "chart": {
+    "currency": "EUR",
+    "closes": [
+      [
+        "2026-03-30",
+        53.0
+      ],
+      [
+        "2026-03-31",
+        52.4
+      ],
+      [
+        "2026-04-01",
+        50.94
+      ],
+      [
+        "2026-04-02",
+        50.94
+      ],
+      [
+        "2026-04-07",
+        51.93
+      ],
+      [
+        "2026-04-08",
+        52.21
+      ],
+      [
+        "2026-04-09",
+        53.58
+      ],
+      [
+        "2026-04-10",
+        54.7
+      ],
+      [
+        "2026-04-13",
+        54.65
+      ],
+      [
+        "2026-04-14",
+        53.73
+      ],
+      [
+        "2026-04-15",
+        52.9
+      ],
+      [
+        "2026-04-16",
+        53.41
+      ],
+      [
+        "2026-04-17",
+        52.77
+      ],
+      [
+        "2026-04-20",
+        52.9
+      ],
+      [
+        "2026-04-21",
+        53.49
+      ],
+      [
+        "2026-04-22",
+        53.51
+      ],
+      [
+        "2026-04-23",
+        54.24
+      ],
+      [
+        "2026-04-24",
+        54.32
+      ],
+      [
+        "2026-04-27",
+        54.28
+      ],
+      [
+        "2026-04-28",
+        54.44
+      ],
+      [
+        "2026-04-29",
+        54.05
+      ],
+      [
+        "2026-04-30",
+        54.74
+      ],
+      [
+        "2026-05-04",
+        52.85
+      ],
+      [
+        "2026-05-05",
+        53.45
+      ],
+      [
+        "2026-05-06",
+        52.52
+      ],
+      [
+        "2026-05-07",
+        50.91
+      ],
+      [
+        "2026-05-08",
+        51.65
+      ],
+      [
+        "2026-05-11",
+        53.46
+      ],
+      [
+        "2026-05-12",
+        53.2
+      ],
+      [
+        "2026-05-13",
+        54.0
+      ],
+      [
+        "2026-05-14",
+        53.39
+      ],
+      [
+        "2026-05-15",
+        52.63
+      ],
+      [
+        "2026-05-18",
+        52.96
+      ],
+      [
+        "2026-05-19",
+        52.3
+      ],
+      [
+        "2026-05-20",
+        51.1
+      ],
+      [
+        "2026-05-21",
+        51.89
+      ],
+      [
+        "2026-05-22",
+        51.67
+      ],
+      [
+        "2026-05-25",
+        51.35
+      ],
+      [
+        "2026-05-26",
+        51.32
+      ],
+      [
+        "2026-05-27",
+        51.09
+      ],
+      [
+        "2026-05-28",
+        50.72
+      ],
+      [
+        "2026-05-29",
+        50.82
+      ],
+      [
+        "2026-06-01",
+        50.84
+      ],
+      [
+        "2026-06-02",
+        51.07
+      ],
+      [
+        "2026-06-03",
+        50.78
+      ],
+      [
+        "2026-06-04",
+        50.65
+      ],
+      [
+        "2026-06-05",
+        50.98
+      ],
+      [
+        "2026-06-08",
+        48.85
+      ],
+      [
+        "2026-06-09",
+        48.525
+      ],
+      [
+        "2026-06-10",
+        47.98
+      ],
+      [
+        "2026-06-11",
+        48.875
+      ],
+      [
+        "2026-06-12",
+        49.5
+      ],
+      [
+        "2026-06-15",
+        49.225
+      ],
+      [
+        "2026-06-16",
+        49.11
+      ],
+      [
+        "2026-06-17",
+        49.885
+      ],
+      [
+        "2026-06-18",
+        48.535
+      ],
+      [
+        "2026-06-19",
+        49.005
+      ],
+      [
+        "2026-06-22",
+        49.17
+      ],
+      [
+        "2026-06-23",
+        48.905
+      ],
+      [
+        "2026-06-24",
+        48.89
+      ],
+      [
+        "2026-06-25",
+        48.275
+      ],
+      [
+        "2026-06-26",
+        47.76
+      ],
+      [
+        "2026-06-29",
+        46.93
+      ],
+      [
+        "2026-06-30",
+        46.78
+      ],
+      [
+        "2026-07-01",
+        46.795
+      ],
+      [
+        "2026-07-02",
+        47.64
+      ],
+      [
+        "2026-07-03",
+        47.78
+      ],
+      [
+        "2026-07-06",
+        47.33
+      ],
+      [
+        "2026-07-07",
+        47.355
+      ],
+      [
+        "2026-07-08",
+        47.62
+      ],
+      [
+        "2026-07-09",
+        47.44
+      ],
+      [
+        "2026-07-10",
+        47.55
+      ],
+      [
+        "2026-07-13",
+        48.85
+      ],
+      [
+        "2026-07-14",
+        49.42
+      ],
+      [
+        "2026-07-15",
+        47.94
+      ],
+      [
+        "2026-07-16",
+        48.415
+      ],
+      [
+        "2026-07-17",
+        48.545
+      ],
+      [
+        "2026-07-20",
+        48.07
+      ],
+      [
+        "2026-07-21",
+        48.245
+      ],
+      [
+        "2026-07-22",
+        48.97
+      ],
+      [
+        "2026-07-23",
+        48.87
+      ],
+      [
+        "2026-07-24",
+        48.57
+      ],
+      [
+        "2026-07-27",
+        48.21
+      ],
+      [
+        "2026-07-28",
+        48.965
+      ],
+      [
+        "2026-07-29",
+        50.86
+      ],
+      [
+        "2026-07-30",
+        51.24
+      ],
+      [
+        "2026-07-31",
+        50.4
+      ],
+      [
+        "2026-08-03",
+        51.06
+      ],
+      [
+        "2026-08-04",
+        50.44
+      ],
+      [
+        "2026-08-05",
+        50.7
+      ],
+      [
+        "2026-08-06",
+        51.32
+      ],
+      [
+        "2026-08-07",
+        51.5
+      ],
+      [
+        "2026-08-10",
+        51.63
+      ],
+      [
+        "2026-08-11",
+        51.26
+      ],
+      [
+        "2026-08-12",
+        51.27
+      ],
+      [
+        "2026-08-13",
+        50.17
+      ],
+      [
+        "2026-08-14",
+        51.15
+      ],
+      [
+        "2026-08-17",
+        50.51
+      ],
+      [
+        "2026-08-18",
+        50.99
+      ],
+      [
+        "2026-08-19",
+        51.79
+      ],
+      [
+        "2026-08-20",
+        51.5
+      ],
+      [
+        "2026-08-21",
+        51.67
+      ],
+      [
+        "2026-08-24",
+        52.43
+      ],
+      [
+        "2026-08-25",
+        51.68
+      ],
+      [
+        "2026-08-26",
+        51.78
+      ],
+      [
+        "2026-08-27",
+        51.51
+      ],
+      [
+        "2026-08-28",
+        52.52
+      ],
+      [
+        "2026-08-31",
+        52.98
+      ],
+      [
+        "2026-09-01",
+        53.03
+      ],
+      [
+        "2026-09-02",
+        53.38
+      ],
+      [
+        "2026-09-03",
+        53.51
+      ],
+      [
+        "2026-09-04",
+        53.36
+      ],
+      [
+        "2026-09-07",
+        53.03
+      ],
+      [
+        "2026-09-08",
+        53.67
+      ],
+      [
+        "2026-09-09",
+        52.7
+      ],
+      [
+        "2026-09-10",
+        53.34
+      ],
+      [
+        "2026-09-11",
+        51.83
+      ],
+      [
+        "2026-09-14",
+        52.38
+      ],
+      [
+        "2026-09-15",
+        51.84
+      ],
+      [
+        "2026-09-16",
+        52.13
+      ],
+      [
+        "2026-09-17",
+        52.37
+      ],
+      [
+        "2026-09-18",
+        51.62
+      ],
+      [
+        "2026-09-21",
+        51.36
+      ],
+      [
+        "2026-09-22",
+        51.79
+      ],
+      [
+        "2026-09-23",
+        52.18
+      ],
+      [
+        "2026-09-24",
+        52.3
+      ],
+      [
+        "2026-09-25",
+        50.42
+      ]
+    ],
+    "levels": {
+      "reported": 51.83000183105469,
+      "entry": 49.4,
+      "target": 60.5,
+      "potential_low": 46.5,
+      "stat_low": 40.86717449164466
+    },
+    "signal_day": "2026-09-11",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "^GDAXI",
+    "benchmark_name": "DAX",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 21,
+      "created": "2026-09-11T16:00:00+00:00",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "score": 76.0,
+      "score_band": "good",
+      "probability_up_6m": 82,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [],
+  "debate": null
+}

@@ -1,0 +1,11 @@
+{
+  "id": 41,
+  "ticker": "META",
+  "status": "failed",
+  "created": "2026-09-28T06:12:40+00:00",
+  "finished": "2026-09-28T06:13:10+00:00",
+  "opportunity_id": null,
+  "error": "The model's reply was unusable even after a corrective retry.",
+  "ahead": null,
+  "remaining": null
+}

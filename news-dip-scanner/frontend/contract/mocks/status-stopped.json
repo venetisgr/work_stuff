@@ -1,0 +1,24 @@
+{
+  "state": "stopped",
+  "label": "Scanner stopped",
+  "reason": "The language model can't be used: OpenAI answered that the account has no quota left (insufficient_quota).",
+  "interval_minutes": 5,
+  "cycle_running_since": null,
+  "next_cycle_at": null,
+  "last_cycle": {
+    "started": "2026-09-28T03:11:40+00:00",
+    "finished": "2026-09-28T03:12:40+00:00",
+    "ok": false,
+    "summary": "Cycle 03:10 failed: the language model can't be used"
+  },
+  "feeds": {
+    "ok": 20,
+    "total": 20
+  },
+  "model_today": {
+    "calls": 12,
+    "input_tokens": 18110,
+    "output_tokens": 0,
+    "since": "2026-09-28T00:00:00+00:00"
+  }
+}

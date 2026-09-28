@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "unavailable",
+    "message": "Manual analyses aren't available on this server.",
+    "retry_after": null
+  }
+}

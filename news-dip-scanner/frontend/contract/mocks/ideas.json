@@ -1,0 +1,620 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "filters": {
+    "days": 30,
+    "min_score": null,
+    "verdict": null,
+    "watchlist": false,
+    "matching": false,
+    "sort": "score"
+  },
+  "total": 10,
+  "count": 10,
+  "page": {
+    "number": 1,
+    "pages": 1,
+    "size": 25
+  },
+  "ideas": [
+    {
+      "id": 2,
+      "ticker": "NIO",
+      "company": "NIO Inc.",
+      "exchange": "NYSE",
+      "currency": "USD",
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "age_seconds": 11921,
+      "score": 80.6,
+      "score_band": "strong",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "confidence": "high",
+      "probability_up_6m": 86,
+      "price": {
+        "amount": 3.58,
+        "approx": 3.1426
+      },
+      "entry": {
+        "amount": 3.35,
+        "approx": 2.9407
+      },
+      "target": {
+        "amount": 4.6,
+        "approx": 4.0379
+      },
+      "potential_low": {
+        "amount": 3.1,
+        "approx": 2.7212
+      },
+      "stat_low": {
+        "amount": 2.3931,
+        "approx": 2.1007
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.877808988764045,
+        "main_currency": "USD",
+        "rate_main_unit": 0.877808988764045,
+        "source": "analysis",
+        "as_of": "2026-09-28T02:53:58.652091+00:00",
+        "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 28.4916,
+      "downside_pct": -13.4078,
+      "entry_upside_pct": 37.3134,
+      "entry_downside_pct": -7.4627,
+      "change_1d_pct": -1.3774,
+      "change_5d_pct": -2.1858,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": true,
+      "on_my_watchlist": false,
+      "debate": null
+    },
+    {
+      "id": 21,
+      "ticker": "BAS.DE",
+      "company": "BASF SE",
+      "exchange": "XETRA",
+      "currency": "EUR",
+      "created": "2026-09-11T16:00:00+00:00",
+      "age_seconds": 1433560,
+      "score": 76.0,
+      "score_band": "good",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "confidence": "high",
+      "probability_up_6m": 82,
+      "price": {
+        "amount": 51.83,
+        "approx": null
+      },
+      "entry": {
+        "amount": 49.4,
+        "approx": null
+      },
+      "target": {
+        "amount": 60.5,
+        "approx": null
+      },
+      "potential_low": {
+        "amount": 46.5,
+        "approx": null
+      },
+      "stat_low": {
+        "amount": 40.8672,
+        "approx": null
+      },
+      "fx": null,
+      "upside_pct": 16.7278,
+      "downside_pct": -10.2836,
+      "entry_upside_pct": 22.4696,
+      "entry_downside_pct": -5.8704,
+      "change_1d_pct": -2.8309,
+      "change_5d_pct": -2.8673,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": true,
+      "on_my_watchlist": false,
+      "debate": null
+    },
+    {
+      "id": 10,
+      "ticker": "ALWN.AT",
+      "company": "Allwyn AG",
+      "exchange": "Athens",
+      "currency": "EUR",
+      "created": "2026-09-25T15:00:00+00:00",
+      "age_seconds": 227560,
+      "score": 66.3,
+      "score_band": "good",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "confidence": "medium",
+      "probability_up_6m": 78,
+      "price": {
+        "amount": 11.84,
+        "approx": null
+      },
+      "entry": {
+        "amount": 11.2,
+        "approx": null
+      },
+      "target": {
+        "amount": 13.9,
+        "approx": null
+      },
+      "potential_low": {
+        "amount": 10.2,
+        "approx": null
+      },
+      "stat_low": {
+        "amount": 9.1004,
+        "approx": null
+      },
+      "fx": null,
+      "upside_pct": 17.3986,
+      "downside_pct": -13.8514,
+      "entry_upside_pct": 24.1071,
+      "entry_downside_pct": -8.9286,
+      "change_1d_pct": -1.6611,
+      "change_5d_pct": -3.7398,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": true,
+      "on_my_watchlist": true,
+      "debate": {
+        "mode": "agreed",
+        "agreement": "high",
+        "line": "Claude 80% · GPT-5 76% → 78% (high agreement)",
+        "participants": [
+          {
+            "label": "A",
+            "model": "anthropic:claude-sonnet-5",
+            "model_label": "Claude Sonnet 5",
+            "opening_probability": 80,
+            "final_probability": 80,
+            "final_verdict": "temporary_fear",
+            "changed_mind": false
+          },
+          {
+            "label": "B",
+            "model": "openai:gpt-5",
+            "model_label": "GPT-5",
+            "opening_probability": 76,
+            "final_probability": 76,
+            "final_verdict": "temporary_fear",
+            "changed_mind": false
+          }
+        ],
+        "final_probability": 78,
+        "judge": null,
+        "judge_label": null
+      }
+    },
+    {
+      "id": 9,
+      "ticker": "AMD",
+      "company": "Advanced Micro Devices, Inc.",
+      "exchange": "NasdaqGS",
+      "currency": "USD",
+      "created": "2026-09-23T21:51:00+00:00",
+      "age_seconds": 375700,
+      "score": 64.8,
+      "score_band": "fair",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "confidence": "high",
+      "probability_up_6m": 71,
+      "price": {
+        "amount": 614.61,
+        "approx": 536.8741
+      },
+      "entry": {
+        "amount": 585.0,
+        "approx": 511.0092
+      },
+      "target": {
+        "amount": 690.0,
+        "approx": 602.7288
+      },
+      "potential_low": {
+        "amount": 540.0,
+        "approx": 471.7008
+      },
+      "stat_low": {
+        "amount": 270.0282,
+        "approx": 235.8751
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.87352,
+        "main_currency": "USD",
+        "rate_main_unit": 0.87352,
+        "source": "analysis",
+        "as_of": "2026-09-23T21:51:00+00:00",
+        "note": "1 USD = 0.8735 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 12.2663,
+      "downside_pct": -12.1394,
+      "entry_upside_pct": 17.9487,
+      "entry_downside_pct": -7.6923,
+      "change_1d_pct": -1.4685,
+      "change_5d_pct": 19.9239,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": true,
+      "on_my_watchlist": false,
+      "debate": null
+    },
+    {
+      "id": 7,
+      "ticker": "META",
+      "company": "Meta Platforms, Inc.",
+      "exchange": "NasdaqGS",
+      "currency": "USD",
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "age_seconds": 11921,
+      "score": 57.5,
+      "score_band": "fair",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "confidence": "medium",
+      "probability_up_6m": 66,
+      "price": {
+        "amount": 751.66,
+        "approx": 659.8139
+      },
+      "entry": {
+        "amount": 712.0,
+        "approx": 625.0
+      },
+      "target": {
+        "amount": 842.0,
+        "approx": 739.1152
+      },
+      "potential_low": {
+        "amount": 668.0,
+        "approx": 586.3764
+      },
+      "stat_low": {
+        "amount": 428.5603,
+        "approx": 376.1941
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.877808988764045,
+        "main_currency": "USD",
+        "rate_main_unit": 0.877808988764045,
+        "source": "analysis",
+        "as_of": "2026-09-28T02:53:58.652091+00:00",
+        "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 12.0187,
+      "downside_pct": -11.13,
+      "entry_upside_pct": 18.2584,
+      "entry_downside_pct": -6.1798,
+      "change_1d_pct": -3.3347,
+      "change_5d_pct": 12.9042,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": true,
+      "on_my_watchlist": true,
+      "debate": {
+        "mode": "debate",
+        "agreement": "medium",
+        "line": "GPT-5 70% · Claude 62% → 66% (medium agreement)",
+        "participants": [
+          {
+            "label": "A",
+            "model": "openai:gpt-5",
+            "model_label": "GPT-5",
+            "opening_probability": 72,
+            "final_probability": 70,
+            "final_verdict": "temporary_fear",
+            "changed_mind": false
+          },
+          {
+            "label": "B",
+            "model": "anthropic:claude-sonnet-5",
+            "model_label": "Claude Sonnet 5",
+            "opening_probability": 58,
+            "final_probability": 62,
+            "final_verdict": "mixed",
+            "changed_mind": true
+          }
+        ],
+        "final_probability": 66,
+        "judge": "anthropic:claude-sonnet-5",
+        "judge_label": "Claude Sonnet 5"
+      }
+    },
+    {
+      "id": 26,
+      "ticker": "F",
+      "company": "Ford Motor Company",
+      "exchange": "NYSE",
+      "currency": "USD",
+      "created": "2026-09-28T02:55:42.159283+00:00",
+      "age_seconds": 11817,
+      "score": 45.4,
+      "score_band": "weak",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "confidence": "medium",
+      "probability_up_6m": 63,
+      "price": {
+        "amount": 12.71,
+        "approx": 11.157
+      },
+      "entry": {
+        "amount": 11.9,
+        "approx": 10.4459
+      },
+      "target": {
+        "amount": 14.4,
+        "approx": 12.6404
+      },
+      "potential_low": {
+        "amount": 10.6,
+        "approx": 9.3048
+      },
+      "stat_low": {
+        "amount": 8.7768,
+        "approx": 7.7043
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.877808988764045,
+        "main_currency": "USD",
+        "rate_main_unit": 0.877808988764045,
+        "source": "analysis",
+        "as_of": "2026-09-28T02:55:42.159283+00:00",
+        "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 13.2966,
+      "downside_pct": -16.6011,
+      "entry_upside_pct": 21.0084,
+      "entry_downside_pct": -10.9244,
+      "change_1d_pct": 0.873,
+      "change_5d_pct": -3.785,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": false,
+      "on_my_watchlist": false,
+      "debate": null
+    },
+    {
+      "id": 5,
+      "ticker": "1211.HK",
+      "company": "BYD Company Limited",
+      "exchange": "HKSE",
+      "currency": "HKD",
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "age_seconds": 11921,
+      "score": 45.3,
+      "score_band": "weak",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "confidence": "medium",
+      "probability_up_6m": 61,
+      "price": {
+        "amount": 78.6,
+        "approx": 8.7991
+      },
+      "entry": {
+        "amount": 72.5,
+        "approx": 8.1162
+      },
+      "target": {
+        "amount": 90.0,
+        "approx": 10.0753
+      },
+      "potential_low": {
+        "amount": 66.5,
+        "approx": 7.4446
+      },
+      "stat_low": {
+        "amount": 54.7949,
+        "approx": 6.1342
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.11194823513607308,
+        "main_currency": "HKD",
+        "rate_main_unit": 0.11194823513607308,
+        "source": "analysis",
+        "as_of": "2026-09-28T02:53:58.652091+00:00",
+        "note": "1 HKD = 0.1119 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 14.5038,
+      "downside_pct": -15.3944,
+      "entry_upside_pct": 24.1379,
+      "entry_downside_pct": -8.2759,
+      "change_1d_pct": 0.6402,
+      "change_5d_pct": -3.202,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": false,
+      "on_my_watchlist": false,
+      "debate": {
+        "mode": "single",
+        "agreement": null,
+        "line": "GPT-5 61% (single model: Claude unavailable)",
+        "participants": [
+          {
+            "label": "A",
+            "model": "openai:gpt-5",
+            "model_label": "GPT-5",
+            "opening_probability": 61,
+            "final_probability": 61,
+            "final_verdict": "mixed",
+            "changed_mind": false
+          }
+        ],
+        "final_probability": 61,
+        "judge": null,
+        "judge_label": null
+      }
+    },
+    {
+      "id": 27,
+      "ticker": "IBM",
+      "company": "International Business Machines Corporation",
+      "exchange": "NYSE",
+      "currency": "USD",
+      "created": "2026-09-28T02:55:42.159283+00:00",
+      "age_seconds": 11817,
+      "score": 43.9,
+      "score_band": "weak",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "confidence": "medium",
+      "probability_up_6m": 58,
+      "price": {
+        "amount": 225.51,
+        "approx": 197.9547
+      },
+      "entry": {
+        "amount": 214.0,
+        "approx": 187.8511
+      },
+      "target": {
+        "amount": 246.0,
+        "approx": 215.941
+      },
+      "potential_low": {
+        "amount": 205.0,
+        "approx": 179.9508
+      },
+      "stat_low": {
+        "amount": 101.7765,
+        "approx": 89.3403
+      },
+      "fx": {
+        "currency": "EUR",
+        "rate": 0.877808988764045,
+        "main_currency": "USD",
+        "rate_main_unit": 0.877808988764045,
+        "source": "analysis",
+        "as_of": "2026-09-28T02:55:42.159283+00:00",
+        "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+      },
+      "upside_pct": 9.0861,
+      "downside_pct": -9.0949,
+      "entry_upside_pct": 14.9533,
+      "entry_downside_pct": -4.2056,
+      "change_1d_pct": -0.6826,
+      "change_5d_pct": -1.76,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": false,
+      "on_my_watchlist": false,
+      "debate": null
+    },
+    {
+      "id": 28,
+      "ticker": "ETE.AT",
+      "company": "National Bank of Greece S.A.",
+      "exchange": "Athens",
+      "currency": "EUR",
+      "created": "2026-09-28T03:09:43.623878+00:00",
+      "age_seconds": 10976,
+      "score": 31.3,
+      "score_band": "weak",
+      "verdict": "unclear",
+      "verdict_label": "Unclear",
+      "confidence": "low",
+      "probability_up_6m": 52,
+      "price": {
+        "amount": 17.435,
+        "approx": null
+      },
+      "entry": {
+        "amount": 16.9,
+        "approx": null
+      },
+      "target": {
+        "amount": 18.9,
+        "approx": null
+      },
+      "potential_low": {
+        "amount": 16.2,
+        "approx": null
+      },
+      "stat_low": {
+        "amount": 13.0316,
+        "approx": null
+      },
+      "fx": null,
+      "upside_pct": 8.4026,
+      "downside_pct": -7.0835,
+      "entry_upside_pct": 11.8343,
+      "entry_downside_pct": -4.142,
+      "change_1d_pct": 2.5588,
+      "change_5d_pct": -0.3714,
+      "analyses_count": 2,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": false,
+      "on_my_watchlist": true,
+      "debate": null
+    },
+    {
+      "id": 12,
+      "ticker": "SAP.DE",
+      "company": "SAP SE",
+      "exchange": "XETRA",
+      "currency": "EUR",
+      "created": "2026-09-01T16:00:00+00:00",
+      "age_seconds": 2297560,
+      "score": 18.8,
+      "score_band": "weak",
+      "verdict": "fundamental",
+      "verdict_label": "Fundamental damage",
+      "confidence": "medium",
+      "probability_up_6m": 38,
+      "price": {
+        "amount": 184.26,
+        "approx": null
+      },
+      "entry": {
+        "amount": 175.0,
+        "approx": null
+      },
+      "target": {
+        "amount": 205.0,
+        "approx": null
+      },
+      "potential_low": {
+        "amount": 160.0,
+        "approx": null
+      },
+      "stat_low": {
+        "amount": 108.7831,
+        "approx": null
+      },
+      "fx": null,
+      "upside_pct": 11.2558,
+      "downside_pct": -13.1662,
+      "entry_upside_pct": 17.1429,
+      "entry_downside_pct": -8.5714,
+      "change_1d_pct": -3.4783,
+      "change_5d_pct": -0.647,
+      "analyses_count": 1,
+      "superseded": false,
+      "superseded_by": null,
+      "matches_my_rules": false,
+      "on_my_watchlist": false,
+      "debate": null
+    }
+  ]
+}

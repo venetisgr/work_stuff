@@ -1,0 +1,11 @@
+{
+  "id": 41,
+  "ticker": "META",
+  "status": "queued",
+  "created": "2026-09-28T06:12:40+00:00",
+  "finished": null,
+  "opportunity_id": null,
+  "error": null,
+  "ahead": 1,
+  "remaining": null
+}

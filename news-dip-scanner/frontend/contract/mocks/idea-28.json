@@ -1,0 +1,748 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 28,
+    "ticker": "ETE.AT",
+    "company": "National Bank of Greece S.A.",
+    "exchange": "Athens",
+    "currency": "EUR",
+    "created": "2026-09-28T03:09:43.623878+00:00",
+    "age_seconds": 10976,
+    "score": 31.3,
+    "score_band": "weak",
+    "verdict": "unclear",
+    "verdict_label": "Unclear",
+    "confidence": "low",
+    "probability_up_6m": 52,
+    "price": {
+      "amount": 17.435,
+      "approx": null
+    },
+    "entry": {
+      "amount": 16.9,
+      "approx": null
+    },
+    "target": {
+      "amount": 18.9,
+      "approx": null
+    },
+    "potential_low": {
+      "amount": 16.2,
+      "approx": null
+    },
+    "stat_low": {
+      "amount": 13.0316,
+      "approx": null
+    },
+    "fx": null,
+    "upside_pct": 8.4026,
+    "downside_pct": -7.0835,
+    "entry_upside_pct": 11.8343,
+    "entry_downside_pct": -4.142,
+    "change_1d_pct": 2.5588,
+    "change_5d_pct": -0.3714,
+    "analyses_count": 2,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": false,
+    "on_my_watchlist": true,
+    "debate": null
+  },
+  "opportunity": {
+    "ticker": "ETE.AT",
+    "company": "National Bank of Greece S.A.",
+    "created": "2026-09-28T03:09:43.623878+00:00",
+    "price": 17.435,
+    "currency": "EUR",
+    "score": 31.3,
+    "analysis": {
+      "verdict": "unclear",
+      "probability_up_6m": 52,
+      "potential_low": 16.2,
+      "entry_price": 16.9,
+      "target_price": 18.9,
+      "confidence": "low",
+      "fear": "Worries that lower interest rates will squeeze Greek banks' net interest income.",
+      "fundamental_impact": "Hard to tell from the news: lower rates cut income, but loan growth may offset it.",
+      "thesis": "No clear edge either way until the next results show how margins hold up.",
+      "risks": [
+        "The news develops further.",
+        "A weak market drags the shares lower."
+      ],
+      "catalysts": [
+        "The next results."
+      ],
+      "checks": [
+        "Read the company's statement on the news.",
+        "Check the date of the next results."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "ETE.AT",
+      "name": "National Bank of Greece S.A.",
+      "currency": "EUR",
+      "exchange": "Athens",
+      "as_of": "2026-09-25T14:17:06+00:00",
+      "price": 17.435,
+      "previous_close": 17.0,
+      "change_1d_pct": 2.5588235294117467,
+      "change_5d_pct": -0.3714285714285781,
+      "change_20d_pct": 3.441118205374427,
+      "high_20d": 18.0,
+      "high_52w": 18.0,
+      "low_52w": 11.664999961853027,
+      "drawdown_20d_pct": -3.138888888888891,
+      "drawdown_52w_pct": -3.138888888888891,
+      "above_low_52w_pct": 49.46420966151797,
+      "sma_50": 16.654800101470947,
+      "sma_200": 14.869525029945374,
+      "volatility_pct": 25.026154025143327,
+      "volume_ratio": 0.4574028691299641,
+      "stat_low_6m": 13.03160805400927,
+      "worst_6m_drawdown_pct": -21.39461224477952,
+      "session_elapsed": null,
+      "timezone": "Europe/Athens",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [],
+    "headlines": [],
+    "dip_reasons": [],
+    "model": "gpt-5",
+    "news_after_session": false,
+    "account_currency": "EUR",
+    "fx_rate": 1.0,
+    "benchmark": "GD.AT",
+    "benchmark_level": 2665.93,
+    "fx_rates": {
+      "EUR": 1.0
+    },
+    "id": 28,
+    "debate": null
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 18.9,
+        "approx": null
+      },
+      "change_pct": 8.4026,
+      "from_entry_pct": 11.8343
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 17.435,
+        "approx": null
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 16.9,
+        "approx": null
+      },
+      "change_pct": -3.0685,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 16.2,
+        "approx": null
+      },
+      "change_pct": -7.0835,
+      "from_entry_pct": -4.142
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 13.0316,
+        "approx": null
+      },
+      "change_pct": -25.256,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": null,
+  "chart": {
+    "currency": "EUR",
+    "closes": [
+      [
+        "2026-03-30",
+        12.7
+      ],
+      [
+        "2026-03-31",
+        13.235
+      ],
+      [
+        "2026-04-01",
+        13.3
+      ],
+      [
+        "2026-04-02",
+        13.11
+      ],
+      [
+        "2026-04-07",
+        13.46
+      ],
+      [
+        "2026-04-08",
+        14.91
+      ],
+      [
+        "2026-04-09",
+        14.28
+      ],
+      [
+        "2026-04-14",
+        15.13
+      ],
+      [
+        "2026-04-15",
+        15.04
+      ],
+      [
+        "2026-04-16",
+        14.6
+      ],
+      [
+        "2026-04-17",
+        15.01
+      ],
+      [
+        "2026-04-20",
+        14.38
+      ],
+      [
+        "2026-04-21",
+        14.48
+      ],
+      [
+        "2026-04-22",
+        14.3
+      ],
+      [
+        "2026-04-23",
+        14.28
+      ],
+      [
+        "2026-04-24",
+        14.17
+      ],
+      [
+        "2026-04-27",
+        14.085
+      ],
+      [
+        "2026-04-28",
+        13.855
+      ],
+      [
+        "2026-04-29",
+        13.845
+      ],
+      [
+        "2026-04-30",
+        13.425
+      ],
+      [
+        "2026-05-04",
+        13.5
+      ],
+      [
+        "2026-05-05",
+        13.88
+      ],
+      [
+        "2026-05-06",
+        14.3
+      ],
+      [
+        "2026-05-07",
+        14.25
+      ],
+      [
+        "2026-05-08",
+        14.285
+      ],
+      [
+        "2026-05-11",
+        14.62
+      ],
+      [
+        "2026-05-12",
+        14.28
+      ],
+      [
+        "2026-05-13",
+        14.085
+      ],
+      [
+        "2026-05-14",
+        14.32
+      ],
+      [
+        "2026-05-15",
+        13.8
+      ],
+      [
+        "2026-05-18",
+        13.75
+      ],
+      [
+        "2026-05-19",
+        13.525
+      ],
+      [
+        "2026-05-20",
+        13.6
+      ],
+      [
+        "2026-05-21",
+        14.02
+      ],
+      [
+        "2026-05-22",
+        14.155
+      ],
+      [
+        "2026-05-25",
+        14.435
+      ],
+      [
+        "2026-05-26",
+        14.76
+      ],
+      [
+        "2026-05-27",
+        15.12
+      ],
+      [
+        "2026-05-28",
+        14.72
+      ],
+      [
+        "2026-05-29",
+        14.825
+      ],
+      [
+        "2026-06-02",
+        14.84
+      ],
+      [
+        "2026-06-03",
+        14.705
+      ],
+      [
+        "2026-06-04",
+        14.335
+      ],
+      [
+        "2026-06-05",
+        14.72
+      ],
+      [
+        "2026-06-08",
+        14.65
+      ],
+      [
+        "2026-06-09",
+        14.715
+      ],
+      [
+        "2026-06-10",
+        14.35
+      ],
+      [
+        "2026-06-11",
+        14.6
+      ],
+      [
+        "2026-06-12",
+        14.92
+      ],
+      [
+        "2026-06-15",
+        15.3
+      ],
+      [
+        "2026-06-16",
+        15.435
+      ],
+      [
+        "2026-06-17",
+        15.5
+      ],
+      [
+        "2026-06-18",
+        15.415
+      ],
+      [
+        "2026-06-19",
+        15.505
+      ],
+      [
+        "2026-06-22",
+        15.7
+      ],
+      [
+        "2026-06-23",
+        15.5
+      ],
+      [
+        "2026-06-24",
+        15.42
+      ],
+      [
+        "2026-06-25",
+        15.05
+      ],
+      [
+        "2026-06-26",
+        15.0
+      ],
+      [
+        "2026-06-29",
+        15.2
+      ],
+      [
+        "2026-06-30",
+        15.085
+      ],
+      [
+        "2026-07-01",
+        15.375
+      ],
+      [
+        "2026-07-02",
+        15.495
+      ],
+      [
+        "2026-07-03",
+        15.765
+      ],
+      [
+        "2026-07-06",
+        15.955
+      ],
+      [
+        "2026-07-07",
+        15.68
+      ],
+      [
+        "2026-07-08",
+        15.22
+      ],
+      [
+        "2026-07-09",
+        15.525
+      ],
+      [
+        "2026-07-10",
+        15.8
+      ],
+      [
+        "2026-07-13",
+        15.555
+      ],
+      [
+        "2026-07-14",
+        15.29
+      ],
+      [
+        "2026-07-15",
+        14.9
+      ],
+      [
+        "2026-07-16",
+        14.72
+      ],
+      [
+        "2026-07-17",
+        14.575
+      ],
+      [
+        "2026-07-20",
+        14.785
+      ],
+      [
+        "2026-07-21",
+        15.3
+      ],
+      [
+        "2026-07-22",
+        15.45
+      ],
+      [
+        "2026-07-23",
+        15.195
+      ],
+      [
+        "2026-07-24",
+        15.69
+      ],
+      [
+        "2026-07-27",
+        16.03
+      ],
+      [
+        "2026-07-28",
+        16.165
+      ],
+      [
+        "2026-07-29",
+        16.36
+      ],
+      [
+        "2026-07-30",
+        16.69
+      ],
+      [
+        "2026-07-31",
+        16.1
+      ],
+      [
+        "2026-08-03",
+        16.45
+      ],
+      [
+        "2026-08-04",
+        16.465
+      ],
+      [
+        "2026-08-05",
+        16.17
+      ],
+      [
+        "2026-08-06",
+        16.34
+      ],
+      [
+        "2026-08-07",
+        16.185
+      ],
+      [
+        "2026-08-10",
+        16.22
+      ],
+      [
+        "2026-08-11",
+        16.2
+      ],
+      [
+        "2026-08-12",
+        16.2
+      ],
+      [
+        "2026-08-13",
+        16.01
+      ],
+      [
+        "2026-08-14",
+        16.465
+      ],
+      [
+        "2026-08-17",
+        16.52
+      ],
+      [
+        "2026-08-18",
+        16.425
+      ],
+      [
+        "2026-08-19",
+        16.33
+      ],
+      [
+        "2026-08-20",
+        16.2
+      ],
+      [
+        "2026-08-21",
+        16.6
+      ],
+      [
+        "2026-08-24",
+        16.44
+      ],
+      [
+        "2026-08-25",
+        16.615
+      ],
+      [
+        "2026-08-26",
+        16.9
+      ],
+      [
+        "2026-08-27",
+        16.78
+      ],
+      [
+        "2026-08-28",
+        16.855
+      ],
+      [
+        "2026-08-31",
+        16.88
+      ],
+      [
+        "2026-09-01",
+        16.835
+      ],
+      [
+        "2026-09-02",
+        16.97
+      ],
+      [
+        "2026-09-03",
+        17.375
+      ],
+      [
+        "2026-09-04",
+        17.55
+      ],
+      [
+        "2026-09-07",
+        17.525
+      ],
+      [
+        "2026-09-08",
+        17.6
+      ],
+      [
+        "2026-09-09",
+        17.285
+      ],
+      [
+        "2026-09-10",
+        17.34
+      ],
+      [
+        "2026-09-11",
+        17.68
+      ],
+      [
+        "2026-09-14",
+        17.385
+      ],
+      [
+        "2026-09-15",
+        17.415
+      ],
+      [
+        "2026-09-16",
+        17.565
+      ],
+      [
+        "2026-09-17",
+        17.41
+      ],
+      [
+        "2026-09-18",
+        17.5
+      ],
+      [
+        "2026-09-21",
+        17.44
+      ],
+      [
+        "2026-09-22",
+        17.375
+      ],
+      [
+        "2026-09-23",
+        17.04
+      ],
+      [
+        "2026-09-24",
+        17.0
+      ],
+      [
+        "2026-09-25",
+        17.435
+      ]
+    ],
+    "levels": {
+      "reported": 17.435,
+      "entry": 16.9,
+      "target": 18.9,
+      "potential_low": 16.2,
+      "stat_low": 13.03160805400927
+    },
+    "signal_day": "2026-09-28",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "GD.AT",
+    "benchmark_name": "Athens General",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 28,
+      "created": "2026-09-28T03:09:43.623878+00:00",
+      "verdict": "unclear",
+      "verdict_label": "Unclear",
+      "score": 31.3,
+      "score_band": "weak",
+      "probability_up_6m": 52,
+      "superseded": false,
+      "current": true
+    },
+    {
+      "id": 11,
+      "created": "2026-09-23T15:00:00+00:00",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "score": 59.0,
+      "score_band": "fair",
+      "probability_up_6m": 72,
+      "superseded": true,
+      "current": false
+    }
+  ],
+  "rule_misses": [
+    "its score 31.3 is under your 55",
+    "its chance up of 52% is under your 60%",
+    "you don't alert on “Unclear”"
+  ],
+  "debate": null
+}

@@ -1,0 +1,35 @@
+{
+  "user": {
+    "id": 2,
+    "email": "eleni@example.com",
+    "name": "",
+    "label": "eleni@example.com",
+    "role": "member"
+  },
+  "settings": {
+    "currency": null,
+    "timezone": "Europe/Berlin",
+    "watchlist": [],
+    "alert_rules": {
+      "min_score": 65.0,
+      "min_probability": 60,
+      "verdicts": [
+        "temporary_fear",
+        "mixed"
+      ],
+      "only_watchlist": false,
+      "thesis_changes": true
+    },
+    "has_alert_channel": false
+  },
+  "csrf": "mock-csrf-8d7e6f5a4b3c2d1e0f9a",
+  "capabilities": {
+    "admin": false,
+    "analyse": {
+      "available": false,
+      "limit": 5,
+      "remaining": 0,
+      "note": "You have used your 5 manual analyses of the last 24 hours."
+    }
+  }
+}

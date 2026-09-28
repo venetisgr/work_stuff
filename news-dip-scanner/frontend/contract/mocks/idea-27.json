@@ -1,0 +1,224 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 27,
+    "ticker": "IBM",
+    "company": "International Business Machines Corporation",
+    "exchange": "NYSE",
+    "currency": "USD",
+    "created": "2026-09-28T02:55:42.159283+00:00",
+    "age_seconds": 11817,
+    "score": 43.9,
+    "score_band": "weak",
+    "verdict": "mixed",
+    "verdict_label": "Mixed",
+    "confidence": "medium",
+    "probability_up_6m": 58,
+    "price": {
+      "amount": 225.51,
+      "approx": 197.9547
+    },
+    "entry": {
+      "amount": 214.0,
+      "approx": 187.8511
+    },
+    "target": {
+      "amount": 246.0,
+      "approx": 215.941
+    },
+    "potential_low": {
+      "amount": 205.0,
+      "approx": 179.9508
+    },
+    "stat_low": {
+      "amount": 101.7765,
+      "approx": 89.3403
+    },
+    "fx": {
+      "currency": "EUR",
+      "rate": 0.877808988764045,
+      "main_currency": "USD",
+      "rate_main_unit": 0.877808988764045,
+      "source": "analysis",
+      "as_of": "2026-09-28T02:55:42.159283+00:00",
+      "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+    },
+    "upside_pct": 9.0861,
+    "downside_pct": -9.0949,
+    "entry_upside_pct": 14.9533,
+    "entry_downside_pct": -4.2056,
+    "change_1d_pct": -0.6826,
+    "change_5d_pct": -1.76,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": false,
+    "on_my_watchlist": false,
+    "debate": null
+  },
+  "opportunity": {
+    "ticker": "IBM",
+    "company": "International Business Machines Corporation",
+    "created": "2026-09-28T02:55:42.159283+00:00",
+    "price": 225.51,
+    "currency": "USD",
+    "score": 43.9,
+    "analysis": {
+      "verdict": "mixed",
+      "probability_up_6m": 58,
+      "potential_low": 205.0,
+      "entry_price": 214.0,
+      "target_price": 246.0,
+      "confidence": "medium",
+      "fear": "Worries that slower consulting demand will hold back IBM's growth next year.",
+      "fundamental_impact": "Consulting is under pressure, while software and mainframe sales are growing.",
+      "thesis": "A mixed picture: the dividend looks safe, but a clear recovery needs the consulting business to stabilise.",
+      "risks": [
+        "Consulting sales keep falling.",
+        "A large acquisition adds debt."
+      ],
+      "catalysts": [
+        "The October results."
+      ],
+      "checks": [
+        "Check the consulting backlog in the last results."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "IBM",
+      "name": "International Business Machines Corporation",
+      "currency": "USD",
+      "exchange": "NYSE",
+      "as_of": "2026-09-25T20:00:03+00:00",
+      "price": 225.51,
+      "previous_close": 227.05999755859375,
+      "change_1d_pct": -0.6826378821719881,
+      "change_5d_pct": -1.7599664552593763,
+      "change_20d_pct": -5.561369261491588,
+      "high_20d": 251.82000732421875,
+      "high_52w": 332.46,
+      "low_52w": 199.19,
+      "drawdown_20d_pct": -10.447941608684241,
+      "drawdown_52w_pct": -32.169283522829815,
+      "above_low_52w_pct": 13.213514734675424,
+      "sma_50": 230.6605988647461,
+      "sma_200": 257.71474955444336,
+      "volatility_pct": 68.3967871283609,
+      "volume_ratio": 0.7392968338790111,
+      "stat_low_6m": 101.77652391246515,
+      "worst_6m_drawdown_pct": -37.49962111412562,
+      "session_elapsed": null,
+      "timezone": "America/New_York",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [
+      "e4a0e14505cb2ce3ae77fb44aa433b43192b1976"
+    ],
+    "headlines": [
+      {
+        "title": "IBM’s Dividend Survived the Old IBM. Can It Survive the New One? - 24/7 Wall St.",
+        "link": "https://news.google.com/rss/articles/CBMiqAFBVV95cUxPdENFTUkyVXVmclRPLUp4LW4wT09hd0NpNG0zQU5JZmRIMDgtY2w5Znkzb1VMZUVqOTNGYk12ZmsxYjVYTkxyUEYyeXh3aWRmUXpVU05uUW9BMUNyZ2RrbmFiM3FIZTdNNXF2RFVpZm42UzloaVdwQUk1ME9HR1dSdWVfLVVVeUprc1g4VXNlT3BrNUlkWHJDeWNzdGNaeXV2eFpnZTdzTlc?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-27T18:20:00+00:00",
+        "direction": "negative",
+        "magnitude": 2
+      }
+    ],
+    "dip_reasons": [
+      "10.4% below its 20-day high",
+      "all of this news came out after the last session (Fri 25 Sep)"
+    ],
+    "model": "gpt-5",
+    "news_after_session": true,
+    "account_currency": "EUR",
+    "fx_rate": 0.877808988764045,
+    "benchmark": "^GSPC",
+    "benchmark_level": 7743.41,
+    "fx_rates": {
+      "EUR": 0.877808988764045
+    },
+    "id": 27,
+    "debate": null
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 246.0,
+        "approx": 215.941
+      },
+      "change_pct": 9.0861,
+      "from_entry_pct": 14.9533
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 225.51,
+        "approx": 197.9547
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 214.0,
+        "approx": 187.8511
+      },
+      "change_pct": -5.104,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 205.0,
+        "approx": 179.9508
+      },
+      "change_pct": -9.0949,
+      "from_entry_pct": -4.2056
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 101.7765,
+        "approx": 89.3403
+      },
+      "change_pct": -54.8683,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ",
+  "chart": null,
+  "prices_problem": "Yahoo Finance couldn't be reached (timed out after 20 s); the chart and the outcome will be tried again on the next visit.",
+  "outcome": null,
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 27,
+      "created": "2026-09-28T02:55:42.159283+00:00",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "score": 43.9,
+      "score_band": "weak",
+      "probability_up_6m": 58,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [
+    "its score 43.9 is under your 55",
+    "its chance up of 58% is under your 60%"
+  ],
+  "debate": null
+}

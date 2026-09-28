@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "limit_reached",
+    "message": "You have used your 5 manual analyses of the last 24 hours.",
+    "retry_after": 3600
+  }
+}

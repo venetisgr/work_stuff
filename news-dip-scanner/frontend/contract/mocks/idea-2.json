@@ -1,0 +1,759 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 2,
+    "ticker": "NIO",
+    "company": "NIO Inc.",
+    "exchange": "NYSE",
+    "currency": "USD",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "age_seconds": 11921,
+    "score": 80.6,
+    "score_band": "strong",
+    "verdict": "temporary_fear",
+    "verdict_label": "Temporary fear",
+    "confidence": "high",
+    "probability_up_6m": 86,
+    "price": {
+      "amount": 3.58,
+      "approx": 3.1426
+    },
+    "entry": {
+      "amount": 3.35,
+      "approx": 2.9407
+    },
+    "target": {
+      "amount": 4.6,
+      "approx": 4.0379
+    },
+    "potential_low": {
+      "amount": 3.1,
+      "approx": 2.7212
+    },
+    "stat_low": {
+      "amount": 2.3931,
+      "approx": 2.1007
+    },
+    "fx": {
+      "currency": "EUR",
+      "rate": 0.877808988764045,
+      "main_currency": "USD",
+      "rate_main_unit": 0.877808988764045,
+      "source": "analysis",
+      "as_of": "2026-09-28T02:53:58.652091+00:00",
+      "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+    },
+    "upside_pct": 28.4916,
+    "downside_pct": -13.4078,
+    "entry_upside_pct": 37.3134,
+    "entry_downside_pct": -7.4627,
+    "change_1d_pct": -1.3774,
+    "change_5d_pct": -2.1858,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": true,
+    "on_my_watchlist": false,
+    "debate": null
+  },
+  "opportunity": {
+    "ticker": "NIO",
+    "company": "NIO Inc.",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "price": 3.58,
+    "currency": "USD",
+    "score": 80.6,
+    "analysis": {
+      "verdict": "temporary_fear",
+      "probability_up_6m": 86,
+      "potential_low": 3.1,
+      "entry_price": 3.35,
+      "target_price": 4.6,
+      "confidence": "high",
+      "fear": "A share sale to fund the battery-swap unit worries investors about dilution.",
+      "fundamental_impact": "Small: the deal brings a partner into the battery-swap business and cash into the company.",
+      "thesis": "A dilution scare on a deal that strengthens the balance sheet; deliveries keep growing.",
+      "risks": [
+        "The news develops further.",
+        "A weak market drags the shares lower."
+      ],
+      "catalysts": [
+        "The next results."
+      ],
+      "checks": [
+        "Read the company's statement on the news.",
+        "Check the date of the next results."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "NIO",
+      "name": "NIO Inc.",
+      "currency": "USD",
+      "exchange": "NYSE",
+      "as_of": "2026-09-25T20:00:03+00:00",
+      "price": 3.58,
+      "previous_close": 3.630000114440918,
+      "change_1d_pct": -1.377413577537001,
+      "change_5d_pct": -2.1857946435684616,
+      "change_20d_pct": -17.889910771302674,
+      "high_20d": 4.409999847412109,
+      "high_52w": 8.02,
+      "low_52w": 3.55,
+      "drawdown_20d_pct": -18.820858869171452,
+      "drawdown_52w_pct": -55.36159600997506,
+      "above_low_52w_pct": 0.8450704225352101,
+      "sma_50": 4.287399999237061,
+      "sma_200": 5.092650003814698,
+      "volatility_pct": 34.625785503656346,
+      "volume_ratio": 0.6377201254286755,
+      "stat_low_6m": 2.393122262138178,
+      "worst_6m_drawdown_pct": -53.75552102290069,
+      "session_elapsed": null,
+      "timezone": "America/New_York",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [
+      "56a2183b1ee431720ee81d9673d91c78a2b87291"
+    ],
+    "headlines": [
+      {
+        "title": "NIO Stock Jumps Overnight As $2.4B Nio Power Deal Brings Geely Into Its Battery Swap Business - TradingView",
+        "link": "https://news.google.com/rss/articles/CBMi6AFBVV95cUxPZ2tuRWswcUpZRjl3TWVLejQxTy1lYmRWdmtBMDFSa3c4S2hfLW9MUTZZQTRwTzFtZzFvWjRweEw1R29qem9iSzhsLW9EeUt4NXBWNm1UTjdIOUZJcF9iVkE5SlMyUGFjQjdIVWFaQ0NjZzRXV3QxOUxHSmRjcm5KTXUxZXVaWC1TZG8xRUktdTdGU2xxZElNajFTeUFxYXFBZS16bFBISDBtZ2xRODE1VVhHRkJ4REtSOVdZcVB0SkJVbGlxcUpvU1NxRlNzV0hvUFJqbm40WUtiSjlaakJfMW94cHZuV2t2?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-28T01:19:00+00:00",
+        "direction": "mixed",
+        "magnitude": 3
+      }
+    ],
+    "dip_reasons": [
+      "18.8% below its 20-day high",
+      "all of this news came out after the last session (Fri 25 Sep)"
+    ],
+    "model": "gpt-5",
+    "news_after_session": true,
+    "account_currency": "EUR",
+    "fx_rate": 0.877808988764045,
+    "benchmark": "^GSPC",
+    "benchmark_level": 7743.41,
+    "fx_rates": {
+      "EUR": 0.877808988764045
+    },
+    "id": 2,
+    "debate": null
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 4.6,
+        "approx": 4.0379
+      },
+      "change_pct": 28.4916,
+      "from_entry_pct": 37.3134
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 3.58,
+        "approx": 3.1426
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 3.35,
+        "approx": 2.9407
+      },
+      "change_pct": -6.4246,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 3.1,
+        "approx": 2.7212
+      },
+      "change_pct": -13.4078,
+      "from_entry_pct": -7.4627
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 2.3931,
+        "approx": 2.1007
+      },
+      "change_pct": -33.153,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ",
+  "chart": {
+    "currency": "USD",
+    "closes": [
+      [
+        "2026-03-30",
+        5.51
+      ],
+      [
+        "2026-03-31",
+        6.03
+      ],
+      [
+        "2026-04-01",
+        6.2
+      ],
+      [
+        "2026-04-02",
+        6.3
+      ],
+      [
+        "2026-04-06",
+        6.24
+      ],
+      [
+        "2026-04-07",
+        6.14
+      ],
+      [
+        "2026-04-08",
+        6.38
+      ],
+      [
+        "2026-04-09",
+        6.07
+      ],
+      [
+        "2026-04-10",
+        6.5
+      ],
+      [
+        "2026-04-13",
+        6.47
+      ],
+      [
+        "2026-04-14",
+        6.58
+      ],
+      [
+        "2026-04-15",
+        6.43
+      ],
+      [
+        "2026-04-16",
+        6.87
+      ],
+      [
+        "2026-04-17",
+        6.83
+      ],
+      [
+        "2026-04-20",
+        6.66
+      ],
+      [
+        "2026-04-21",
+        6.43
+      ],
+      [
+        "2026-04-22",
+        6.48
+      ],
+      [
+        "2026-04-23",
+        6.28
+      ],
+      [
+        "2026-04-24",
+        6.21
+      ],
+      [
+        "2026-04-27",
+        6.23
+      ],
+      [
+        "2026-04-28",
+        6.36
+      ],
+      [
+        "2026-04-29",
+        6.39
+      ],
+      [
+        "2026-04-30",
+        6.39
+      ],
+      [
+        "2026-05-01",
+        5.91
+      ],
+      [
+        "2026-05-04",
+        6.07
+      ],
+      [
+        "2026-05-05",
+        5.9
+      ],
+      [
+        "2026-05-06",
+        5.9
+      ],
+      [
+        "2026-05-07",
+        5.87
+      ],
+      [
+        "2026-05-08",
+        5.85
+      ],
+      [
+        "2026-05-11",
+        6.07
+      ],
+      [
+        "2026-05-12",
+        6.08
+      ],
+      [
+        "2026-05-13",
+        6.54
+      ],
+      [
+        "2026-05-14",
+        6.25
+      ],
+      [
+        "2026-05-15",
+        6.1
+      ],
+      [
+        "2026-05-18",
+        5.88
+      ],
+      [
+        "2026-05-19",
+        5.74
+      ],
+      [
+        "2026-05-20",
+        5.59
+      ],
+      [
+        "2026-05-21",
+        5.6
+      ],
+      [
+        "2026-05-22",
+        5.2
+      ],
+      [
+        "2026-05-26",
+        5.26
+      ],
+      [
+        "2026-05-27",
+        5.75
+      ],
+      [
+        "2026-05-28",
+        5.55
+      ],
+      [
+        "2026-05-29",
+        5.6
+      ],
+      [
+        "2026-06-01",
+        5.98
+      ],
+      [
+        "2026-06-02",
+        6.01
+      ],
+      [
+        "2026-06-03",
+        5.75
+      ],
+      [
+        "2026-06-04",
+        5.69
+      ],
+      [
+        "2026-06-05",
+        5.36
+      ],
+      [
+        "2026-06-08",
+        5.45
+      ],
+      [
+        "2026-06-09",
+        5.28
+      ],
+      [
+        "2026-06-10",
+        5.18
+      ],
+      [
+        "2026-06-11",
+        5.23
+      ],
+      [
+        "2026-06-12",
+        5.21
+      ],
+      [
+        "2026-06-15",
+        5.2
+      ],
+      [
+        "2026-06-16",
+        5.01
+      ],
+      [
+        "2026-06-17",
+        5.05
+      ],
+      [
+        "2026-06-18",
+        5.02
+      ],
+      [
+        "2026-06-22",
+        5.05
+      ],
+      [
+        "2026-06-23",
+        5.09
+      ],
+      [
+        "2026-06-24",
+        4.9
+      ],
+      [
+        "2026-06-25",
+        4.73
+      ],
+      [
+        "2026-06-26",
+        4.86
+      ],
+      [
+        "2026-06-29",
+        4.95
+      ],
+      [
+        "2026-06-30",
+        5.06
+      ],
+      [
+        "2026-07-01",
+        4.97
+      ],
+      [
+        "2026-07-02",
+        4.79
+      ],
+      [
+        "2026-07-06",
+        5.02
+      ],
+      [
+        "2026-07-07",
+        4.88
+      ],
+      [
+        "2026-07-08",
+        4.9
+      ],
+      [
+        "2026-07-09",
+        4.78
+      ],
+      [
+        "2026-07-10",
+        4.78
+      ],
+      [
+        "2026-07-13",
+        4.93
+      ],
+      [
+        "2026-07-14",
+        5.01
+      ],
+      [
+        "2026-07-15",
+        5.03
+      ],
+      [
+        "2026-07-16",
+        4.99
+      ],
+      [
+        "2026-07-17",
+        4.88
+      ],
+      [
+        "2026-07-20",
+        4.81
+      ],
+      [
+        "2026-07-21",
+        4.79
+      ],
+      [
+        "2026-07-22",
+        4.67
+      ],
+      [
+        "2026-07-23",
+        4.64
+      ],
+      [
+        "2026-07-24",
+        4.49
+      ],
+      [
+        "2026-07-27",
+        4.62
+      ],
+      [
+        "2026-07-28",
+        4.68
+      ],
+      [
+        "2026-07-29",
+        4.76
+      ],
+      [
+        "2026-07-30",
+        4.84
+      ],
+      [
+        "2026-07-31",
+        4.88
+      ],
+      [
+        "2026-08-03",
+        4.81
+      ],
+      [
+        "2026-08-04",
+        4.76
+      ],
+      [
+        "2026-08-05",
+        4.65
+      ],
+      [
+        "2026-08-06",
+        4.6
+      ],
+      [
+        "2026-08-07",
+        4.74
+      ],
+      [
+        "2026-08-10",
+        4.82
+      ],
+      [
+        "2026-08-11",
+        4.62
+      ],
+      [
+        "2026-08-12",
+        4.54
+      ],
+      [
+        "2026-08-13",
+        4.5
+      ],
+      [
+        "2026-08-14",
+        4.52
+      ],
+      [
+        "2026-08-17",
+        4.6
+      ],
+      [
+        "2026-08-18",
+        4.53
+      ],
+      [
+        "2026-08-19",
+        4.58
+      ],
+      [
+        "2026-08-20",
+        4.53
+      ],
+      [
+        "2026-08-21",
+        4.63
+      ],
+      [
+        "2026-08-24",
+        4.36
+      ],
+      [
+        "2026-08-25",
+        4.45
+      ],
+      [
+        "2026-08-26",
+        4.37
+      ],
+      [
+        "2026-08-27",
+        4.36
+      ],
+      [
+        "2026-08-28",
+        4.37
+      ],
+      [
+        "2026-08-31",
+        4.23
+      ],
+      [
+        "2026-09-01",
+        4.06
+      ],
+      [
+        "2026-09-02",
+        3.86
+      ],
+      [
+        "2026-09-03",
+        3.86
+      ],
+      [
+        "2026-09-04",
+        3.8
+      ],
+      [
+        "2026-09-08",
+        3.79
+      ],
+      [
+        "2026-09-09",
+        3.7
+      ],
+      [
+        "2026-09-10",
+        3.58
+      ],
+      [
+        "2026-09-11",
+        3.69
+      ],
+      [
+        "2026-09-14",
+        3.67
+      ],
+      [
+        "2026-09-15",
+        3.6
+      ],
+      [
+        "2026-09-16",
+        3.58
+      ],
+      [
+        "2026-09-17",
+        3.62
+      ],
+      [
+        "2026-09-18",
+        3.66
+      ],
+      [
+        "2026-09-21",
+        3.67
+      ],
+      [
+        "2026-09-22",
+        3.72
+      ],
+      [
+        "2026-09-23",
+        3.67
+      ],
+      [
+        "2026-09-24",
+        3.63
+      ],
+      [
+        "2026-09-25",
+        3.58
+      ]
+    ],
+    "levels": {
+      "reported": 3.58,
+      "entry": 3.35,
+      "target": 4.6,
+      "potential_low": 3.1,
+      "stat_low": 2.393122262138178
+    },
+    "signal_day": "2026-09-27",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "^GSPC",
+    "benchmark_name": "S&P 500",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 2,
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "score": 80.6,
+      "score_band": "strong",
+      "probability_up_6m": 86,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [],
+  "debate": null
+}

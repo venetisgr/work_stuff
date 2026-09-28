@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "csrf",
+    "message": "This page has expired. Reload it and try again.",
+    "retry_after": null
+  }
+}

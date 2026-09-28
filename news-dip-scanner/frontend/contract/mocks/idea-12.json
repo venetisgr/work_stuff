@@ -1,0 +1,751 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 12,
+    "ticker": "SAP.DE",
+    "company": "SAP SE",
+    "exchange": "XETRA",
+    "currency": "EUR",
+    "created": "2026-09-01T16:00:00+00:00",
+    "age_seconds": 2297560,
+    "score": 18.8,
+    "score_band": "weak",
+    "verdict": "fundamental",
+    "verdict_label": "Fundamental damage",
+    "confidence": "medium",
+    "probability_up_6m": 38,
+    "price": {
+      "amount": 184.26,
+      "approx": null
+    },
+    "entry": {
+      "amount": 175.0,
+      "approx": null
+    },
+    "target": {
+      "amount": 205.0,
+      "approx": null
+    },
+    "potential_low": {
+      "amount": 160.0,
+      "approx": null
+    },
+    "stat_low": {
+      "amount": 108.7831,
+      "approx": null
+    },
+    "fx": null,
+    "upside_pct": 11.2558,
+    "downside_pct": -13.1662,
+    "entry_upside_pct": 17.1429,
+    "entry_downside_pct": -8.5714,
+    "change_1d_pct": -3.4783,
+    "change_5d_pct": -0.647,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": false,
+    "on_my_watchlist": false,
+    "debate": null
+  },
+  "opportunity": {
+    "ticker": "SAP.DE",
+    "company": "SAP SE",
+    "created": "2026-09-01T16:00:00+00:00",
+    "price": 184.25999450683594,
+    "currency": "EUR",
+    "score": 18.8,
+    "analysis": {
+      "verdict": "fundamental",
+      "probability_up_6m": 38,
+      "potential_low": 160.0,
+      "entry_price": 175.0,
+      "target_price": 205.0,
+      "confidence": "medium",
+      "fear": "A cut to the cloud growth outlook after large customers delayed projects.",
+      "fundamental_impact": "Real: the cut lowers next year's revenue and margins, and the backlog grows more slowly.",
+      "thesis": "The guidance cut goes to the heart of the growth story; a quick recovery is unlikely.",
+      "risks": [
+        "The news develops further.",
+        "A weak market drags the shares lower."
+      ],
+      "catalysts": [
+        "The next results."
+      ],
+      "checks": [
+        "Read the company's statement on the news.",
+        "Check the date of the next results."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "SAP.DE",
+      "name": "SAP SE",
+      "currency": "EUR",
+      "exchange": "XETRA",
+      "as_of": "2026-09-01T15:25:00+00:00",
+      "price": 184.25999450683594,
+      "previous_close": 190.89999389648438,
+      "change_1d_pct": -3.478260661050092,
+      "change_5d_pct": -0.6470463515525826,
+      "change_20d_pct": 10.084830404827393,
+      "high_20d": 192.1199951171875,
+      "high_52w": 244.3000030517578,
+      "low_52w": 127.5,
+      "drawdown_20d_pct": -4.091193426044592,
+      "drawdown_52w_pct": -24.576343755592056,
+      "above_low_52w_pct": 44.51764275045955,
+      "sma_50": 158.32519989013673,
+      "sma_200": 168.5286001586914,
+      "volatility_pct": 45.305675583431366,
+      "volume_ratio": 0.9626074302219083,
+      "stat_low_6m": 108.78314327390072,
+      "worst_6m_drawdown_pct": -42.40495665999483,
+      "session_elapsed": null,
+      "timezone": "Europe/Berlin",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [],
+    "headlines": [],
+    "dip_reasons": [
+      "down 3.5% on Tue 01 Sep"
+    ],
+    "model": "gpt-5",
+    "news_after_session": false,
+    "account_currency": "EUR",
+    "fx_rate": 1.0,
+    "benchmark": "^GDAXI",
+    "benchmark_level": 25970.109375,
+    "fx_rates": {
+      "EUR": 1.0
+    },
+    "id": 12,
+    "debate": null
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 205.0,
+        "approx": null
+      },
+      "change_pct": 11.2558,
+      "from_entry_pct": 17.1429
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 184.26,
+        "approx": null
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 175.0,
+        "approx": null
+      },
+      "change_pct": -5.0255,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 160.0,
+        "approx": null
+      },
+      "change_pct": -13.1662,
+      "from_entry_pct": -8.5714
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 108.7831,
+        "approx": null
+      },
+      "change_pct": -40.9621,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": null,
+  "chart": {
+    "currency": "EUR",
+    "closes": [
+      [
+        "2026-03-30",
+        147.02
+      ],
+      [
+        "2026-03-31",
+        146.9
+      ],
+      [
+        "2026-04-01",
+        148.86
+      ],
+      [
+        "2026-04-02",
+        148.9
+      ],
+      [
+        "2026-04-07",
+        145.22
+      ],
+      [
+        "2026-04-08",
+        149.7
+      ],
+      [
+        "2026-04-09",
+        139.5
+      ],
+      [
+        "2026-04-10",
+        139.38
+      ],
+      [
+        "2026-04-13",
+        142.5
+      ],
+      [
+        "2026-04-14",
+        143.46
+      ],
+      [
+        "2026-04-15",
+        146.54
+      ],
+      [
+        "2026-04-16",
+        151.66
+      ],
+      [
+        "2026-04-17",
+        156.24
+      ],
+      [
+        "2026-04-20",
+        150.2
+      ],
+      [
+        "2026-04-21",
+        151.16
+      ],
+      [
+        "2026-04-22",
+        149.82
+      ],
+      [
+        "2026-04-23",
+        140.7
+      ],
+      [
+        "2026-04-24",
+        147.28
+      ],
+      [
+        "2026-04-27",
+        148.96
+      ],
+      [
+        "2026-04-28",
+        148.88
+      ],
+      [
+        "2026-04-29",
+        145.88
+      ],
+      [
+        "2026-04-30",
+        145.5
+      ],
+      [
+        "2026-05-04",
+        148.06
+      ],
+      [
+        "2026-05-05",
+        149.8
+      ],
+      [
+        "2026-05-06",
+        149.32
+      ],
+      [
+        "2026-05-07",
+        151.38
+      ],
+      [
+        "2026-05-08",
+        146.2
+      ],
+      [
+        "2026-05-11",
+        144.46
+      ],
+      [
+        "2026-05-12",
+        142.4
+      ],
+      [
+        "2026-05-13",
+        136.26
+      ],
+      [
+        "2026-05-14",
+        141.22
+      ],
+      [
+        "2026-05-15",
+        144.06
+      ],
+      [
+        "2026-05-18",
+        147.86
+      ],
+      [
+        "2026-05-19",
+        156.72
+      ],
+      [
+        "2026-05-20",
+        153.42
+      ],
+      [
+        "2026-05-21",
+        150.9
+      ],
+      [
+        "2026-05-22",
+        151.78
+      ],
+      [
+        "2026-05-25",
+        154.48
+      ],
+      [
+        "2026-05-26",
+        151.46
+      ],
+      [
+        "2026-05-27",
+        150.0
+      ],
+      [
+        "2026-05-28",
+        151.6
+      ],
+      [
+        "2026-05-29",
+        155.26
+      ],
+      [
+        "2026-06-01",
+        167.9
+      ],
+      [
+        "2026-06-02",
+        162.86
+      ],
+      [
+        "2026-06-03",
+        155.94
+      ],
+      [
+        "2026-06-04",
+        164.5
+      ],
+      [
+        "2026-06-05",
+        161.48
+      ],
+      [
+        "2026-06-08",
+        158.1
+      ],
+      [
+        "2026-06-09",
+        154.7
+      ],
+      [
+        "2026-06-10",
+        149.7
+      ],
+      [
+        "2026-06-11",
+        139.9
+      ],
+      [
+        "2026-06-12",
+        140.26
+      ],
+      [
+        "2026-06-15",
+        143.18
+      ],
+      [
+        "2026-06-16",
+        142.9
+      ],
+      [
+        "2026-06-17",
+        141.18
+      ],
+      [
+        "2026-06-18",
+        134.86
+      ],
+      [
+        "2026-06-19",
+        134.14
+      ],
+      [
+        "2026-06-22",
+        132.22
+      ],
+      [
+        "2026-06-23",
+        134.52
+      ],
+      [
+        "2026-06-24",
+        134.86
+      ],
+      [
+        "2026-06-25",
+        132.28
+      ],
+      [
+        "2026-06-26",
+        135.14
+      ],
+      [
+        "2026-06-29",
+        136.64
+      ],
+      [
+        "2026-06-30",
+        134.0
+      ],
+      [
+        "2026-07-01",
+        140.88
+      ],
+      [
+        "2026-07-02",
+        141.72
+      ],
+      [
+        "2026-07-03",
+        139.64
+      ],
+      [
+        "2026-07-06",
+        140.06
+      ],
+      [
+        "2026-07-07",
+        143.9
+      ],
+      [
+        "2026-07-08",
+        137.96
+      ],
+      [
+        "2026-07-09",
+        137.74
+      ],
+      [
+        "2026-07-10",
+        137.58
+      ],
+      [
+        "2026-07-13",
+        140.72
+      ],
+      [
+        "2026-07-14",
+        136.72
+      ],
+      [
+        "2026-07-15",
+        136.98
+      ],
+      [
+        "2026-07-16",
+        137.64
+      ],
+      [
+        "2026-07-17",
+        137.92
+      ],
+      [
+        "2026-07-20",
+        138.26
+      ],
+      [
+        "2026-07-21",
+        136.42
+      ],
+      [
+        "2026-07-22",
+        132.04
+      ],
+      [
+        "2026-07-23",
+        128.32
+      ],
+      [
+        "2026-07-24",
+        140.2
+      ],
+      [
+        "2026-07-27",
+        151.28
+      ],
+      [
+        "2026-07-28",
+        159.24
+      ],
+      [
+        "2026-07-29",
+        162.04
+      ],
+      [
+        "2026-07-30",
+        155.92
+      ],
+      [
+        "2026-07-31",
+        157.68
+      ],
+      [
+        "2026-08-03",
+        164.64
+      ],
+      [
+        "2026-08-04",
+        167.38
+      ],
+      [
+        "2026-08-05",
+        169.26
+      ],
+      [
+        "2026-08-06",
+        170.98
+      ],
+      [
+        "2026-08-07",
+        177.96
+      ],
+      [
+        "2026-08-10",
+        179.3
+      ],
+      [
+        "2026-08-11",
+        180.7
+      ],
+      [
+        "2026-08-12",
+        175.96
+      ],
+      [
+        "2026-08-13",
+        175.38
+      ],
+      [
+        "2026-08-14",
+        180.14
+      ],
+      [
+        "2026-08-17",
+        179.58
+      ],
+      [
+        "2026-08-18",
+        182.5
+      ],
+      [
+        "2026-08-19",
+        185.9
+      ],
+      [
+        "2026-08-20",
+        185.64
+      ],
+      [
+        "2026-08-21",
+        188.12
+      ],
+      [
+        "2026-08-24",
+        187.2
+      ],
+      [
+        "2026-08-25",
+        185.46
+      ],
+      [
+        "2026-08-26",
+        180.02
+      ],
+      [
+        "2026-08-27",
+        189.88
+      ],
+      [
+        "2026-08-28",
+        191.32
+      ],
+      [
+        "2026-08-31",
+        190.9
+      ],
+      [
+        "2026-09-01",
+        184.26
+      ],
+      [
+        "2026-09-02",
+        181.44
+      ],
+      [
+        "2026-09-03",
+        185.58
+      ],
+      [
+        "2026-09-04",
+        185.68
+      ],
+      [
+        "2026-09-07",
+        182.8
+      ],
+      [
+        "2026-09-08",
+        181.7
+      ],
+      [
+        "2026-09-09",
+        182.86
+      ],
+      [
+        "2026-09-10",
+        177.82
+      ],
+      [
+        "2026-09-11",
+        177.26
+      ],
+      [
+        "2026-09-14",
+        186.26
+      ],
+      [
+        "2026-09-15",
+        187.08
+      ],
+      [
+        "2026-09-16",
+        186.56
+      ],
+      [
+        "2026-09-17",
+        188.0
+      ],
+      [
+        "2026-09-18",
+        183.12
+      ],
+      [
+        "2026-09-21",
+        182.86
+      ],
+      [
+        "2026-09-22",
+        182.32
+      ],
+      [
+        "2026-09-23",
+        186.46
+      ],
+      [
+        "2026-09-24",
+        184.18
+      ],
+      [
+        "2026-09-25",
+        185.92
+      ]
+    ],
+    "levels": {
+      "reported": 184.25999450683594,
+      "entry": 175.0,
+      "target": 205.0,
+      "potential_low": 160.0,
+      "stat_low": 108.78314327390072
+    },
+    "signal_day": "2026-09-01",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "^GDAXI",
+    "benchmark_name": "DAX",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 12,
+      "created": "2026-09-01T16:00:00+00:00",
+      "verdict": "fundamental",
+      "verdict_label": "Fundamental damage",
+      "score": 18.8,
+      "score_band": "weak",
+      "probability_up_6m": 38,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [
+    "its score 18.8 is under your 55",
+    "its chance up of 38% is under your 60%",
+    "you don't alert on “Fundamental damage”"
+  ],
+  "debate": null
+}

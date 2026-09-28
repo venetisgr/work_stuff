@@ -1,0 +1,24 @@
+{
+  "state": "running",
+  "label": "Scanner running",
+  "reason": null,
+  "interval_minutes": 5,
+  "cycle_running_since": null,
+  "next_cycle_at": "2026-09-28T06:15:00+00:00",
+  "last_cycle": {
+    "started": "2026-09-28T06:10:00+00:00",
+    "finished": "2026-09-28T06:10:35+00:00",
+    "ok": true,
+    "summary": "Cycle 06:10: 14 new articles, 3 companies, 1 candidate, 1 opportunity, 0 alerts"
+  },
+  "feeds": {
+    "ok": 19,
+    "total": 20
+  },
+  "model_today": {
+    "calls": 87,
+    "input_tokens": 148230,
+    "output_tokens": 61875,
+    "since": "2026-09-28T00:00:00+00:00"
+  }
+}

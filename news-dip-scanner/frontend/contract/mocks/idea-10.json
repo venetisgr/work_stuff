@@ -1,0 +1,1024 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 10,
+    "ticker": "ALWN.AT",
+    "company": "Allwyn AG",
+    "exchange": "Athens",
+    "currency": "EUR",
+    "created": "2026-09-25T15:00:00+00:00",
+    "age_seconds": 227560,
+    "score": 66.3,
+    "score_band": "good",
+    "verdict": "temporary_fear",
+    "verdict_label": "Temporary fear",
+    "confidence": "medium",
+    "probability_up_6m": 78,
+    "price": {
+      "amount": 11.84,
+      "approx": null
+    },
+    "entry": {
+      "amount": 11.2,
+      "approx": null
+    },
+    "target": {
+      "amount": 13.9,
+      "approx": null
+    },
+    "potential_low": {
+      "amount": 10.2,
+      "approx": null
+    },
+    "stat_low": {
+      "amount": 9.1004,
+      "approx": null
+    },
+    "fx": null,
+    "upside_pct": 17.3986,
+    "downside_pct": -13.8514,
+    "entry_upside_pct": 24.1071,
+    "entry_downside_pct": -8.9286,
+    "change_1d_pct": -1.6611,
+    "change_5d_pct": -3.7398,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": true,
+    "on_my_watchlist": true,
+    "debate": {
+      "mode": "agreed",
+      "agreement": "high",
+      "line": "Claude 80% · GPT-5 76% → 78% (high agreement)",
+      "participants": [
+        {
+          "label": "A",
+          "model": "anthropic:claude-sonnet-5",
+          "model_label": "Claude Sonnet 5",
+          "opening_probability": 80,
+          "final_probability": 80,
+          "final_verdict": "temporary_fear",
+          "changed_mind": false
+        },
+        {
+          "label": "B",
+          "model": "openai:gpt-5",
+          "model_label": "GPT-5",
+          "opening_probability": 76,
+          "final_probability": 76,
+          "final_verdict": "temporary_fear",
+          "changed_mind": false
+        }
+      ],
+      "final_probability": 78,
+      "judge": null,
+      "judge_label": null
+    }
+  },
+  "opportunity": {
+    "ticker": "ALWN.AT",
+    "company": "Allwyn AG",
+    "created": "2026-09-25T15:00:00+00:00",
+    "price": 11.84000015258789,
+    "currency": "EUR",
+    "score": 66.3,
+    "analysis": {
+      "verdict": "temporary_fear",
+      "probability_up_6m": 78,
+      "potential_low": 10.2,
+      "entry_price": 11.2,
+      "target_price": 13.9,
+      "confidence": "medium",
+      "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+      "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+      "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+      "risks": [
+        "The final rules are stricter than the proposal.",
+        "A higher gaming tax in the next budget."
+      ],
+      "catalysts": [
+        "The final text of the advertising rules.",
+        "The interim dividend date."
+      ],
+      "checks": [
+        "Read the ministry's proposal.",
+        "Check the ex-dividend date."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "ALWN.AT",
+      "name": "Allwyn AG",
+      "currency": "EUR",
+      "exchange": "Athens",
+      "as_of": "2026-09-25T14:25:00+00:00",
+      "price": 11.84000015258789,
+      "previous_close": 12.039999961853027,
+      "change_1d_pct": -1.6611279891927455,
+      "change_5d_pct": -3.7398376505186848,
+      "change_20d_pct": -14.327059232699302,
+      "high_20d": 13.800000190734863,
+      "high_52w": 20.920000076293945,
+      "low_52w": 11.65999984741211,
+      "drawdown_20d_pct": -14.202898630848503,
+      "drawdown_52w_pct": -43.403441159616904,
+      "above_low_52w_pct": 1.5437419170784228,
+      "sma_50": 13.257900047302247,
+      "sma_200": 14.662725067138672,
+      "volatility_pct": 22.62476117803726,
+      "volume_ratio": 1.4443934978697175,
+      "stat_low_6m": 9.100365109059531,
+      "worst_6m_drawdown_pct": -38.40314079398228,
+      "session_elapsed": null,
+      "timezone": "Europe/Athens",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [],
+    "headlines": [],
+    "dip_reasons": [
+      "down 1.7% on Fri 25 Sep",
+      "14.2% below its 20-day high"
+    ],
+    "model": "debate: claude-sonnet-5 vs gpt-5, agreed",
+    "news_after_session": false,
+    "account_currency": "EUR",
+    "fx_rate": 1.0,
+    "benchmark": "GD.AT",
+    "benchmark_level": 2665.929931640625,
+    "fx_rates": {
+      "EUR": 1.0
+    },
+    "id": 10,
+    "debate": {
+      "mode": "agreed",
+      "reason": "the openings agreed (the same verdict, chances 4 points apart, lows 0.8% of the price apart)",
+      "rounds": 0,
+      "participants": [
+        {
+          "label": "A",
+          "model": "anthropic:claude-sonnet-5",
+          "opening": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 80,
+            "potential_low": 10.3,
+            "entry_price": 11.25,
+            "target_price": 14.1,
+            "confidence": "medium",
+            "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+            "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+            "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+            "risks": [
+              "The final rules are stricter than the proposal.",
+              "A higher gaming tax in the next budget."
+            ],
+            "catalysts": [
+              "The final text of the advertising rules.",
+              "The interim dividend date."
+            ],
+            "checks": [
+              "Read the ministry's proposal.",
+              "Check the ex-dividend date."
+            ],
+            "warnings": []
+          },
+          "final": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 80,
+            "potential_low": 10.3,
+            "entry_price": 11.25,
+            "target_price": 14.1,
+            "confidence": "medium",
+            "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+            "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+            "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+            "risks": [
+              "The final rules are stricter than the proposal.",
+              "A higher gaming tax in the next budget."
+            ],
+            "catalysts": [
+              "The final text of the advertising rules.",
+              "The interim dividend date."
+            ],
+            "checks": [
+              "Read the ministry's proposal.",
+              "Check the ex-dividend date."
+            ],
+            "warnings": []
+          },
+          "critique": [],
+          "concessions": [],
+          "changed_mind": false
+        },
+        {
+          "label": "B",
+          "model": "openai:gpt-5",
+          "opening": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 76,
+            "potential_low": 10.2,
+            "entry_price": 11.2,
+            "target_price": 13.7,
+            "confidence": "medium",
+            "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+            "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+            "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+            "risks": [
+              "The final rules are stricter than the proposal.",
+              "A higher gaming tax in the next budget."
+            ],
+            "catalysts": [
+              "The final text of the advertising rules.",
+              "The interim dividend date."
+            ],
+            "checks": [
+              "Read the ministry's proposal.",
+              "Check the ex-dividend date."
+            ],
+            "warnings": []
+          },
+          "final": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 76,
+            "potential_low": 10.2,
+            "entry_price": 11.2,
+            "target_price": 13.7,
+            "confidence": "medium",
+            "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+            "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+            "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+            "risks": [
+              "The final rules are stricter than the proposal.",
+              "A higher gaming tax in the next budget."
+            ],
+            "catalysts": [
+              "The final text of the advertising rules.",
+              "The interim dividend date."
+            ],
+            "checks": [
+              "Read the ministry's proposal.",
+              "Check the ex-dividend date."
+            ],
+            "warnings": []
+          },
+          "critique": [],
+          "concessions": [],
+          "changed_mind": false
+        }
+      ],
+      "judge": null,
+      "summary": "Both models read the fall as a temporary fear (80% and 76%), so their positions were merged without a judge.",
+      "agreement": "high",
+      "favoured": null
+    }
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 13.9,
+        "approx": null
+      },
+      "change_pct": 17.3986,
+      "from_entry_pct": 24.1071
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 11.84,
+        "approx": null
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 11.2,
+        "approx": null
+      },
+      "change_pct": -5.4054,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 10.2,
+        "approx": null
+      },
+      "change_pct": -13.8514,
+      "from_entry_pct": -8.9286
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 9.1004,
+        "approx": null
+      },
+      "change_pct": -23.1388,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": null,
+  "chart": {
+    "currency": "EUR",
+    "closes": [
+      [
+        "2026-03-30",
+        13.3
+      ],
+      [
+        "2026-03-31",
+        13.09
+      ],
+      [
+        "2026-04-01",
+        14.2
+      ],
+      [
+        "2026-04-02",
+        14.56
+      ],
+      [
+        "2026-04-07",
+        15.15
+      ],
+      [
+        "2026-04-08",
+        15.05
+      ],
+      [
+        "2026-04-09",
+        14.4
+      ],
+      [
+        "2026-04-14",
+        13.6
+      ],
+      [
+        "2026-04-15",
+        13.77
+      ],
+      [
+        "2026-04-16",
+        13.805
+      ],
+      [
+        "2026-04-17",
+        13.795
+      ],
+      [
+        "2026-04-20",
+        13.62
+      ],
+      [
+        "2026-04-21",
+        13.6
+      ],
+      [
+        "2026-04-22",
+        13.17
+      ],
+      [
+        "2026-04-23",
+        13.15
+      ],
+      [
+        "2026-04-24",
+        13.22
+      ],
+      [
+        "2026-04-27",
+        13.325
+      ],
+      [
+        "2026-04-28",
+        13.005
+      ],
+      [
+        "2026-04-29",
+        12.7
+      ],
+      [
+        "2026-04-30",
+        12.1
+      ],
+      [
+        "2026-05-04",
+        12.79
+      ],
+      [
+        "2026-05-05",
+        12.985
+      ],
+      [
+        "2026-05-06",
+        13.26
+      ],
+      [
+        "2026-05-07",
+        12.835
+      ],
+      [
+        "2026-05-08",
+        12.315
+      ],
+      [
+        "2026-05-11",
+        12.35
+      ],
+      [
+        "2026-05-12",
+        12.05
+      ],
+      [
+        "2026-05-13",
+        12.255
+      ],
+      [
+        "2026-05-14",
+        12.135
+      ],
+      [
+        "2026-05-15",
+        11.945
+      ],
+      [
+        "2026-05-18",
+        11.765
+      ],
+      [
+        "2026-05-19",
+        11.805
+      ],
+      [
+        "2026-05-20",
+        11.78
+      ],
+      [
+        "2026-05-21",
+        12.175
+      ],
+      [
+        "2026-05-22",
+        11.9
+      ],
+      [
+        "2026-05-25",
+        12.18
+      ],
+      [
+        "2026-05-26",
+        12.68
+      ],
+      [
+        "2026-05-27",
+        12.645
+      ],
+      [
+        "2026-05-28",
+        12.255
+      ],
+      [
+        "2026-05-29",
+        12.595
+      ],
+      [
+        "2026-06-02",
+        12.94
+      ],
+      [
+        "2026-06-03",
+        13.17
+      ],
+      [
+        "2026-06-04",
+        13.38
+      ],
+      [
+        "2026-06-05",
+        13.51
+      ],
+      [
+        "2026-06-08",
+        13.015
+      ],
+      [
+        "2026-06-09",
+        13.47
+      ],
+      [
+        "2026-06-10",
+        13.425
+      ],
+      [
+        "2026-06-11",
+        13.85
+      ],
+      [
+        "2026-06-12",
+        13.93
+      ],
+      [
+        "2026-06-15",
+        13.86
+      ],
+      [
+        "2026-06-16",
+        13.935
+      ],
+      [
+        "2026-06-17",
+        13.7
+      ],
+      [
+        "2026-06-18",
+        13.89
+      ],
+      [
+        "2026-06-19",
+        13.8
+      ],
+      [
+        "2026-06-22",
+        13.63
+      ],
+      [
+        "2026-06-23",
+        13.725
+      ],
+      [
+        "2026-06-24",
+        13.765
+      ],
+      [
+        "2026-06-25",
+        13.715
+      ],
+      [
+        "2026-06-26",
+        13.87
+      ],
+      [
+        "2026-06-29",
+        13.84
+      ],
+      [
+        "2026-06-30",
+        13.92
+      ],
+      [
+        "2026-07-01",
+        14.115
+      ],
+      [
+        "2026-07-02",
+        14.1
+      ],
+      [
+        "2026-07-03",
+        14.225
+      ],
+      [
+        "2026-07-06",
+        14.175
+      ],
+      [
+        "2026-07-07",
+        14.16
+      ],
+      [
+        "2026-07-08",
+        13.67
+      ],
+      [
+        "2026-07-09",
+        13.35
+      ],
+      [
+        "2026-07-10",
+        13.36
+      ],
+      [
+        "2026-07-13",
+        13.52
+      ],
+      [
+        "2026-07-14",
+        13.5
+      ],
+      [
+        "2026-07-15",
+        13.22
+      ],
+      [
+        "2026-07-16",
+        13.115
+      ],
+      [
+        "2026-07-17",
+        13.0
+      ],
+      [
+        "2026-07-20",
+        13.115
+      ],
+      [
+        "2026-07-21",
+        13.275
+      ],
+      [
+        "2026-07-22",
+        13.03
+      ],
+      [
+        "2026-07-23",
+        12.85
+      ],
+      [
+        "2026-07-24",
+        12.85
+      ],
+      [
+        "2026-07-27",
+        12.985
+      ],
+      [
+        "2026-07-28",
+        13.1
+      ],
+      [
+        "2026-07-29",
+        13.3
+      ],
+      [
+        "2026-07-30",
+        13.08
+      ],
+      [
+        "2026-07-31",
+        13.34
+      ],
+      [
+        "2026-08-03",
+        13.61
+      ],
+      [
+        "2026-08-04",
+        13.49
+      ],
+      [
+        "2026-08-05",
+        13.445
+      ],
+      [
+        "2026-08-06",
+        13.29
+      ],
+      [
+        "2026-08-07",
+        13.49
+      ],
+      [
+        "2026-08-10",
+        13.535
+      ],
+      [
+        "2026-08-11",
+        13.52
+      ],
+      [
+        "2026-08-12",
+        13.5
+      ],
+      [
+        "2026-08-13",
+        13.44
+      ],
+      [
+        "2026-08-14",
+        13.68
+      ],
+      [
+        "2026-08-17",
+        14.1
+      ],
+      [
+        "2026-08-18",
+        14.175
+      ],
+      [
+        "2026-08-19",
+        13.98
+      ],
+      [
+        "2026-08-20",
+        13.91
+      ],
+      [
+        "2026-08-21",
+        14.1
+      ],
+      [
+        "2026-08-24",
+        14.17
+      ],
+      [
+        "2026-08-25",
+        14.56
+      ],
+      [
+        "2026-08-26",
+        14.45
+      ],
+      [
+        "2026-08-27",
+        14.15
+      ],
+      [
+        "2026-08-28",
+        13.82
+      ],
+      [
+        "2026-08-31",
+        13.5
+      ],
+      [
+        "2026-09-01",
+        13.38
+      ],
+      [
+        "2026-09-02",
+        13.1
+      ],
+      [
+        "2026-09-03",
+        13.155
+      ],
+      [
+        "2026-09-04",
+        13.01
+      ],
+      [
+        "2026-09-07",
+        13.1
+      ],
+      [
+        "2026-09-08",
+        13.1
+      ],
+      [
+        "2026-09-09",
+        13.13
+      ],
+      [
+        "2026-09-10",
+        13.22
+      ],
+      [
+        "2026-09-11",
+        13.1
+      ],
+      [
+        "2026-09-14",
+        12.92
+      ],
+      [
+        "2026-09-15",
+        12.8
+      ],
+      [
+        "2026-09-16",
+        12.55
+      ],
+      [
+        "2026-09-17",
+        12.72
+      ],
+      [
+        "2026-09-18",
+        12.3
+      ],
+      [
+        "2026-09-21",
+        12.29
+      ],
+      [
+        "2026-09-22",
+        12.2
+      ],
+      [
+        "2026-09-23",
+        12.1
+      ],
+      [
+        "2026-09-24",
+        12.04
+      ],
+      [
+        "2026-09-25",
+        11.84
+      ]
+    ],
+    "levels": {
+      "reported": 11.84000015258789,
+      "entry": 11.2,
+      "target": 13.9,
+      "potential_low": 10.2,
+      "stat_low": 9.100365109059531
+    },
+    "signal_day": "2026-09-25",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": true,
+    "price_mismatch": false,
+    "days": 3,
+    "last_price": 11.92,
+    "last_day": "2026-09-25",
+    "return_pct": 0.6757,
+    "account_currency": "EUR",
+    "account_return_pct": 0.6757,
+    "benchmark": "GD.AT",
+    "benchmark_name": "Athens General",
+    "benchmark_return_pct": -0.21,
+    "excess_return_pct": 0.8857,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": 1.1,
+    "max_loss_pct": -0.4,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 10,
+      "created": "2026-09-25T15:00:00+00:00",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "score": 66.3,
+      "score_band": "good",
+      "probability_up_6m": 78,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [],
+  "debate": {
+    "mode": "agreed",
+    "reason": "the openings agreed (the same verdict, chances 4 points apart, lows 0.8% of the price apart)",
+    "reason_label": "the openings agreed (the same verdict, chances 4 points apart, lows 0.8% of the price apart).",
+    "rounds": 0,
+    "title": "The debate",
+    "how": "Claude Sonnet 5 and GPT-5 analysed it separately and agreed, so no rebuttal or judge was needed.",
+    "participants": [
+      {
+        "label": "A",
+        "model": "anthropic:claude-sonnet-5",
+        "model_label": "Claude Sonnet 5",
+        "provider": "anthropic",
+        "provider_label": "Anthropic",
+        "other_label": "GPT-5",
+        "opening": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 80,
+          "potential_low": 10.3,
+          "entry_price": 11.25,
+          "target_price": 14.1,
+          "confidence": "medium",
+          "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+          "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+          "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+          "risks": [
+            "The final rules are stricter than the proposal.",
+            "A higher gaming tax in the next budget."
+          ],
+          "catalysts": [
+            "The final text of the advertising rules.",
+            "The interim dividend date."
+          ],
+          "checks": [
+            "Read the ministry's proposal.",
+            "Check the ex-dividend date."
+          ],
+          "warnings": []
+        },
+        "final": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 80,
+          "potential_low": 10.3,
+          "entry_price": 11.25,
+          "target_price": 14.1,
+          "confidence": "medium",
+          "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+          "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+          "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+          "risks": [
+            "The final rules are stricter than the proposal.",
+            "A higher gaming tax in the next budget."
+          ],
+          "catalysts": [
+            "The final text of the advertising rules.",
+            "The interim dividend date."
+          ],
+          "checks": [
+            "Read the ministry's proposal.",
+            "Check the ex-dividend date."
+          ],
+          "warnings": []
+        },
+        "critique": [],
+        "concessions": [],
+        "changed_mind": false,
+        "favoured": false,
+        "compare": false
+      },
+      {
+        "label": "B",
+        "model": "openai:gpt-5",
+        "model_label": "GPT-5",
+        "provider": "openai",
+        "provider_label": "OpenAI",
+        "other_label": "Claude Sonnet 5",
+        "opening": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 76,
+          "potential_low": 10.2,
+          "entry_price": 11.2,
+          "target_price": 13.7,
+          "confidence": "medium",
+          "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+          "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+          "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+          "risks": [
+            "The final rules are stricter than the proposal.",
+            "A higher gaming tax in the next budget."
+          ],
+          "catalysts": [
+            "The final text of the advertising rules.",
+            "The interim dividend date."
+          ],
+          "checks": [
+            "Read the ministry's proposal.",
+            "Check the ex-dividend date."
+          ],
+          "warnings": []
+        },
+        "final": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 76,
+          "potential_low": 10.2,
+          "entry_price": 11.2,
+          "target_price": 13.7,
+          "confidence": "medium",
+          "fear": "The market fears that new limits on online gaming advertising in Greece will slow Allwyn's growth there.",
+          "fundamental_impact": "Small: Greece is one of several markets, and the proposed limits cover advertising, not the licences.",
+          "thesis": "A fall on a proposal that doesn't touch the licences or the dividend. Once the final rules are known, the shares are likely to return towards their August level.",
+          "risks": [
+            "The final rules are stricter than the proposal.",
+            "A higher gaming tax in the next budget."
+          ],
+          "catalysts": [
+            "The final text of the advertising rules.",
+            "The interim dividend date."
+          ],
+          "checks": [
+            "Read the ministry's proposal.",
+            "Check the ex-dividend date."
+          ],
+          "warnings": []
+        },
+        "critique": [],
+        "concessions": [],
+        "changed_mind": false,
+        "favoured": false,
+        "compare": false
+      }
+    ],
+    "judge": null,
+    "judge_label": null,
+    "summary": "Both models read the fall as a temporary fear (80% and 76%), so their positions were merged without a judge.",
+    "agreement": "high",
+    "favoured": null,
+    "favoured_label": null,
+    "ruling_title": "The merged analysis",
+    "judge_note": null,
+    "line": "Claude 80% · GPT-5 76% → 78% (high agreement)"
+  }
+}

@@ -1,0 +1,1139 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 7,
+    "ticker": "META",
+    "company": "Meta Platforms, Inc.",
+    "exchange": "NasdaqGS",
+    "currency": "USD",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "age_seconds": 11921,
+    "score": 57.5,
+    "score_band": "fair",
+    "verdict": "temporary_fear",
+    "verdict_label": "Temporary fear",
+    "confidence": "medium",
+    "probability_up_6m": 66,
+    "price": {
+      "amount": 751.66,
+      "approx": 659.8139
+    },
+    "entry": {
+      "amount": 712.0,
+      "approx": 625.0
+    },
+    "target": {
+      "amount": 842.0,
+      "approx": 739.1152
+    },
+    "potential_low": {
+      "amount": 668.0,
+      "approx": 586.3764
+    },
+    "stat_low": {
+      "amount": 428.5603,
+      "approx": 376.1941
+    },
+    "fx": {
+      "currency": "EUR",
+      "rate": 0.877808988764045,
+      "main_currency": "USD",
+      "rate_main_unit": 0.877808988764045,
+      "source": "analysis",
+      "as_of": "2026-09-28T02:53:58.652091+00:00",
+      "note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+    },
+    "upside_pct": 12.0187,
+    "downside_pct": -11.13,
+    "entry_upside_pct": 18.2584,
+    "entry_downside_pct": -6.1798,
+    "change_1d_pct": -3.3347,
+    "change_5d_pct": 12.9042,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": true,
+    "on_my_watchlist": true,
+    "debate": {
+      "mode": "debate",
+      "agreement": "medium",
+      "line": "GPT-5 70% · Claude 62% → 66% (medium agreement)",
+      "participants": [
+        {
+          "label": "A",
+          "model": "openai:gpt-5",
+          "model_label": "GPT-5",
+          "opening_probability": 72,
+          "final_probability": 70,
+          "final_verdict": "temporary_fear",
+          "changed_mind": false
+        },
+        {
+          "label": "B",
+          "model": "anthropic:claude-sonnet-5",
+          "model_label": "Claude Sonnet 5",
+          "opening_probability": 58,
+          "final_probability": 62,
+          "final_verdict": "mixed",
+          "changed_mind": true
+        }
+      ],
+      "final_probability": 66,
+      "judge": "anthropic:claude-sonnet-5",
+      "judge_label": "Claude Sonnet 5"
+    }
+  },
+  "opportunity": {
+    "ticker": "META",
+    "company": "Meta Platforms, Inc.",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "price": 751.66,
+    "currency": "USD",
+    "score": 57.5,
+    "analysis": {
+      "verdict": "temporary_fear",
+      "probability_up_6m": 66,
+      "potential_low": 668.0,
+      "entry_price": 712.0,
+      "target_price": 842.0,
+      "confidence": "medium",
+      "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+      "fundamental_impact": "Limited so far: advertising revenue grew over 20% in the last quarter and the spending is funded from operating cash flow. A further rise in capital spending would weigh on free cash flow, not on the ad business itself.",
+      "thesis": "A 3.3% fall on a spending worry, with the business growing and no change to guidance. If the next results show ad growth holding up, the shares have room to recover towards the September high; a limit buy near 712 leaves room for the worry to run a little further first.",
+      "risks": [
+        "Capital spending guidance rises again at the next results.",
+        "Regulators in the EU restrict the use of personal data for ads.",
+        "A weaker ad market as the economy slows."
+      ],
+      "catalysts": [
+        "The third-quarter results at the end of October.",
+        "Early numbers on Muse usage and ad pricing."
+      ],
+      "checks": [
+        "Read the capital spending guidance in the last results.",
+        "Check the date of the next results.",
+        "Compare the fall with the Nasdaq's move on the same day."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "META",
+      "name": "Meta Platforms, Inc.",
+      "currency": "USD",
+      "exchange": "NasdaqGS",
+      "as_of": "2026-09-25T20:00:01+00:00",
+      "price": 751.66,
+      "previous_close": 777.5900268554688,
+      "change_1d_pct": -3.334665564105599,
+      "change_5d_pct": 12.904243334585042,
+      "change_20d_pct": 31.616184929584602,
+      "high_20d": 779.8200073242188,
+      "high_52w": 779.8200073242188,
+      "low_52w": 520.26,
+      "drawdown_20d_pct": -3.611090643960735,
+      "drawdown_52w_pct": -3.611090643960735,
+      "above_low_52w_pct": 44.47776111944029,
+      "sma_50": 615.7463970214844,
+      "sma_200": 626.4722477539062,
+      "volatility_pct": 48.3027061889635,
+      "volume_ratio": 1.14962678455284,
+      "stat_low_6m": 428.560333398316,
+      "worst_6m_drawdown_pct": -34.209345445636515,
+      "session_elapsed": null,
+      "timezone": "America/New_York",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [
+      "db32cfe53a80977c7e90b1d2f8d0764d66d5a373",
+      "2e8201ec0e88a721eee4ed07bbf73e58a1794c23",
+      "ca6c0248bb8aae9ec92a11a3054ed9b944efa842",
+      "a017eb88a38e99d52b3bd115be90a1d5668b2032",
+      "d7424fa9f3ec54fc78cc58c0d0e2be7f0ec22076",
+      "16e4e0780fbd55bb4eb4848e0276aac6e39b4a7f"
+    ],
+    "headlines": [
+      {
+        "title": "Apple, Microsoft, and Meta prove stock picking for individuals is not a fool's errand",
+        "link": "https://www.cnbc.com/2026/09/27/jim-cramer-apple-microsoft-and-meta-prove-stock-picking-for-individuals-is-not-a-fools-errand.html",
+        "source": "CNBC - Top News",
+        "published": "2026-09-27T23:33:21+00:00",
+        "direction": "negative",
+        "magnitude": 2
+      },
+      {
+        "title": "Meta's VR Glasses are the product Vision Pro should have been; sources: Apple Vision team is working on a revamped headset, but the work is on \"life support\" (Mark Gurman/Bloomberg)",
+        "link": "https://www.techmeme.com/260927/p6",
+        "source": "Techmeme",
+        "published": "2026-09-27T15:00:00+00:00",
+        "direction": "mixed",
+        "magnitude": 2
+      },
+      {
+        "title": "Meta's Muse agent is attacking one of the economy's most profitable weak spots",
+        "link": "https://www.cnbc.com/2026/09/27/meta-muse-ai-personal-agent.html",
+        "source": "CNBC - Top News",
+        "published": "2026-09-27T14:33:22+00:00",
+        "direction": "mixed",
+        "magnitude": 3
+      },
+      {
+        "title": "Meta's Commerce Bet Meets a Courtroom Verdict: Inside a Week of Highs, Headwinds and Hard Questions - AD HOC NEWS",
+        "link": "https://news.google.com/rss/articles/CBMi1wFBVV95cUxPdjNmWFVtM2NKYlg3ZEhLTXdTUTdseE5iUFFuUzZyYkxhMS1SYUk1bVdtbGtsNXpJT2NSUmZlZlJBblhDaWZoMnh1NEYxQWFwdWo3d3ptUjgtdGxUcUNvUE1sYVhld3ZORjNTNThMMzlyQ05KVWwyalFGenR1bGFPOElFdV9tLUhwemtycnhkSVF0d0dBX0xRVEpLY2JaS2dvVS1yR0o4OXhVeC1RREc1SHd1N2VxR3cwNlhLUC1RMFlqaXh5NzVQbnBOenBNaGlOODZEZ3ZWbw?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-27T12:11:27+00:00",
+        "direction": "negative",
+        "magnitude": 2
+      },
+      {
+        "title": "Mark Zuckerberg Loses Nearly $9 Billion in One Day as Meta Stock Slides 4% After Goldman Questions AI Spending Payoff - TradingView",
+        "link": "https://news.google.com/rss/articles/CBMihAJBVV95cUxQelZwdUpmbnRKeGlQVk9xaVBSS0hra04xQjYtdHZzdzZBYThmYzNnejNjX2Fvcy0tRWpjejEzRUpVaU5TdnNEZ0pWeFRDSkRxZ08wd3BMYjFhYzd2bWhJNHFYbnJvalQ5b0VzTTJMOWZ2SjIzZmR0ODFNd2I5V0hwbFh5cGpqV09nRkNIVkVxakdjVk0xOHhISnVSZVAzZDQ1enYyTUU2eG0zem5qUldibk80eUdjWkZIc1hlTUpCS1FvQnA2d1gxVDNkalBOWlZCbUY1Y0hyX0oyaGVaSnhqZHhES2VkWjBRWWJQY3ExNzBESFpJVk1OdUIwVWxnQkFCMHI0dw?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-27T03:50:00+00:00",
+        "direction": "mixed",
+        "magnitude": 4
+      },
+      {
+        "title": "META Stock Drops For Fourth Session: Meta Recruits Cybersecurity Experts To Fortify AI Agents - Stocktwits",
+        "link": "https://news.google.com/rss/articles/CBMi7AFBVV95cUxOblRJLU1wUjlUM1NJWE1EOTk3YjBuQ0tQMGdfQVNTY21oWHFHMF9QX1Z4LUhGWnhwQUxoMnJEaExydmw2NnpMcnJNYVMyOGZ4NDZNSklmelYwbmZoZk5HQXJISm5VTkd2R0R3S2J6c291ZXRmem8wVHNya2dmOFladUVzaWhCZGl6VXpZbzdzUjlOUDdFeVhrczFPcENFNnRmcm80UmJ0dUJNLVl3S3RWbDR3VWlrMU55MzFEQTRiSTRQWnplRzljRGt2UUtTdk45LTJUb1JiazZFSm5EajNCb0pPb3hqb25DWXhUcQ?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-27T03:19:44+00:00",
+        "direction": "negative",
+        "magnitude": 2
+      }
+    ],
+    "dip_reasons": [
+      "down 3.3% on Fri 25 Sep",
+      "all of this news came out after the last session (Fri 25 Sep)"
+    ],
+    "model": "debate: gpt-5 vs claude-sonnet-5, judged by claude-sonnet-5",
+    "news_after_session": true,
+    "account_currency": "EUR",
+    "fx_rate": 0.877808988764045,
+    "benchmark": "^GSPC",
+    "benchmark_level": 7743.41,
+    "fx_rates": {
+      "EUR": 0.877808988764045
+    },
+    "id": 7,
+    "debate": {
+      "mode": "debate",
+      "reason": null,
+      "rounds": 1,
+      "participants": [
+        {
+          "label": "A",
+          "model": "openai:gpt-5",
+          "opening": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 72,
+            "potential_low": 675.0,
+            "entry_price": 718.0,
+            "target_price": 850.0,
+            "confidence": "high",
+            "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+            "fundamental_impact": "Limited so far: advertising revenue grew over 20% in the last quarter and the spending is funded from operating cash flow. A further rise in capital spending would weigh on free cash flow, not on the ad business itself.",
+            "thesis": "The fall is about spending, not demand: ad revenue is growing and the balance sheet is strong. Shares that fell on a capital spending scare have usually recovered within months once results confirm growth.",
+            "risks": [
+              "Capital spending guidance rises again at the next results.",
+              "Regulators in the EU restrict the use of personal data for ads."
+            ],
+            "catalysts": [
+              "The third-quarter results at the end of October.",
+              "Early numbers on Muse usage and ad pricing."
+            ],
+            "checks": [
+              "Read the capital spending guidance in the last results.",
+              "Check the date of the next results.",
+              "Compare the fall with the Nasdaq's move on the same day."
+            ],
+            "warnings": []
+          },
+          "final": {
+            "verdict": "temporary_fear",
+            "probability_up_6m": 70,
+            "potential_low": 670.0,
+            "entry_price": 715.0,
+            "target_price": 845.0,
+            "confidence": "medium",
+            "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+            "fundamental_impact": "Limited so far: advertising revenue grew over 20% in the last quarter and the spending is funded from operating cash flow. A further rise in capital spending would weigh on free cash flow, not on the ad business itself.",
+            "thesis": "A 3.3% fall on a spending worry, with the business growing and no change to guidance. If the next results show ad growth holding up, the shares have room to recover towards the September high; a limit buy near 712 leaves room for the worry to run a little further first.",
+            "risks": [
+              "Capital spending guidance rises again at the next results.",
+              "Regulators in the EU restrict the use of personal data for ads.",
+              "A weaker ad market as the economy slows."
+            ],
+            "catalysts": [
+              "The third-quarter results at the end of October.",
+              "Early numbers on Muse usage and ad pricing."
+            ],
+            "checks": [
+              "Read the capital spending guidance in the last results.",
+              "Check the date of the next results.",
+              "Compare the fall with the Nasdaq's move on the same day."
+            ],
+            "warnings": []
+          },
+          "critique": [
+            "Calls the spending a lasting margin problem, but the input shows operating cash flow covering it.",
+            "Puts the potential low below the statistical 6-month low without a reason in the input."
+          ],
+          "concessions": [
+            "The headlines do not rule out a further rise in capital spending guidance.",
+            "Confidence should be medium until the October results."
+          ],
+          "changed_mind": false
+        },
+        {
+          "label": "B",
+          "model": "anthropic:claude-sonnet-5",
+          "opening": {
+            "verdict": "mixed",
+            "probability_up_6m": 58,
+            "potential_low": 640.0,
+            "entry_price": 700.0,
+            "target_price": 820.0,
+            "confidence": "medium",
+            "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+            "fundamental_impact": "Real but gradual: each further rise in capital spending lowers free cash flow, and the returns on AI spending are not yet visible in the figures.",
+            "thesis": "The ad business is healthy, but the spending question may take more than one quarter to settle; the shares could stay range-bound until it does.",
+            "risks": [
+              "Capital spending guidance rises again at the next results.",
+              "Regulators in the EU restrict the use of personal data for ads.",
+              "A weaker ad market as the economy slows."
+            ],
+            "catalysts": [
+              "The third-quarter results at the end of October."
+            ],
+            "checks": [
+              "Read the capital spending guidance in the last results.",
+              "Check the date of the next results."
+            ],
+            "warnings": []
+          },
+          "final": {
+            "verdict": "mixed",
+            "probability_up_6m": 62,
+            "potential_low": 660.0,
+            "entry_price": 708.0,
+            "target_price": 835.0,
+            "confidence": "medium",
+            "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+            "fundamental_impact": "Limited today; free cash flow is the part at risk if capital spending rises again.",
+            "thesis": "A healthy ad business with a spending overhang: a recovery is more likely than not, but it depends on the October guidance.",
+            "risks": [
+              "Capital spending guidance rises again at the next results.",
+              "Regulators in the EU restrict the use of personal data for ads.",
+              "A weaker ad market as the economy slows."
+            ],
+            "catalysts": [
+              "The third-quarter results at the end of October.",
+              "Early numbers on Muse usage and ad pricing."
+            ],
+            "checks": [
+              "Read the capital spending guidance in the last results.",
+              "Check the date of the next results.",
+              "Compare the fall with the Nasdaq's move on the same day."
+            ],
+            "warnings": []
+          },
+          "critique": [
+            "Treats the recovery as likely within months without weighing the next capital spending guidance.",
+            "Uses a historical pattern of recoveries that is not in the input."
+          ],
+          "concessions": [
+            "Ad revenue growth in the input is strong, so fundamental damage is unlikely.",
+            "A potential low near 660 is more consistent with the price history than 640."
+          ],
+          "changed_mind": true
+        }
+      ],
+      "judge": "anthropic:claude-sonnet-5",
+      "summary": "Both analysts agree the ad business is intact; the crux is whether higher capital spending is a passing worry or a lasting drag on free cash flow. Analyst A's reading is better supported by the cash flow figures in the input, but the October guidance can't be known yet, so the ruling keeps a temporary-fear verdict at medium confidence.",
+      "agreement": "medium",
+      "favoured": "openai:gpt-5"
+    }
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 842.0,
+        "approx": 739.1152
+      },
+      "change_pct": 12.0187,
+      "from_entry_pct": 18.2584
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 751.66,
+        "approx": 659.8139
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 712.0,
+        "approx": 625.0
+      },
+      "change_pct": -5.2763,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 668.0,
+        "approx": 586.3764
+      },
+      "change_pct": -11.13,
+      "from_entry_pct": -6.1798
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 428.5603,
+        "approx": 376.1941
+      },
+      "change_pct": -42.9848,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": "1 USD = 0.8778 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ",
+  "chart": {
+    "currency": "USD",
+    "closes": [
+      [
+        "2026-03-30",
+        536.38
+      ],
+      [
+        "2026-03-31",
+        572.13
+      ],
+      [
+        "2026-04-01",
+        579.23
+      ],
+      [
+        "2026-04-02",
+        574.46
+      ],
+      [
+        "2026-04-06",
+        573.02
+      ],
+      [
+        "2026-04-07",
+        575.05
+      ],
+      [
+        "2026-04-08",
+        612.42
+      ],
+      [
+        "2026-04-09",
+        628.39
+      ],
+      [
+        "2026-04-10",
+        629.86
+      ],
+      [
+        "2026-04-13",
+        634.53
+      ],
+      [
+        "2026-04-14",
+        662.49
+      ],
+      [
+        "2026-04-15",
+        671.58
+      ],
+      [
+        "2026-04-16",
+        676.87
+      ],
+      [
+        "2026-04-17",
+        688.55
+      ],
+      [
+        "2026-04-20",
+        670.91
+      ],
+      [
+        "2026-04-21",
+        668.84
+      ],
+      [
+        "2026-04-22",
+        674.72
+      ],
+      [
+        "2026-04-23",
+        659.15
+      ],
+      [
+        "2026-04-24",
+        675.03
+      ],
+      [
+        "2026-04-27",
+        678.62
+      ],
+      [
+        "2026-04-28",
+        671.34
+      ],
+      [
+        "2026-04-29",
+        669.12
+      ],
+      [
+        "2026-04-30",
+        611.91
+      ],
+      [
+        "2026-05-01",
+        608.75
+      ],
+      [
+        "2026-05-04",
+        610.41
+      ],
+      [
+        "2026-05-05",
+        604.96
+      ],
+      [
+        "2026-05-06",
+        612.88
+      ],
+      [
+        "2026-05-07",
+        616.81
+      ],
+      [
+        "2026-05-08",
+        609.63
+      ],
+      [
+        "2026-05-11",
+        598.86
+      ],
+      [
+        "2026-05-12",
+        603.0
+      ],
+      [
+        "2026-05-13",
+        616.63
+      ],
+      [
+        "2026-05-14",
+        618.43
+      ],
+      [
+        "2026-05-15",
+        614.23
+      ],
+      [
+        "2026-05-18",
+        611.21
+      ],
+      [
+        "2026-05-19",
+        602.61
+      ],
+      [
+        "2026-05-20",
+        605.06
+      ],
+      [
+        "2026-05-21",
+        607.38
+      ],
+      [
+        "2026-05-22",
+        610.26
+      ],
+      [
+        "2026-05-26",
+        612.34
+      ],
+      [
+        "2026-05-27",
+        635.26
+      ],
+      [
+        "2026-05-28",
+        635.29
+      ],
+      [
+        "2026-05-29",
+        632.51
+      ],
+      [
+        "2026-06-01",
+        600.47
+      ],
+      [
+        "2026-06-02",
+        597.63
+      ],
+      [
+        "2026-06-03",
+        622.98
+      ],
+      [
+        "2026-06-04",
+        627.57
+      ],
+      [
+        "2026-06-05",
+        593.0
+      ],
+      [
+        "2026-06-08",
+        585.39
+      ],
+      [
+        "2026-06-09",
+        584.59
+      ],
+      [
+        "2026-06-10",
+        570.98
+      ],
+      [
+        "2026-06-11",
+        568.43
+      ],
+      [
+        "2026-06-12",
+        566.98
+      ],
+      [
+        "2026-06-15",
+        593.48
+      ],
+      [
+        "2026-06-16",
+        600.21
+      ],
+      [
+        "2026-06-17",
+        567.58
+      ],
+      [
+        "2026-06-18",
+        577.22
+      ],
+      [
+        "2026-06-22",
+        563.85
+      ],
+      [
+        "2026-06-23",
+        562.2
+      ],
+      [
+        "2026-06-24",
+        557.67
+      ],
+      [
+        "2026-06-25",
+        542.87
+      ],
+      [
+        "2026-06-26",
+        550.25
+      ],
+      [
+        "2026-06-29",
+        562.6
+      ],
+      [
+        "2026-06-30",
+        563.29
+      ],
+      [
+        "2026-07-01",
+        612.91
+      ],
+      [
+        "2026-07-02",
+        582.9
+      ],
+      [
+        "2026-07-06",
+        600.29
+      ],
+      [
+        "2026-07-07",
+        615.58
+      ],
+      [
+        "2026-07-08",
+        603.12
+      ],
+      [
+        "2026-07-09",
+        631.48
+      ],
+      [
+        "2026-07-10",
+        669.21
+      ],
+      [
+        "2026-07-13",
+        656.73
+      ],
+      [
+        "2026-07-14",
+        661.04
+      ],
+      [
+        "2026-07-15",
+        681.31
+      ],
+      [
+        "2026-07-16",
+        664.54
+      ],
+      [
+        "2026-07-17",
+        646.01
+      ],
+      [
+        "2026-07-20",
+        645.85
+      ],
+      [
+        "2026-07-21",
+        643.81
+      ],
+      [
+        "2026-07-22",
+        627.17
+      ],
+      [
+        "2026-07-23",
+        606.1
+      ],
+      [
+        "2026-07-24",
+        595.19
+      ],
+      [
+        "2026-07-27",
+        593.87
+      ],
+      [
+        "2026-07-28",
+        593.41
+      ],
+      [
+        "2026-07-29",
+        585.61
+      ],
+      [
+        "2026-07-30",
+        539.03
+      ],
+      [
+        "2026-07-31",
+        556.71
+      ],
+      [
+        "2026-08-03",
+        590.24
+      ],
+      [
+        "2026-08-04",
+        587.94
+      ],
+      [
+        "2026-08-05",
+        588.77
+      ],
+      [
+        "2026-08-06",
+        589.9
+      ],
+      [
+        "2026-08-07",
+        592.1
+      ],
+      [
+        "2026-08-10",
+        594.92
+      ],
+      [
+        "2026-08-11",
+        599.12
+      ],
+      [
+        "2026-08-12",
+        578.85
+      ],
+      [
+        "2026-08-13",
+        594.97
+      ],
+      [
+        "2026-08-14",
+        589.85
+      ],
+      [
+        "2026-08-17",
+        568.97
+      ],
+      [
+        "2026-08-18",
+        543.67
+      ],
+      [
+        "2026-08-19",
+        546.03
+      ],
+      [
+        "2026-08-20",
+        545.83
+      ],
+      [
+        "2026-08-21",
+        549.9
+      ],
+      [
+        "2026-08-24",
+        559.02
+      ],
+      [
+        "2026-08-25",
+        570.05
+      ],
+      [
+        "2026-08-26",
+        576.14
+      ],
+      [
+        "2026-08-27",
+        571.1
+      ],
+      [
+        "2026-08-28",
+        578.02
+      ],
+      [
+        "2026-08-31",
+        572.34
+      ],
+      [
+        "2026-09-01",
+        578.54
+      ],
+      [
+        "2026-09-02",
+        592.85
+      ],
+      [
+        "2026-09-03",
+        610.68
+      ],
+      [
+        "2026-09-04",
+        616.77
+      ],
+      [
+        "2026-09-08",
+        613.48
+      ],
+      [
+        "2026-09-09",
+        653.69
+      ],
+      [
+        "2026-09-10",
+        644.38
+      ],
+      [
+        "2026-09-11",
+        648.03
+      ],
+      [
+        "2026-09-14",
+        665.6
+      ],
+      [
+        "2026-09-15",
+        670.24
+      ],
+      [
+        "2026-09-16",
+        673.31
+      ],
+      [
+        "2026-09-17",
+        682.31
+      ],
+      [
+        "2026-09-18",
+        665.75
+      ],
+      [
+        "2026-09-21",
+        741.25
+      ],
+      [
+        "2026-09-22",
+        736.6
+      ],
+      [
+        "2026-09-23",
+        744.1
+      ],
+      [
+        "2026-09-24",
+        777.59
+      ],
+      [
+        "2026-09-25",
+        751.66
+      ]
+    ],
+    "levels": {
+      "reported": 751.66,
+      "entry": 712.0,
+      "target": 842.0,
+      "potential_low": 668.0,
+      "stat_low": 428.560333398316
+    },
+    "signal_day": "2026-09-27",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "^GSPC",
+    "benchmark_name": "S&P 500",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [],
+  "history": [
+    {
+      "id": 7,
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "score": 57.5,
+      "score_band": "fair",
+      "probability_up_6m": 66,
+      "superseded": false,
+      "current": true
+    },
+    {
+      "id": 22,
+      "created": "2026-07-30T21:51:00+00:00",
+      "verdict": "temporary_fear",
+      "verdict_label": "Temporary fear",
+      "score": 72.2,
+      "score_band": "good",
+      "probability_up_6m": 79,
+      "superseded": true,
+      "current": false
+    }
+  ],
+  "rule_misses": [],
+  "debate": {
+    "mode": "debate",
+    "reason": null,
+    "reason_label": null,
+    "rounds": 1,
+    "title": "The debate",
+    "how": "GPT-5 and Claude Sonnet 5 analysed it separately, answered each other once, and Claude Sonnet 5 ruled.",
+    "participants": [
+      {
+        "label": "A",
+        "model": "openai:gpt-5",
+        "model_label": "GPT-5",
+        "provider": "openai",
+        "provider_label": "OpenAI",
+        "other_label": "Claude Sonnet 5",
+        "opening": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 72,
+          "potential_low": 675.0,
+          "entry_price": 718.0,
+          "target_price": 850.0,
+          "confidence": "high",
+          "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+          "fundamental_impact": "Limited so far: advertising revenue grew over 20% in the last quarter and the spending is funded from operating cash flow. A further rise in capital spending would weigh on free cash flow, not on the ad business itself.",
+          "thesis": "The fall is about spending, not demand: ad revenue is growing and the balance sheet is strong. Shares that fell on a capital spending scare have usually recovered within months once results confirm growth.",
+          "risks": [
+            "Capital spending guidance rises again at the next results.",
+            "Regulators in the EU restrict the use of personal data for ads."
+          ],
+          "catalysts": [
+            "The third-quarter results at the end of October.",
+            "Early numbers on Muse usage and ad pricing."
+          ],
+          "checks": [
+            "Read the capital spending guidance in the last results.",
+            "Check the date of the next results.",
+            "Compare the fall with the Nasdaq's move on the same day."
+          ],
+          "warnings": []
+        },
+        "final": {
+          "verdict": "temporary_fear",
+          "probability_up_6m": 70,
+          "potential_low": 670.0,
+          "entry_price": 715.0,
+          "target_price": 845.0,
+          "confidence": "medium",
+          "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+          "fundamental_impact": "Limited so far: advertising revenue grew over 20% in the last quarter and the spending is funded from operating cash flow. A further rise in capital spending would weigh on free cash flow, not on the ad business itself.",
+          "thesis": "A 3.3% fall on a spending worry, with the business growing and no change to guidance. If the next results show ad growth holding up, the shares have room to recover towards the September high; a limit buy near 712 leaves room for the worry to run a little further first.",
+          "risks": [
+            "Capital spending guidance rises again at the next results.",
+            "Regulators in the EU restrict the use of personal data for ads.",
+            "A weaker ad market as the economy slows."
+          ],
+          "catalysts": [
+            "The third-quarter results at the end of October.",
+            "Early numbers on Muse usage and ad pricing."
+          ],
+          "checks": [
+            "Read the capital spending guidance in the last results.",
+            "Check the date of the next results.",
+            "Compare the fall with the Nasdaq's move on the same day."
+          ],
+          "warnings": []
+        },
+        "critique": [
+          "Calls the spending a lasting margin problem, but the input shows operating cash flow covering it.",
+          "Puts the potential low below the statistical 6-month low without a reason in the input."
+        ],
+        "concessions": [
+          "The headlines do not rule out a further rise in capital spending guidance.",
+          "Confidence should be medium until the October results."
+        ],
+        "changed_mind": false,
+        "favoured": true,
+        "compare": true
+      },
+      {
+        "label": "B",
+        "model": "anthropic:claude-sonnet-5",
+        "model_label": "Claude Sonnet 5",
+        "provider": "anthropic",
+        "provider_label": "Anthropic",
+        "other_label": "GPT-5",
+        "opening": {
+          "verdict": "mixed",
+          "probability_up_6m": 58,
+          "potential_low": 640.0,
+          "entry_price": 700.0,
+          "target_price": 820.0,
+          "confidence": "medium",
+          "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+          "fundamental_impact": "Real but gradual: each further rise in capital spending lowers free cash flow, and the returns on AI spending are not yet visible in the figures.",
+          "thesis": "The ad business is healthy, but the spending question may take more than one quarter to settle; the shares could stay range-bound until it does.",
+          "risks": [
+            "Capital spending guidance rises again at the next results.",
+            "Regulators in the EU restrict the use of personal data for ads.",
+            "A weaker ad market as the economy slows."
+          ],
+          "catalysts": [
+            "The third-quarter results at the end of October."
+          ],
+          "checks": [
+            "Read the capital spending guidance in the last results.",
+            "Check the date of the next results."
+          ],
+          "warnings": []
+        },
+        "final": {
+          "verdict": "mixed",
+          "probability_up_6m": 62,
+          "potential_low": 660.0,
+          "entry_price": 708.0,
+          "target_price": 835.0,
+          "confidence": "medium",
+          "fear": "Investors fear that Meta's spending on AI data centres and its new Muse agent will squeeze margins for longer, after a report that capital spending could rise again next year.",
+          "fundamental_impact": "Limited today; free cash flow is the part at risk if capital spending rises again.",
+          "thesis": "A healthy ad business with a spending overhang: a recovery is more likely than not, but it depends on the October guidance.",
+          "risks": [
+            "Capital spending guidance rises again at the next results.",
+            "Regulators in the EU restrict the use of personal data for ads.",
+            "A weaker ad market as the economy slows."
+          ],
+          "catalysts": [
+            "The third-quarter results at the end of October.",
+            "Early numbers on Muse usage and ad pricing."
+          ],
+          "checks": [
+            "Read the capital spending guidance in the last results.",
+            "Check the date of the next results.",
+            "Compare the fall with the Nasdaq's move on the same day."
+          ],
+          "warnings": []
+        },
+        "critique": [
+          "Treats the recovery as likely within months without weighing the next capital spending guidance.",
+          "Uses a historical pattern of recoveries that is not in the input."
+        ],
+        "concessions": [
+          "Ad revenue growth in the input is strong, so fundamental damage is unlikely.",
+          "A potential low near 660 is more consistent with the price history than 640."
+        ],
+        "changed_mind": true,
+        "favoured": false,
+        "compare": true
+      }
+    ],
+    "judge": "anthropic:claude-sonnet-5",
+    "judge_label": "Claude Sonnet 5",
+    "summary": "Both analysts agree the ad business is intact; the crux is whether higher capital spending is a passing worry or a lasting drag on free cash flow. Analyst A's reading is better supported by the cash flow figures in the input, but the October guidance can't be known yet, so the ruling keeps a temporary-fear verdict at medium confidence.",
+    "agreement": "medium",
+    "favoured": "openai:gpt-5",
+    "favoured_label": "GPT-5",
+    "ruling_title": "The ruling by Claude Sonnet 5",
+    "judge_note": "It found GPT-5's case stronger. It saw the two only as Analyst A and Analyst B, so it couldn't tell which one was its own model.",
+    "line": "GPT-5 70% · Claude 62% → 66% (medium agreement)"
+  }
+}

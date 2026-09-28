@@ -1,0 +1,921 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "idea": {
+    "id": 5,
+    "ticker": "1211.HK",
+    "company": "BYD Company Limited",
+    "exchange": "HKSE",
+    "currency": "HKD",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "age_seconds": 11921,
+    "score": 45.3,
+    "score_band": "weak",
+    "verdict": "mixed",
+    "verdict_label": "Mixed",
+    "confidence": "medium",
+    "probability_up_6m": 61,
+    "price": {
+      "amount": 78.6,
+      "approx": 8.7991
+    },
+    "entry": {
+      "amount": 72.5,
+      "approx": 8.1162
+    },
+    "target": {
+      "amount": 90.0,
+      "approx": 10.0753
+    },
+    "potential_low": {
+      "amount": 66.5,
+      "approx": 7.4446
+    },
+    "stat_low": {
+      "amount": 54.7949,
+      "approx": 6.1342
+    },
+    "fx": {
+      "currency": "EUR",
+      "rate": 0.11194823513607308,
+      "main_currency": "HKD",
+      "rate_main_unit": 0.11194823513607308,
+      "source": "analysis",
+      "as_of": "2026-09-28T02:53:58.652091+00:00",
+      "note": "1 HKD = 0.1119 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ"
+    },
+    "upside_pct": 14.5038,
+    "downside_pct": -15.3944,
+    "entry_upside_pct": 24.1379,
+    "entry_downside_pct": -8.2759,
+    "change_1d_pct": 0.6402,
+    "change_5d_pct": -3.202,
+    "analyses_count": 1,
+    "superseded": false,
+    "superseded_by": null,
+    "matches_my_rules": false,
+    "on_my_watchlist": false,
+    "debate": {
+      "mode": "single",
+      "agreement": null,
+      "line": "GPT-5 61% (single model: Claude unavailable)",
+      "participants": [
+        {
+          "label": "A",
+          "model": "openai:gpt-5",
+          "model_label": "GPT-5",
+          "opening_probability": 61,
+          "final_probability": 61,
+          "final_verdict": "mixed",
+          "changed_mind": false
+        }
+      ],
+      "final_probability": 61,
+      "judge": null,
+      "judge_label": null
+    }
+  },
+  "opportunity": {
+    "ticker": "1211.HK",
+    "company": "BYD Company Limited",
+    "created": "2026-09-28T02:53:58.652091+00:00",
+    "price": 78.6,
+    "currency": "HKD",
+    "score": 45.3,
+    "analysis": {
+      "verdict": "mixed",
+      "probability_up_6m": 61,
+      "potential_low": 66.5,
+      "entry_price": 72.5,
+      "target_price": 90.0,
+      "confidence": "medium",
+      "fear": "Price cuts across China's car market and slowing domestic sales make investors doubt BYD's margins.",
+      "fundamental_impact": "Partly real: the price war lowers margins this year, while exports and commercial vehicles keep growing.",
+      "thesis": "Cheap on the sales it keeps winning, but the price war may last; a recovery within six months is somewhat more likely than not.",
+      "risks": [
+        "The price war deepens.",
+        "New tariffs on Chinese cars in Europe."
+      ],
+      "catalysts": [
+        "Monthly sales figures.",
+        "Export growth to Europe and South America."
+      ],
+      "checks": [
+        "Check the monthly sales release.",
+        "Read the latest margin figures."
+      ],
+      "warnings": []
+    },
+    "stats": {
+      "ticker": "1211.HK",
+      "name": "BYD Company Limited",
+      "currency": "HKD",
+      "exchange": "HKSE",
+      "as_of": "2026-09-28T02:38:54+00:00",
+      "price": 78.6,
+      "previous_close": 78.0999984741211,
+      "change_1d_pct": 0.6402068318152043,
+      "change_5d_pct": -3.201966805367573,
+      "change_20d_pct": -9.862382166534644,
+      "high_20d": 90.8499984741211,
+      "high_52w": 114.7,
+      "low_52w": 71.4,
+      "drawdown_20d_pct": -13.483762993799663,
+      "drawdown_52w_pct": -31.473408892763743,
+      "above_low_52w_pct": 10.084033613445364,
+      "sma_50": 87.30300021362305,
+      "sma_200": 93.56450009155273,
+      "volatility_pct": 31.015868659317746,
+      "volume_ratio": 0.9227236979056513,
+      "stat_low_6m": 54.79494874979248,
+      "worst_6m_drawdown_pct": -38.60705229615421,
+      "session_elapsed": 0.17225,
+      "timezone": "Asia/Hong_Kong",
+      "instrument_type": "EQUITY"
+    },
+    "article_ids": [
+      "8451bc1a6011c99f71b9a2b51d4ef8af41c2005f"
+    ],
+    "headlines": [
+      {
+        "title": "BYD Pushes Premium and Commercial Offensives as Shares Stay Trapped in Reverse - AD HOC NEWS",
+        "link": "https://news.google.com/rss/articles/CBMi2gFBVV95cUxPbUJ3VDV2M0V5RjBkZ3dfMHA1NlFLd09PRTZZYWtrbTFjVmlsdHZNTzRmQVZ4U3V4TFhGVjI2LW92SHd2elFoZGlJV2pZSmtXazl0enY5UTRtQzl0aVljOFdGMEc3ZzRoUmIwTC1NOWhoZUdwUmM4cUhmV1M1U0dycW14alN1TDZRdHJwNnVIWjhyQXRhRFNWWUliZVpWYS1XVnl4dXU1OG96ZG1qdXJNdUt6ZzdwaklLVWlEM29LcHJaVlVNbkNmOEhMbGo4U08tYjA4VkstMkNUUQ?oc=5",
+        "source": "Google News - Shares Falling",
+        "published": "2026-09-27T12:32:27+00:00",
+        "direction": "mixed",
+        "magnitude": 3
+      }
+    ],
+    "dip_reasons": [
+      "13.5% below its 20-day high"
+    ],
+    "model": "gpt-5 (debate: anthropic unavailable)",
+    "news_after_session": false,
+    "account_currency": "EUR",
+    "fx_rate": 0.11194823513607308,
+    "benchmark": "^HSI",
+    "benchmark_level": 24629.4,
+    "fx_rates": {
+      "EUR": 0.11194823513607308
+    },
+    "id": 5,
+    "debate": {
+      "mode": "single",
+      "reason": "anthropic unavailable: the model returned an overloaded error three times",
+      "rounds": 0,
+      "participants": [
+        {
+          "label": "A",
+          "model": "openai:gpt-5",
+          "opening": {
+            "verdict": "mixed",
+            "probability_up_6m": 61,
+            "potential_low": 66.5,
+            "entry_price": 72.5,
+            "target_price": 90.0,
+            "confidence": "medium",
+            "fear": "Price cuts across China's car market and slowing domestic sales make investors doubt BYD's margins.",
+            "fundamental_impact": "Partly real: the price war lowers margins this year, while exports and commercial vehicles keep growing.",
+            "thesis": "Cheap on the sales it keeps winning, but the price war may last; a recovery within six months is somewhat more likely than not.",
+            "risks": [
+              "The price war deepens.",
+              "New tariffs on Chinese cars in Europe."
+            ],
+            "catalysts": [
+              "Monthly sales figures.",
+              "Export growth to Europe and South America."
+            ],
+            "checks": [
+              "Check the monthly sales release.",
+              "Read the latest margin figures."
+            ],
+            "warnings": []
+          },
+          "final": {
+            "verdict": "mixed",
+            "probability_up_6m": 61,
+            "potential_low": 66.5,
+            "entry_price": 72.5,
+            "target_price": 90.0,
+            "confidence": "medium",
+            "fear": "Price cuts across China's car market and slowing domestic sales make investors doubt BYD's margins.",
+            "fundamental_impact": "Partly real: the price war lowers margins this year, while exports and commercial vehicles keep growing.",
+            "thesis": "Cheap on the sales it keeps winning, but the price war may last; a recovery within six months is somewhat more likely than not.",
+            "risks": [
+              "The price war deepens.",
+              "New tariffs on Chinese cars in Europe."
+            ],
+            "catalysts": [
+              "Monthly sales figures.",
+              "Export growth to Europe and South America."
+            ],
+            "checks": [
+              "Check the monthly sales release.",
+              "Read the latest margin figures."
+            ],
+            "warnings": []
+          },
+          "critique": [],
+          "concessions": [],
+          "changed_mind": false
+        }
+      ],
+      "judge": null,
+      "summary": null,
+      "agreement": null,
+      "favoured": null
+    }
+  },
+  "levels": [
+    {
+      "key": "target",
+      "label": "Target (limit sell idea)",
+      "short_label": "Target",
+      "value": {
+        "amount": 90.0,
+        "approx": 10.0753
+      },
+      "change_pct": 14.5038,
+      "from_entry_pct": 24.1379
+    },
+    {
+      "key": "price",
+      "label": "Price in the report",
+      "short_label": "Reported",
+      "value": {
+        "amount": 78.6,
+        "approx": 8.7991
+      },
+      "change_pct": null,
+      "from_entry_pct": null
+    },
+    {
+      "key": "entry",
+      "label": "Entry (limit buy)",
+      "short_label": "Entry",
+      "value": {
+        "amount": 72.5,
+        "approx": 8.1162
+      },
+      "change_pct": -7.7608,
+      "from_entry_pct": null
+    },
+    {
+      "key": "potential_low",
+      "label": "Potential low",
+      "short_label": "Low",
+      "value": {
+        "amount": 66.5,
+        "approx": 7.4446
+      },
+      "change_pct": -15.3944,
+      "from_entry_pct": -8.2759
+    },
+    {
+      "key": "stat_low",
+      "label": "Statistical 6-month low",
+      "short_label": "Stat. low",
+      "value": {
+        "amount": 54.7949,
+        "approx": 6.1342
+      },
+      "change_pct": -30.2863,
+      "from_entry_pct": null
+    }
+  ],
+  "fx_note": "1 HKD = 0.1119 EUR at the analysis (Yahoo Finance); your broker's rate and conversion fee differ",
+  "chart": {
+    "currency": "HKD",
+    "closes": [
+      [
+        "2026-03-30",
+        105.8
+      ],
+      [
+        "2026-03-31",
+        105.8
+      ],
+      [
+        "2026-04-01",
+        104.7
+      ],
+      [
+        "2026-04-02",
+        103.9
+      ],
+      [
+        "2026-04-08",
+        106.8
+      ],
+      [
+        "2026-04-09",
+        101.8
+      ],
+      [
+        "2026-04-10",
+        105.1
+      ],
+      [
+        "2026-04-13",
+        110.3
+      ],
+      [
+        "2026-04-14",
+        109.4
+      ],
+      [
+        "2026-04-15",
+        107.3
+      ],
+      [
+        "2026-04-16",
+        113.2
+      ],
+      [
+        "2026-04-17",
+        111.4
+      ],
+      [
+        "2026-04-20",
+        110.0
+      ],
+      [
+        "2026-04-21",
+        109.1
+      ],
+      [
+        "2026-04-22",
+        107.0
+      ],
+      [
+        "2026-04-23",
+        103.5
+      ],
+      [
+        "2026-04-24",
+        101.2
+      ],
+      [
+        "2026-04-27",
+        106.0
+      ],
+      [
+        "2026-04-28",
+        103.7
+      ],
+      [
+        "2026-04-29",
+        108.3
+      ],
+      [
+        "2026-04-30",
+        102.5
+      ],
+      [
+        "2026-05-04",
+        103.0
+      ],
+      [
+        "2026-05-05",
+        101.0
+      ],
+      [
+        "2026-05-06",
+        98.9
+      ],
+      [
+        "2026-05-07",
+        100.7
+      ],
+      [
+        "2026-05-08",
+        99.75
+      ],
+      [
+        "2026-05-11",
+        101.7
+      ],
+      [
+        "2026-05-12",
+        99.85
+      ],
+      [
+        "2026-05-13",
+        98.15
+      ],
+      [
+        "2026-05-14",
+        98.15
+      ],
+      [
+        "2026-05-15",
+        96.45
+      ],
+      [
+        "2026-05-18",
+        93.8
+      ],
+      [
+        "2026-05-19",
+        93.9
+      ],
+      [
+        "2026-05-20",
+        90.2
+      ],
+      [
+        "2026-05-21",
+        90.55
+      ],
+      [
+        "2026-05-22",
+        91.6
+      ],
+      [
+        "2026-05-26",
+        93.65
+      ],
+      [
+        "2026-05-27",
+        90.7
+      ],
+      [
+        "2026-05-28",
+        90.3
+      ],
+      [
+        "2026-05-29",
+        91.3
+      ],
+      [
+        "2026-06-01",
+        90.75
+      ],
+      [
+        "2026-06-02",
+        96.75
+      ],
+      [
+        "2026-06-03",
+        93.25
+      ],
+      [
+        "2026-06-04",
+        91.8
+      ],
+      [
+        "2026-06-05",
+        89.7
+      ],
+      [
+        "2026-06-08",
+        88.05
+      ],
+      [
+        "2026-06-09",
+        88.4
+      ],
+      [
+        "2026-06-10",
+        86.6
+      ],
+      [
+        "2026-06-11",
+        84.95
+      ],
+      [
+        "2026-06-12",
+        86.55
+      ],
+      [
+        "2026-06-15",
+        85.6
+      ],
+      [
+        "2026-06-16",
+        84.05
+      ],
+      [
+        "2026-06-17",
+        81.9
+      ],
+      [
+        "2026-06-18",
+        80.85
+      ],
+      [
+        "2026-06-22",
+        78.35
+      ],
+      [
+        "2026-06-23",
+        75.85
+      ],
+      [
+        "2026-06-24",
+        75.95
+      ],
+      [
+        "2026-06-25",
+        76.05
+      ],
+      [
+        "2026-06-26",
+        72.65
+      ],
+      [
+        "2026-06-29",
+        72.9
+      ],
+      [
+        "2026-06-30",
+        72.45
+      ],
+      [
+        "2026-07-02",
+        78.3
+      ],
+      [
+        "2026-07-03",
+        84.1
+      ],
+      [
+        "2026-07-06",
+        83.8
+      ],
+      [
+        "2026-07-07",
+        83.45
+      ],
+      [
+        "2026-07-08",
+        85.85
+      ],
+      [
+        "2026-07-09",
+        82.65
+      ],
+      [
+        "2026-07-10",
+        84.9
+      ],
+      [
+        "2026-07-13",
+        83.95
+      ],
+      [
+        "2026-07-14",
+        86.15
+      ],
+      [
+        "2026-07-15",
+        86.95
+      ],
+      [
+        "2026-07-16",
+        90.95
+      ],
+      [
+        "2026-07-17",
+        88.7
+      ],
+      [
+        "2026-07-20",
+        90.15
+      ],
+      [
+        "2026-07-21",
+        89.8
+      ],
+      [
+        "2026-07-22",
+        87.85
+      ],
+      [
+        "2026-07-23",
+        88.65
+      ],
+      [
+        "2026-07-24",
+        88.65
+      ],
+      [
+        "2026-07-27",
+        88.55
+      ],
+      [
+        "2026-07-28",
+        89.8
+      ],
+      [
+        "2026-07-29",
+        93.6
+      ],
+      [
+        "2026-07-30",
+        94.8
+      ],
+      [
+        "2026-07-31",
+        94.15
+      ],
+      [
+        "2026-08-03",
+        94.9
+      ],
+      [
+        "2026-08-04",
+        93.45
+      ],
+      [
+        "2026-08-05",
+        93.8
+      ],
+      [
+        "2026-08-06",
+        89.85
+      ],
+      [
+        "2026-08-07",
+        90.15
+      ],
+      [
+        "2026-08-10",
+        92.3
+      ],
+      [
+        "2026-08-11",
+        89.7
+      ],
+      [
+        "2026-08-12",
+        89.6
+      ],
+      [
+        "2026-08-13",
+        88.4
+      ],
+      [
+        "2026-08-14",
+        88.25
+      ],
+      [
+        "2026-08-17",
+        90.05
+      ],
+      [
+        "2026-08-18",
+        90.0
+      ],
+      [
+        "2026-08-19",
+        89.4
+      ],
+      [
+        "2026-08-20",
+        91.8
+      ],
+      [
+        "2026-08-21",
+        93.15
+      ],
+      [
+        "2026-08-24",
+        92.8
+      ],
+      [
+        "2026-08-25",
+        93.6
+      ],
+      [
+        "2026-08-26",
+        92.6
+      ],
+      [
+        "2026-08-27",
+        91.25
+      ],
+      [
+        "2026-08-28",
+        91.95
+      ],
+      [
+        "2026-08-31",
+        87.2
+      ],
+      [
+        "2026-09-01",
+        88.25
+      ],
+      [
+        "2026-09-02",
+        85.25
+      ],
+      [
+        "2026-09-03",
+        85.7
+      ],
+      [
+        "2026-09-04",
+        86.15
+      ],
+      [
+        "2026-09-07",
+        84.5
+      ],
+      [
+        "2026-09-08",
+        83.85
+      ],
+      [
+        "2026-09-09",
+        81.8
+      ],
+      [
+        "2026-09-10",
+        79.55
+      ],
+      [
+        "2026-09-11",
+        79.85
+      ],
+      [
+        "2026-09-14",
+        80.2
+      ],
+      [
+        "2026-09-15",
+        79.05
+      ],
+      [
+        "2026-09-16",
+        79.2
+      ],
+      [
+        "2026-09-17",
+        81.15
+      ],
+      [
+        "2026-09-18",
+        81.5
+      ],
+      [
+        "2026-09-21",
+        81.2
+      ],
+      [
+        "2026-09-22",
+        81.35
+      ],
+      [
+        "2026-09-23",
+        80.35
+      ],
+      [
+        "2026-09-24",
+        79.5
+      ],
+      [
+        "2026-09-25",
+        78.1
+      ],
+      [
+        "2026-09-28",
+        78.6
+      ]
+    ],
+    "levels": {
+      "reported": 78.6,
+      "entry": 72.5,
+      "target": 90.0,
+      "potential_low": 66.5,
+      "stat_low": 54.79494874979248
+    },
+    "signal_day": "2026-09-28",
+    "split_factor": 1.0,
+    "split_note": null
+  },
+  "prices_problem": null,
+  "outcome": {
+    "status": "waiting_entry",
+    "status_label": "waiting for entry",
+    "priced": false,
+    "price_mismatch": false,
+    "days": 0,
+    "last_price": null,
+    "last_day": null,
+    "return_pct": null,
+    "account_currency": "EUR",
+    "account_return_pct": null,
+    "benchmark": "^HSI",
+    "benchmark_name": "Hang Seng",
+    "benchmark_return_pct": null,
+    "excess_return_pct": null,
+    "entry_filled": null,
+    "target_hit": null,
+    "low_breached": null,
+    "max_gain_pct": null,
+    "max_loss_pct": null,
+    "trade_return_pct": null,
+    "up_after_6m": null,
+    "split_factor": 1.0
+  },
+  "outcome_notes": [
+    "No prices for the index Hang Seng: Yahoo Finance answered 502."
+  ],
+  "history": [
+    {
+      "id": 5,
+      "created": "2026-09-28T02:53:58.652091+00:00",
+      "verdict": "mixed",
+      "verdict_label": "Mixed",
+      "score": 45.3,
+      "score_band": "weak",
+      "probability_up_6m": 61,
+      "superseded": false,
+      "current": true
+    }
+  ],
+  "rule_misses": [
+    "its score 45.3 is under your 55"
+  ],
+  "debate": {
+    "mode": "single",
+    "reason": "anthropic unavailable: the model returned an overloaded error three times",
+    "reason_label": "anthropic unavailable: the model returned an overloaded error three times.",
+    "rounds": 0,
+    "title": "The models",
+    "how": null,
+    "participants": [
+      {
+        "label": "A",
+        "model": "openai:gpt-5",
+        "model_label": "GPT-5",
+        "provider": "openai",
+        "provider_label": "OpenAI",
+        "other_label": null,
+        "opening": {
+          "verdict": "mixed",
+          "probability_up_6m": 61,
+          "potential_low": 66.5,
+          "entry_price": 72.5,
+          "target_price": 90.0,
+          "confidence": "medium",
+          "fear": "Price cuts across China's car market and slowing domestic sales make investors doubt BYD's margins.",
+          "fundamental_impact": "Partly real: the price war lowers margins this year, while exports and commercial vehicles keep growing.",
+          "thesis": "Cheap on the sales it keeps winning, but the price war may last; a recovery within six months is somewhat more likely than not.",
+          "risks": [
+            "The price war deepens.",
+            "New tariffs on Chinese cars in Europe."
+          ],
+          "catalysts": [
+            "Monthly sales figures.",
+            "Export growth to Europe and South America."
+          ],
+          "checks": [
+            "Check the monthly sales release.",
+            "Read the latest margin figures."
+          ],
+          "warnings": []
+        },
+        "final": {
+          "verdict": "mixed",
+          "probability_up_6m": 61,
+          "potential_low": 66.5,
+          "entry_price": 72.5,
+          "target_price": 90.0,
+          "confidence": "medium",
+          "fear": "Price cuts across China's car market and slowing domestic sales make investors doubt BYD's margins.",
+          "fundamental_impact": "Partly real: the price war lowers margins this year, while exports and commercial vehicles keep growing.",
+          "thesis": "Cheap on the sales it keeps winning, but the price war may last; a recovery within six months is somewhat more likely than not.",
+          "risks": [
+            "The price war deepens.",
+            "New tariffs on Chinese cars in Europe."
+          ],
+          "catalysts": [
+            "Monthly sales figures.",
+            "Export growth to Europe and South America."
+          ],
+          "checks": [
+            "Check the monthly sales release.",
+            "Read the latest margin figures."
+          ],
+          "warnings": []
+        },
+        "critique": [],
+        "concessions": [],
+        "changed_mind": false,
+        "favoured": false,
+        "compare": false
+      }
+    ],
+    "judge": null,
+    "judge_label": null,
+    "summary": null,
+    "agreement": null,
+    "favoured": null,
+    "favoured_label": null,
+    "ruling_title": null,
+    "judge_note": null,
+    "line": "GPT-5 61% (single model: Claude unavailable)"
+  }
+}

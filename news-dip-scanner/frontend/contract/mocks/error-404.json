@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "not_found",
+    "message": "There is no idea with that number. It may have been removed.",
+    "retry_after": null
+  }
+}

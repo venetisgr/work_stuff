@@ -1,0 +1,19 @@
+{
+  "generated_at": "2026-09-28T06:12:40+00:00",
+  "filters": {
+    "days": 1,
+    "min_score": 80,
+    "verdict": "temporary_fear",
+    "watchlist": true,
+    "matching": true,
+    "sort": "score"
+  },
+  "total": 3,
+  "count": 0,
+  "page": {
+    "number": 1,
+    "pages": 1,
+    "size": 25
+  },
+  "ideas": []
+}

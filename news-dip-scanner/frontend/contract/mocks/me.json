@@ -1,0 +1,41 @@
+{
+  "user": {
+    "id": 1,
+    "email": "nikos@example.com",
+    "name": "Nikos",
+    "label": "Nikos",
+    "role": "admin"
+  },
+  "settings": {
+    "currency": "EUR",
+    "timezone": "Europe/Athens",
+    "watchlist": [
+      "META",
+      "ALWN.AT",
+      "ETE.AT",
+      "PPC.AT",
+      "ASML.AS"
+    ],
+    "alert_rules": {
+      "min_score": 55.0,
+      "min_probability": 60,
+      "verdicts": [
+        "temporary_fear",
+        "mixed"
+      ],
+      "only_watchlist": false,
+      "thesis_changes": true
+    },
+    "has_alert_channel": true
+  },
+  "csrf": "mock-csrf-3f9a1c0b7e2d4a58b6c1",
+  "capabilities": {
+    "admin": true,
+    "analyse": {
+      "available": true,
+      "limit": null,
+      "remaining": null,
+      "note": null
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "error": {
+    "code": "not_signed_in",
+    "message": "Sign in to continue.",
+    "retry_after": null
+  }
+}
