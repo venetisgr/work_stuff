@@ -39,6 +39,9 @@ export default function NoIdeas({
     );
   }
   const last = status.last_cycle;
+  // Paused by an admin, stopped on a setup problem, or off in this process: no cycle is coming, whatever the last one
+  // was (the status strip above says why).
+  const idle = !status.cycle_running_since && ["paused", "stopped", "disabled"].includes(status.state);
   return (
     <EmptyState title={title}>
       <p className="m-0">
@@ -47,7 +50,9 @@ export default function NoIdeas({
         news every {status.interval_minutes} minutes.
       </p>
       <p className="mb-0 mt-2">
-        {status.cycle_running_since ? (
+        {idle ? (
+          "The scanner isn't running just now (see above), so no new ideas arrive until it runs again."
+        ) : status.cycle_running_since ? (
           <>
             A cycle is running now (it started <TimeAgo iso={status.cycle_running_since} now={now} timeZone={timeZone} />
             ).

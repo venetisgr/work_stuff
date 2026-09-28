@@ -102,6 +102,17 @@ describe("the dashboard with no ideas", () => {
     );
   });
 
+  it("doesn't promise a first cycle while the scanner is off, paused or stopped", () => {
+    for (const state of ["disabled", "paused", "stopped"] as const) {
+      const idle = render(false, { state, last_cycle: null, cycle_running_since: null });
+      expect(idle).toContain("The scanner isn't running just now (see above), so no new ideas arrive until it runs again.");
+      expect(idle).not.toContain("The first cycle hasn't finished yet");
+    }
+    expect(render(false, { state: "stalled", last_cycle: null, cycle_running_since: null })).toContain(
+      "The first cycle hasn't finished yet",
+    );
+  });
+
   it("reads the US session in the reader's time zone, summer and winter", () => {
     expect(usSessionHours(Date.parse("2026-09-28T09:00:00Z"), "Europe/Athens")).toBe("16:30–23:00 EEST");
     expect(usSessionHours(Date.parse("2026-12-01T09:00:00Z"), "Europe/Athens")).toBe("16:30–23:00 EET");
