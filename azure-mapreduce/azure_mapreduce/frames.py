@@ -11,7 +11,9 @@ import json
 import logging
 import math
 from collections.abc import Iterable, Mapping, Sequence
+from datetime import UTC, datetime, tzinfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .errors import ConfigError, LLMRequestError
 
@@ -71,6 +73,11 @@ def _plain(value: Any) -> Any:
         return {str(key): _plain(item) for key, item in value.items()}
     if isinstance(value, list | tuple | set | frozenset):
         return [_plain(item) for item in value]
+    if isinstance(value, bytes | bytearray):
+        return bytes(value).decode("utf-8", "replace")
+    if getattr(getattr(value, "dtype", None), "kind", None) in ("M", "m"):  # numpy dates and durations
+        # as strings: .tolist() would turn nanosecond ones into bare integers
+        return value.astype(str).tolist() if getattr(value, "ndim", 0) else str(value)
     if hasattr(value, "tolist") and getattr(value, "ndim", None) is not None:
         return _plain(value.tolist()) if value.ndim else value.item()
     return value
@@ -142,6 +149,7 @@ class SparkFrame(Frame):
         self._table: Any = None  # the collected DataFrame as a pyarrow Table (PySpark 4+)
         self._rows: list[Any] | None = None  # or as Rows
         self._ids: list[Any] | None = None
+        self._id_array: Any = None  # the ids as collected through Arrow, exact
 
     def check(self, column, output_column, error_column):
         _check_single_column(column, self.df.columns)
@@ -154,30 +162,27 @@ class SparkFrame(Frame):
         _check_single_column(column, columns)
         if self.id_column is None:
             index = columns.index(column)
-            table = self._collect_arrow()
-            if table is not None:
-                self._table = table
-                return table.column(index).to_pylist()
+            self._table = _collect_arrow(self.df)
+            if self._table is not None:
+                return self._arrow_values(self._table.column(index), self.df.schema.fields[index].dataType)
             self._rows = self.df.collect()
             return [row[index] for row in self._rows]
 
         from pyspark.sql import functions as F
 
         _check_single_column(self.id_column, columns)
-        pairs = self.df.select(F.col(_quoted(self.id_column)), F.col(_quoted(column))).collect()
-        ids = [row[0] for row in pairs]
-        if any(value is None or (isinstance(value, float) and math.isnan(value)) for value in ids):
-            raise ConfigError(f'id_column "{self.id_column}" has empty or NaN values; every row needs an id.')
-        try:
-            unique = len(set(ids))
-        except TypeError:
-            raise ConfigError(
-                f'id_column "{self.id_column}" must hold simple values such as numbers or strings.'
-            ) from None
-        if unique != len(ids):
-            raise ConfigError(f'id_column "{self.id_column}" has repeated values; every row needs its own id.')
+        pairs = self.df.select(F.col(_quoted(self.id_column)), F.col(_quoted(column)))
+        table = _collect_arrow(pairs)
+        if table is not None:
+            ids = table.column(0).to_pylist()
+            texts = self._arrow_values(table.column(1), pairs.schema.fields[1].dataType)
+        else:
+            rows = pairs.collect()
+            ids, texts = [row[0] for row in rows], [row[1] for row in rows]
+        self._check_ids(ids)
         self._ids = ids
-        return [row[1] for row in pairs]
+        self._id_array = table.column(0) if table is not None else None
+        return texts
 
     def with_outputs(self, output_column, outputs, *, error_column=None, failures=None):
         """The DataFrame with the output column (and error column) added or replaced, at the end.
@@ -212,11 +217,17 @@ class SparkFrame(Frame):
 
         if self._ids is None:
             raise RuntimeError("values() must be called before with_outputs().")
-        id_type = schema[self.id_column].dataType
-        replies = spark.createDataFrame(
-            [(self._ids[n], *(v[n] for v in new_values)) for n in range(len(self._ids))],
-            StructType([StructField(_JOIN_KEY, id_type, True), *new_fields]),
-        )
+        reply_schema = StructType([StructField(_JOIN_KEY, schema[self.id_column].dataType, True), *new_fields])
+        if self._id_array is not None:  # the exact ids, so timestamps in a repeated DST hour still match
+            import pyarrow as pa
+
+            columns = [self._id_array] + [pa.chunked_array([pa.array(v, type=pa.string())]) for v in new_values]
+            table = pa.Table.from_arrays(columns, names=[_JOIN_KEY, *names])
+            replies = spark.createDataFrame(table, schema=reply_schema)
+        else:
+            replies = spark.createDataFrame(
+                [(self._ids[n], *(v[n] for v in new_values)) for n in range(len(self._ids))], reply_schema
+            )
         base = self.df.drop(*[self.df.columns[i] for i in range(len(self.df.columns)) if i not in keep])
         joined = base.join(replies, base[_quoted(self.id_column)] == replies[_JOIN_KEY], "left")
         return joined.drop(replies[_JOIN_KEY])
@@ -230,19 +241,32 @@ class SparkFrame(Frame):
         if error_column is not None and self._same(error_column, output_column):
             raise ConfigError("The output and error columns need different names.")
 
-    def _collect_arrow(self) -> Any:
-        """The whole DataFrame as a pyarrow Table (PySpark 4+), which keeps timestamps exact; None if unavailable.
-
-        Collecting Rows turns timestamps into local wall-clock times, which can't tell the two occurrences of
-        the hour repeated when daylight saving time ends apart.
-        """
-        if not hasattr(self.df, "toArrow"):
-            return None
+    def _check_ids(self, ids: list[Any]) -> None:
+        if any(value is None or _has_nan(value) for value in ids):
+            raise ConfigError(f'id_column "{self.id_column}" has empty or NaN values; every row needs an id.')
         try:
-            return self.df.toArrow()
-        except Exception as exc:  # a type Arrow can't carry, or pyarrow missing: collect Rows instead
-            log.debug("Collecting through Arrow failed (%s); collecting rows instead.", exc)
-            return None
+            unique = len({_frozen(value) for value in ids})
+        except TypeError:
+            raise ConfigError(
+                f'id_column "{self.id_column}" must hold simple values such as numbers or strings.'
+            ) from None
+        if unique != len(ids):
+            raise ConfigError(f'id_column "{self.id_column}" has repeated values; every row needs its own id.')
+
+    def _arrow_values(self, array: Any, data_type: Any) -> list[Any]:
+        """A column collected through Arrow as Python values, the way collect() would give them.
+
+        Maps come out as dicts, and timestamps as wall-clock times in the session time zone (what df.show()
+        prints) rather than as UTC.
+        """
+        try:
+            values = array.to_pylist(maps_as_pydicts="lossy")
+        except TypeError:  # pyarrow before 13
+            values = array.to_pylist()
+        if _has_type(data_type, "TimestampType"):
+            zone = _session_zone(self.df)
+            values = [_wall_clock(value, zone) for value in values]
+        return values
 
     def _same(self, left: str | None, right: str | None) -> bool:
         if left is None or right is None:
@@ -256,6 +280,93 @@ class SparkFrame(Frame):
             return str(self.df.sparkSession.conf.get("spark.sql.caseSensitive", "false")).lower() == "true"
         except Exception:  # pragma: no cover - a session that can't report its settings
             return False
+
+
+# Types a DataFrame can't make the round trip through Arrow with (or that Arrow hands back as raw encodings),
+# so frames holding them are collected as Rows instead.
+_NOT_THROUGH_ARROW = {
+    "UserDefinedType",
+    "VariantType",
+    "GeometryType",
+    "GeographyType",
+    "YearMonthIntervalType",
+    "CalendarIntervalType",
+    "TimeType",
+    "NullType",
+}
+
+
+def _collect_arrow(df: Any) -> Any:
+    """The DataFrame as a pyarrow Table (PySpark 4+), which keeps timestamps exact; None if it can't be.
+
+    Collecting Rows turns timestamps into local wall-clock times, which can't tell the two occurrences of the
+    hour repeated when daylight saving time ends apart.
+    """
+    if not hasattr(df, "toArrow") or not _arrow_safe(df.schema):
+        return None
+    try:
+        return df.toArrow()
+    except (ImportError, TypeError, ValueError, NotImplementedError) as exc:  # a conversion problem, not the query
+        log.debug("Collecting through Arrow failed (%s); collecting rows instead.", exc)
+        return None
+
+
+def _arrow_safe(data_type: Any) -> bool:
+    return not any(_type_names(data_type) & _NOT_THROUGH_ARROW)
+
+
+def _has_type(data_type: Any, name: str) -> bool:
+    return data_type is not None and name in _type_names(data_type)
+
+
+def _type_names(data_type: Any) -> set[str]:
+    """The class names of a Spark type and every type nested in it (a UDT also counts as UserDefinedType)."""
+    names = {cls.__name__ for cls in type(data_type).__mro__}
+    for field in getattr(data_type, "fields", None) or []:
+        names |= _type_names(field.dataType)
+    for attribute in ("elementType", "keyType", "valueType"):
+        nested = getattr(data_type, attribute, None)
+        if nested is not None:
+            names |= _type_names(nested)
+    return names
+
+
+def _session_zone(df: Any) -> tzinfo:
+    try:
+        return ZoneInfo(str(df.sparkSession.conf.get("spark.sql.session.timeZone")))
+    except Exception:  # an offset such as "+01:00", or no setting
+        return UTC
+
+
+def _wall_clock(value: Any, zone: tzinfo) -> Any:
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.astimezone(zone).replace(tzinfo=None)
+    if isinstance(value, dict):
+        return {key: _wall_clock(item, zone) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return type(value)(_wall_clock(item, zone) for item in value)
+    return value
+
+
+def _has_nan(value: Any) -> bool:
+    if isinstance(value, float):
+        return math.isnan(value)
+    if hasattr(value, "asDict"):
+        value = value.asDict(recursive=True)
+    if isinstance(value, Mapping):
+        return any(_has_nan(item) for item in value.values())
+    if isinstance(value, list | tuple):
+        return any(_has_nan(item) for item in value)
+    return False
+
+
+def _frozen(value: Any) -> Any:
+    """A hashable stand-in for an id (Arrow hands structs back as dicts and arrays as lists)."""
+    if isinstance(value, Mapping):
+        return tuple((key, _frozen(item)) for key, item in value.items())
+    if isinstance(value, list):
+        return tuple(_frozen(item) for item in value)
+    return value
 
 
 def to_frame(data: Any, *, id_column: str | None = None) -> Frame:
@@ -284,7 +395,7 @@ def column_values(data: Any, column: str | None) -> list[Any]:
         return data[column].tolist()
     if column is not None:
         raise ConfigError("column only applies when reducing a DataFrame.")
-    if isinstance(data, str):
+    if isinstance(data, str | bytes | bytearray):
         return [data]
     if type(data).__module__.startswith("pyspark"):
         raise TypeError(f"Pass a Spark DataFrame and a column name, not a {type(data).__name__}.")

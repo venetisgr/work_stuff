@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import math
+import numbers
 import time
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -91,7 +92,7 @@ def make_groups(texts: Sequence[str], size: int, *, balanced: bool = False) -> l
 
     Fixed groups fill up in turn (11 texts, size 10: 10 + 1); balanced groups differ by one at most (6 + 5).
     """
-    if not balanced:
+    if not balanced or not texts:
         return [list(texts[start : start + size]) for start in range(0, len(texts), size)]
     count = math.ceil(len(texts) / size)
     base, extra = divmod(len(texts), count)
@@ -156,7 +157,11 @@ class MapReduce:
         _check_positive("max_concurrent_batch_jobs", max_concurrent_batch_jobs)
         if reduce_batch_size is not None:
             _check_positive("reduce_batch_size", reduce_batch_size)
-        if not isinstance(reduce_group_size, int) or isinstance(reduce_group_size, bool) or reduce_group_size < 2:
+        if (
+            not isinstance(reduce_group_size, numbers.Integral)
+            or isinstance(reduce_group_size, bool)
+            or reduce_group_size < 2
+        ):
             raise ConfigError(
                 f"reduce_group_size must be 2 or more, or the reduce never ends (got {reduce_group_size!r})."
             )
@@ -172,9 +177,9 @@ class MapReduce:
         self.reduce_prompt = reduce_prompt
         self.collapse_prompt = collapse_prompt if collapse_prompt is not None else reduce_prompt
         self.system_prompt = system_prompt
-        self.map_batch_size = map_batch_size
-        self.reduce_group_size = reduce_group_size
-        self.reduce_batch_size = reduce_batch_size or map_batch_size
+        self.map_batch_size = int(map_batch_size)  # plain ints and floats, even if numpy ones were passed
+        self.reduce_group_size = int(reduce_group_size)
+        self.reduce_batch_size = int(reduce_batch_size or map_batch_size)
         self.balance_groups = balance_groups
         self.separator = separator
         self.placeholder = placeholder
@@ -183,11 +188,11 @@ class MapReduce:
         self.show_progress = show_progress
         self._executor_options = {
             "strategies": tuple(strategies) if not isinstance(strategies, str) else strategies,
-            "max_concurrency": max_concurrency,
-            "batch_poll_interval": batch_poll_interval,
-            "batch_timeout": batch_timeout,
-            "batch_cancel_wait": batch_cancel_wait,
-            "max_concurrent_batch_jobs": max_concurrent_batch_jobs,
+            "max_concurrency": int(max_concurrency),
+            "batch_poll_interval": float(batch_poll_interval),
+            "batch_timeout": None if batch_timeout is None else float(batch_timeout),
+            "batch_cancel_wait": float(batch_cancel_wait),
+            "max_concurrent_batch_jobs": int(max_concurrent_batch_jobs),
             "batch_cleanup": batch_cleanup,
             "sleep": sleep,
             "clock": clock,
@@ -216,13 +221,13 @@ class MapReduce:
             frame = to_frame(data, id_column=id_column)
             frame.check(column, output_column, error_column)
             outputs, failures = self._map_frame(frame, column, output_column, error_column, self._new_executor())
-            return frame.with_outputs(output_column, outputs, error_column=error_column, failures=failures)
+            return _with_outputs(frame, output_column, outputs, error_column, failures)
 
     def map_texts(self, texts: Sequence[Any] | str) -> list[str | None]:
         """The map step on a plain list: one output per text (None for empty or failed ones)."""
         if is_pandas_dataframe(texts) or is_spark_dataframe(texts):
             raise TypeError("map_texts takes a list of texts; use map(df, column, output_column) for a DataFrame.")
-        values = [texts] if isinstance(texts, str) else list(texts)
+        values = [texts] if isinstance(texts, str | bytes | bytearray) else list(texts)
         with self._logging():
             outputs, _ = self._map(values, self._new_executor())
             return outputs
@@ -255,10 +260,10 @@ class MapReduce:
             frame = to_frame(data, id_column=id_column)
             frame.check(column, output_column, error_column)
             outputs, failures = self._map_frame(frame, column, output_column, error_column, executor)
-            mapped = frame.with_outputs(output_column, outputs, error_column=error_column, failures=failures)
+            mapped = _with_outputs(frame, output_column, outputs, error_column, failures)
             try:
                 reduced = self._reduce([text for text in outputs if text is not None], executor)
-            except Exception as exc:
+            except BaseException as exc:  # an interrupt too: the paid-for map step goes with it
                 attach(exc, frame=mapped, map_failures=failures)
                 raise
             return MapReduceResult(
@@ -278,7 +283,7 @@ class MapReduce:
         values = frame.values(column)
         try:
             return self._map(values, executor)
-        except Exception as exc:
+        except BaseException as exc:
             outputs = getattr(exc, "outputs", None)
             if outputs is not None:
                 with contextlib.suppress(Exception):
@@ -303,7 +308,7 @@ class MapReduce:
         with StepProgress(len(requests), "Map", unit="record", show=self.show_progress) as progress:
             try:
                 results, failures = executor.run(requests, progress, batch_size=self.map_batch_size)
-            except Exception as exc:
+            except BaseException as exc:  # keep the replies that were paid for, on an interrupt too
                 partial = getattr(exc, "results", None) or {}
                 attach(exc, outputs=[partial.get(index) for index in range(len(values))])
                 raise
@@ -339,7 +344,7 @@ class MapReduce:
                 ) as progress:
                     try:
                         results, failures = executor.run(requests, progress, batch_size=self.reduce_batch_size)
-                    except Exception as exc:
+                    except BaseException as exc:
                         partial = getattr(exc, "results", None) or {}
                         attach(exc, outputs=[partial.get(index) for index in range(len(groups))], levels=levels)
                         raise
@@ -355,7 +360,9 @@ class MapReduce:
                     all_failures[level] = dict(failures)
                 current = [text for text in outputs if text is not None]
                 if not current:
-                    raise MapReduceError(f"Every group failed at reduce level {level}; see the warnings above.")
+                    error = MapReduceError(f"Every group failed at reduce level {level}; see the warnings above.")
+                    attach(error, outputs=outputs, failures=dict(failures), levels=levels)
+                    raise error
                 levels.append(current)
                 bar.update(1)
                 if final:
@@ -424,15 +431,36 @@ def _check_prompt(name: str, prompt: object, placeholder: str) -> None:
         raise ConfigError(f"{name} needs a {placeholder} placeholder where the text goes.")
 
 
+def _with_outputs(
+    frame: Frame,
+    output_column: str,
+    outputs: list[str | None],
+    error_column: str | None,
+    failures: dict[int, LLMRequestError],
+) -> Any:
+    """Add the output column; if that fails, the replies go with the exception rather than being lost."""
+    try:
+        return frame.with_outputs(output_column, outputs, error_column=error_column, failures=failures)
+    except BaseException as exc:
+        attach(exc, outputs=outputs, failures=failures)
+        if isinstance(exc, Exception) and is_spark_dataframe(getattr(frame, "df", None)):
+            log.error(
+                "Couldn't add the replies to the Spark DataFrame (%s). They're kept on the exception as .outputs "
+                "(in row order); passing id_column avoids rebuilding the DataFrame.",
+                exc,
+            )
+        raise
+
+
 def _check_positive(name: str, value: object) -> None:
-    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+    if not isinstance(value, numbers.Integral) or isinstance(value, bool) or value < 1:
         raise ConfigError(f"{name} must be a whole number of at least 1 (got {value!r}).")
 
 
 def _check_seconds(name: str, value: object, *, allow_none: bool = False, allow_zero: bool = False) -> None:
     if value is None and allow_none:
         return
-    valid = isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    valid = isinstance(value, numbers.Real) and not isinstance(value, bool) and math.isfinite(value)
     if not valid or value < 0 or (value == 0 and not allow_zero):
         wanted = "zero or more" if allow_zero else "greater than zero"
         suffix = ", or None to wait as long as it takes" if allow_none else ""

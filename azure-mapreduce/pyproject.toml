@@ -16,8 +16,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-spark = ["pyspark>=3.5"]
-dev = ["pytest>=8", "pyspark>=3.5"]
+spark = ["pyspark>=3.5", "pyarrow>=14"]
+dev = ["pytest>=8", "pyspark>=3.5", "pyarrow>=14"]
 
 [tool.setuptools]
 packages = ["azure_mapreduce"]
