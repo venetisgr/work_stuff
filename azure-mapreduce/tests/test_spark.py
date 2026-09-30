@@ -6,8 +6,11 @@ doesn't care how the replies were made; the end-to-end runs go through the (fake
 
 from __future__ import annotations
 
+import json
+import logging
+import math
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
@@ -17,16 +20,21 @@ pytest.importorskip("pyspark")
 
 from pyspark.sql import Row, SparkSession  # noqa: E402
 from pyspark.sql import functions as F  # noqa: E402
+from pyspark.sql import types as T  # noqa: E402
 from pyspark.sql.types import (  # noqa: E402
     ArrayType,
     BinaryType,
     BooleanType,
+    ByteType,
     DateType,
+    DayTimeIntervalType,
     DecimalType,
     DoubleType,
+    FloatType,
     IntegerType,
     LongType,
     MapType,
+    ShortType,
     StringType,
     StructField,
     StructType,
@@ -34,7 +42,13 @@ from pyspark.sql.types import (  # noqa: E402
 )
 
 from azure_mapreduce import MapReduce, MapReduceResult, ReduceResult  # noqa: E402
-from azure_mapreduce.errors import ConfigError, LLMRequestError, MapReduceError, StepFailedError  # noqa: E402
+from azure_mapreduce.errors import (  # noqa: E402
+    ConfigError,
+    LLMRequestError,
+    LLMSetupError,
+    MapReduceError,
+    StepFailedError,
+)
 from azure_mapreduce.frames import SparkFrame, column_values, is_spark_dataframe, to_frame  # noqa: E402
 from azure_mapreduce.runners import STRATEGIES  # noqa: E402
 
@@ -203,14 +217,10 @@ def test_is_spark_dataframe_recognises_spark_dataframes(spark):
     assert not is_spark_dataframe(pd.DataFrame({"text": ["a"]}))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: is_spark_dataframe says yes to a Spark Column (any attribute of a Column exists), so "
-    "reduce(df.summary) asks for a column name instead of rejecting the Column",
-)
 def test_is_spark_dataframe_rejects_a_spark_column(spark):
     df = simple_df(spark, [(1, "a")])
     assert not is_spark_dataframe(df.text)
+    assert not is_spark_dataframe(F.col("text"))
 
 
 def test_to_frame_wraps_spark_dataframes(spark):
@@ -325,18 +335,20 @@ def new_york_time(monkeypatch):
     time.tzset()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: rebuilding collected rows turns timestamps into naive local datetimes and back, so the two "
-    "instants of a repeated DST hour collapse into one (untouched columns silently change)",
-)
-def test_map_keeps_timestamps_in_the_repeated_daylight_saving_hour(spark, clock, new_york_time):
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_map_keeps_timestamps_in_the_repeated_daylight_saving_hour(spark, clock, new_york_time, id_column):
     """2024-11-03 01:30 happens twice in New York (05:30 and 06:30 UTC); both instants must survive."""
     df = spark.sql(
-        "SELECT timestamp_seconds(s) AS ts, CAST(s AS STRING) AS text FROM VALUES (1730611800L), (1730615400L) AS t(s)"
+        "SELECT s AS id, timestamp_seconds(s) AS ts, CAST(s AS STRING) AS text "
+        "FROM VALUES (1730611800L), (1730615400L) AS t(s)"
     )
-    out = make(FakeClient(), clock).map(df, "text", "summary")
-    assert [row[0] for row in out.select(F.col("ts").cast("long")).collect()] == [1730611800, 1730615400]
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column=id_column)
+    rows = out.select("id", F.col("ts").cast("long"), "summary").collect()
+    assert sorted(tuple(row) for row in rows) == [
+        (1730611800, 1730611800, "<Summarize: 1730611800>"),
+        (1730615400, 1730615400, "<Summarize: 1730615400>"),
+    ]
+    assert out.schema["ts"].dataType == TimestampType()
 
 
 # --- output_column and error_column --------------------------------------------------------------------
@@ -363,16 +375,14 @@ def test_output_column_can_replace_the_text_column(spark, clock, id_column):
     assert by_id(out, "text") == {1: ("<Summarize: a>",), 2: (None,), 3: ("<Summarize: c>",)}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: output column names are compared case-sensitively, so 'Summary' is added next to 'summary' "
-    "and Spark (case-insensitive by default) can no longer resolve either",
-)
-def test_output_column_differing_only_in_case_replaces_the_column(spark, clock):
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_output_column_differing_only_in_case_replaces_the_column(spark, clock, id_column):
     df = spark.createDataFrame([(1, "a", 10), (2, "b", 20)], "id long, text string, summary int")
-    out = make(FakeClient(), clock).map(df, "text", "Summary")
-    assert [name.lower() for name in out.columns].count("summary") == 1
-    assert [row[0] for row in out.select("summary").collect()] == ["<Summarize: a>", "<Summarize: b>"]
+    out = make(FakeClient(), clock).map(df, "text", "Summary", id_column=id_column)
+    assert out.columns == ["id", "text", "Summary"]
+    assert out.schema["Summary"] == StructField("Summary", StringType(), True)
+    assert by_id(out, "Summary") == {1: ("<Summarize: a>",), 2: ("<Summarize: b>",)}
+    assert [row[0] for row in out.orderBy("id").select("summary").collect()] == ["<Summarize: a>", "<Summarize: b>"]
 
 
 @pytest.mark.parametrize("id_column", [None, "id"])
@@ -417,12 +427,24 @@ def test_without_error_column_failed_records_are_just_none(spark, clock):
     assert [row["summary"] for row in out.collect()] == [None, "<Summarize: good>"]
 
 
-def test_on_error_raise_stops_a_spark_map_with_the_outputs(spark, clock):
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_on_error_raise_stops_a_spark_map_with_the_outputs(spark, clock, id_column):
     df = simple_df(spark, [(1, "good"), (2, "bad"), (3, "fine")])
     with pytest.raises(StepFailedError) as caught:
-        make(FakeClient(responder=failing_on("bad")), clock, on_error="raise").map(df, "text", "summary")
+        make(FakeClient(responder=failing_on("bad")), clock, on_error="raise").map(
+            df, "text", "summary", error_column="error", id_column=id_column
+        )
     assert caught.value.outputs == ["<Summarize: good>", None, "<Summarize: fine>"]
     assert list(caught.value.failures) == [1]
+    # ... and the partial DataFrame, so the replies that were paid for can be kept
+    frame = caught.value.frame
+    assert is_spark_dataframe(frame)
+    assert frame.columns == ["id", "text", "summary", "error"]
+    assert by_id(frame, "summary", "error") == {
+        1: ("<Summarize: good>", None),
+        2: (None, "content filtered"),
+        3: ("<Summarize: fine>", None),
+    }
 
 
 # --- map with id_column: collect ids and texts, join the replies back ---------------------------------
@@ -483,14 +505,11 @@ def test_map_with_struct_id_column(spark, clock):
     assert by_id(out, "summary") == {Row(a=1, b="x"): ("<Summarize: one>",), Row(a=1, b="y"): ("<Summarize: two>",)}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: the id_column join (on=id) moves the id column to the front instead of keeping the column order",
-)
 def test_map_with_id_column_keeps_the_column_order(spark, clock):
     df = spark.createDataFrame([("a", 1, 0.5), ("b", 2, 1.5)], "text string, id long, score double")
     out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
     assert out.columns == ["text", "id", "score", "summary"]
+    assert out.schema.fields[:-1] == df.schema.fields
 
 
 def test_repeated_ids_are_rejected_before_any_request(spark, clock):
@@ -510,20 +529,15 @@ def test_repeated_string_ids_are_rejected(spark, clock):
 def test_null_ids_are_rejected_before_any_request(spark, clock):
     df = simple_df(spark, [(1, "a"), (None, "b"), (3, "c")])
     client = FakeClient()
-    with pytest.raises(ConfigError, match='id_column "id" has empty values'):
+    with pytest.raises(ConfigError, match='id_column "id" has empty or NaN values; every row needs an id'):
         make(client, clock).map(df, "text", "summary", id_column="id")
     assert no_calls(client)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: NaN ids pass the Python uniqueness check (nan != nan) but Spark joins NaN to NaN, "
-    "so rows are duplicated and get each other's replies",
-)
 def test_nan_ids_are_rejected(spark, clock):
     df = spark.createDataFrame([(1.0, "a"), (float("nan"), "b"), (float("nan"), "c")], "id double, text string")
     client = FakeClient()
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match='id_column "id" has empty or NaN values'):
         make(client, clock).map(df, "text", "summary", id_column="id")
     assert no_calls(client)
 
@@ -551,11 +565,6 @@ def test_output_and_error_columns_cannot_replace_the_id_column(spark, clock, out
         make(FakeClient(), clock).map(df, "text", output_column, error_column=error_column, id_column="id")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: clashing output/error/id column names are only checked in with_outputs, after every map "
-    "request (possibly a 24h Batch job) has been paid for; the replies are then lost",
-)
 @pytest.mark.parametrize(
     ("output_column", "error_column", "id_column"),
     [("id", None, "id"), ("summary", "id", "id"), ("summary", "summary", None), ("summary", "summary", "id")],
@@ -568,11 +577,6 @@ def test_clashing_column_names_are_rejected_before_any_request(spark, clock, out
     assert no_calls(client)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: with id_column the columns are read with F.col(name), which treats a dot as struct access, so "
-    "a column that exists (and passed the check) can't be resolved",
-)
 def test_map_with_id_column_handles_column_names_with_dots(spark, clock):
     df = spark.createDataFrame([(1, "a"), (2, "b")], "id long, `review.text` string")
     out = make(FakeClient(), clock).map(df, "review.text", "summary", id_column="id")
@@ -654,11 +658,6 @@ def test_reduce_a_spark_dataframe_needs_a_column(spark, clock):
     assert no_calls(client)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: column_values selects the column by a parsed name, so a column with a dot in its name can't be "
-    "reduced although it passes the column check",
-)
 def test_reduce_a_spark_column_with_a_dot_in_its_name(spark, clock):
     df = spark.createDataFrame([(1, "a"), (2, "b")], "id long, `map.output` string")
     assert make(FakeClient(), clock).reduce(df, "map.output").output == "<Combine: a\n\nb>"
@@ -762,15 +761,10 @@ def test_column_names_are_case_sensitive_in_the_check(spark, clock):
         make(FakeClient(), clock).map(df, "Text", "summary")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: map_texts(spark_df) iterates the DataFrame's Columns and sends \"Column<'text'>\" to the model "
-    "instead of rejecting a DataFrame",
-)
 def test_map_texts_rejects_a_spark_dataframe(spark, clock):
     df = simple_df(spark, [(1, "a"), (2, "b")])
     client = FakeClient()
-    with pytest.raises((TypeError, ConfigError)):
+    with pytest.raises(TypeError, match=r"map_texts takes a list of texts; use map\(df, column, output_column\)"):
         make(client, clock).map_texts(df.select("text"))
     assert no_calls(client)
 
@@ -783,3 +777,769 @@ def test_spark_run_shows_map_and_per_level_reduce_progress(spark, clock, capsys)
     assert "Reduce" in err
     for label in ("Level 1/3: 5 → 3", "Level 2/3: 3 → 2", "Level 3/3: 2 → 1"):
         assert label in err
+
+
+# --- column_values and other pyspark objects -----------------------------------------------------------
+
+
+@pytest.mark.parametrize("data", ["a text", ["a", "b"], ("a",)])
+def test_column_values_rejects_a_column_for_anything_but_a_dataframe(data):
+    with pytest.raises(ConfigError, match="column only applies when reducing a DataFrame"):
+        column_values(data, "text")
+
+
+def test_reduce_rejects_spark_objects_that_are_not_dataframes(spark, clock):
+    df = simple_df(spark, [(1, "a"), (2, "b")])
+    client = FakeClient()
+    mr = make(client, clock)
+    with pytest.raises(TypeError, match="Pass a Spark DataFrame and a column name, not a Column"):
+        mr.reduce(df.text)
+    with pytest.raises(TypeError, match="not a GroupedData"):
+        mr.reduce(df.groupBy("id"))
+    with pytest.raises(ConfigError, match="column only applies"):
+        mr.reduce(df.text, "text")
+    assert no_calls(client)
+
+
+def test_reduce_a_list_of_spark_rows_sends_each_row_as_json(spark, clock):
+    rows = simple_df(spark, [(1, "a"), (2, "café")]).collect()
+    result = make(FakeClient(), clock).reduce(rows)
+    assert result.levels[0] == ['{"id": 1, "text": "a"}', '{"id": 2, "text": "café"}']
+
+
+# --- without id_column the DataFrame goes through Arrow and back ---------------------------------------
+
+TimestampNTZType = getattr(T, "TimestampNTZType", None)  # PySpark 3.4+
+
+WIDE_FIELDS = [
+    StructField("n", IntegerType(), False),
+    StructField("big", LongType(), True),
+    StructField("tiny", ByteType(), True),
+    StructField("small", ShortType(), True),
+    StructField("ratio", FloatType(), True),
+    StructField("score", DoubleType(), True),
+    StructField("price", DecimalType(38, 18), True),
+    StructField("day", DateType(), True),
+    StructField("ts", TimestampType(), True),
+    *([StructField("local", TimestampNTZType(), True)] if TimestampNTZType else []),
+    StructField("gap", DayTimeIntervalType(), True),
+    StructField("raw", BinaryType(), True),
+    StructField("flag", BooleanType(), True),
+    StructField("tags", ArrayType(StringType(), True), True),
+    StructField("attrs", MapType(StringType(), ArrayType(LongType(), True), True), True),
+    StructField(
+        "info",
+        StructType(
+            [
+                StructField("when", TimestampType(), True),
+                StructField("counts", MapType(StringType(), IntegerType(), True), True),
+                StructField("items", ArrayType(StructType([StructField("k", StringType(), True)]), True), True),
+            ]
+        ),
+        True,
+    ),
+    StructField("text", StringType(), True),
+]
+WIDE_SCHEMA = StructType(WIDE_FIELDS)
+
+
+def wide_row(n, text, *, empty=False, **values):
+    """One row of WIDE_SCHEMA: the given values, the defaults below for the rest (all None if ``empty``)."""
+    defaults = {
+        "big": 2**62 + n,
+        "tiny": -128,
+        "small": 32767,
+        "ratio": 0.25,
+        "score": -1e-300,
+        "price": Decimal("-12345678901234567890.123456789012345678"),
+        "day": date(1, 1, 1),
+        "ts": datetime(1969, 12, 31, 23, 59, 59, 999999),
+        "local": datetime(2024, 3, 10, 2, 30, 0, 1),  # doesn't exist in New York; fine without a time zone
+        "gap": timedelta(days=-3, seconds=5, microseconds=7),
+        "raw": bytearray(b"\x00\xff\x10"),
+        "flag": False,
+        "tags": ["x", None, "日本"],
+        "attrs": {"a": [1, None, 2**40], "b": []},
+        "info": Row(when=datetime(2000, 2, 29, 12), counts={"z": None}, items=[Row(k="v"), None]),
+    }
+    row = {"n": n, "text": text}
+    for field in WIDE_FIELDS[1:-1]:
+        row[field.name] = None if empty else values.get(field.name, defaults[field.name])
+    return tuple(row[field.name] for field in WIDE_FIELDS)
+
+
+WIDE_ROWS = [  # not in any sorted order
+    wide_row(3, "third"),
+    wide_row(1, None, empty=True),
+    wide_row(4, "fourth", flag=True, tags=[], attrs={}, info=Row(when=None, counts=None, items=[])),
+    wide_row(2, "  ", ts=datetime(2038, 1, 19, 3, 14, 8), day=date(9999, 12, 31), big=-(2**63)),
+]
+
+
+@pytest.fixture
+def wide_df(spark):
+    return spark.createDataFrame(WIDE_ROWS, WIDE_SCHEMA)
+
+
+@pytest.fixture
+def to_arrow_calls(spark, monkeypatch) -> list:
+    """Records every DataFrame.toArrow call (and still collects)."""
+    cls = type(spark.range(1))
+    original = cls.toArrow
+    calls = []
+
+    def spy(self, *args, **kwargs):
+        calls.append(self)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(cls, "toArrow", spy)
+    return calls
+
+
+@pytest.fixture
+def no_arrow(spark, monkeypatch):
+    """DataFrame.toArrow fails (an old pyarrow, a type Arrow can't carry...), so Rows are collected instead."""
+    cls = type(spark.range(1))
+
+    def unavailable(self, *args, **kwargs):
+        raise RuntimeError("Arrow isn't available here")
+
+    monkeypatch.setattr(cls, "toArrow", unavailable)
+
+
+def test_map_rebuilds_through_arrow_keeping_every_type_value_and_the_row_order(wide_df, clock, to_arrow_calls):
+    client = FakeClient()
+    out = make(client, clock).map(wide_df, "text", "summary", error_column="error")
+
+    assert len(to_arrow_calls) == 1  # the whole DataFrame was collected once, through Arrow
+    assert out.schema.fields[:-2] == wide_df.schema.fields  # names, types (nested too) and nullability
+    assert out.schema.fields[-2:] == [STRING, StructField("error", StringType(), True)]
+    rows = out.collect()
+    assert [tuple(row)[:-2] for row in rows] == [tuple(row) for row in wide_df.collect()]
+    assert [row["n"] for row in rows] == [3, 1, 4, 2]
+    assert [row["summary"] for row in rows] == ["<Summarize: third>", None, "<Summarize: fourth>", None]
+    assert [row["error"] for row in rows] == [None] * 4
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: third", "Summarize: fourth"]
+
+
+def test_arrow_rebuild_keeps_extreme_values_exactly(spark, clock, to_arrow_calls):
+    """Microseconds at both ends of the range, NaN, infinities, -0.0 and the widest decimals survive unchanged."""
+    df = spark.sql(
+        "SELECT * FROM VALUES "
+        "(1, timestamp_micros(-1L), double('NaN'), 99999999999999999999.999999999999999999BD, 'a'), "
+        "(2, timestamp_micros(253402300799999999L), double('-Infinity'), 0.000000000000000001BD, 'b'), "
+        "(3, timestamp_micros(0L), -0.0D, CAST(NULL AS DECIMAL(38, 18)), 'c') "
+        "AS t(id, ts, x, d, text)"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary")
+    assert len(to_arrow_calls) == 1
+    got = out.select("id", F.unix_micros("ts"), "x", F.col("d").cast("string"), "summary").collect()
+    assert [(row[0], row[1], row[3], row[4]) for row in got] == [
+        (1, -1, "99999999999999999999.999999999999999999", "<Summarize: a>"),
+        (2, 253402300799999999, "0.000000000000000001", "<Summarize: b>"),
+        (3, 0, None, "<Summarize: c>"),
+    ]
+    assert math.isnan(got[0][2])
+    assert got[1][2] == -math.inf
+    assert got[2][2] == 0.0 and math.copysign(1.0, got[2][2]) == -1.0
+
+
+def test_map_through_arrow_on_an_empty_dataframe_keeps_the_schema(spark, clock, to_arrow_calls):
+    df = spark.createDataFrame([], WIDE_SCHEMA)
+    client = FakeClient()
+    out = make(client, clock, strategies=STRATEGIES).map(df, "text", "summary", error_column="error")
+    assert len(to_arrow_calls) == 1
+    assert out.count() == 0
+    assert out.schema.fields == [*WIDE_FIELDS, STRING, StructField("error", StringType(), True)]
+    assert no_calls(client)
+
+
+def test_map_through_arrow_replaces_existing_columns_of_any_type(wide_df, clock, to_arrow_calls):
+    out = make(FakeClient(), clock).map(wide_df, "text", "info", error_column="ATTRS")
+    kept = [field for field in WIDE_FIELDS if field.name not in ("info", "attrs")]
+    assert out.schema.fields == [*kept, StructField("info", StringType(), True), StructField("ATTRS", StringType())]
+    assert [row["info"] for row in out.collect()] == ["<Summarize: third>", None, "<Summarize: fourth>", None]
+
+
+def test_map_falls_back_to_rows_when_arrow_collection_fails(wide_df, clock, no_arrow, caplog):
+    caplog.set_level(logging.DEBUG, logger="azure_mapreduce.frames")
+    client = FakeClient()
+    out = make(client, clock).map(wide_df, "text", "summary")
+    assert "Collecting through Arrow failed (Arrow isn't available here); collecting rows instead." in caplog.text
+    assert out.schema.fields[:-1] == wide_df.schema.fields
+    assert [tuple(row)[:-1] for row in out.collect()] == [tuple(row) for row in wide_df.collect()]
+    assert [row["summary"] for row in out.collect()] == ["<Summarize: third>", None, "<Summarize: fourth>", None]
+
+
+def test_map_falls_back_to_rows_on_an_empty_dataframe(spark, clock, no_arrow):
+    df = spark.createDataFrame([], "id long, text string")
+    out = make(FakeClient(), clock).map(df, "text", "summary", error_column="error")
+    assert out.count() == 0
+    assert out.columns == ["id", "text", "summary", "error"]
+
+
+def test_map_with_id_column_does_not_collect_the_whole_dataframe_through_arrow(spark, clock, to_arrow_calls):
+    df = simple_df(spark, [(1, "a"), (2, "b")])
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert by_id(out, "summary") == {1: ("<Summarize: a>",), 2: ("<Summarize: b>",)}
+    assert to_arrow_calls == []
+
+
+# --- time zones: timestamps stay exact -----------------------------------------------------------------
+
+
+def test_map_keeps_timestamps_in_the_repeated_daylight_saving_hour_inside_structs(spark, clock, new_york_time):
+    df = spark.sql(
+        "SELECT s AS id, named_struct('at', timestamp_seconds(s)) AS info, array(timestamp_seconds(s)) AS times, "
+        "CAST(s AS STRING) AS text FROM VALUES (1730611800L), (1730615400L) AS t(s)"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary")
+    rows = out.select("id", F.unix_seconds("info.at"), F.unix_seconds(F.col("times")[0])).collect()
+    assert [tuple(row) for row in rows] == [(1730611800,) * 3, (1730615400,) * 3]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: with a timestamp id_column the ids are collected as Rows (naive local datetimes), so the two "
+    "instants of a repeated DST hour look like the same id and are rejected as repeated values",
+)
+def test_timestamp_ids_in_the_repeated_daylight_saving_hour_are_told_apart(spark, clock, new_york_time):
+    df = spark.sql(
+        "SELECT timestamp_seconds(s) AS id, CAST(s AS STRING) AS text FROM VALUES (1730611800L), (1730615400L) AS t(s)"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert sorted(tuple(row) for row in out.select(F.unix_seconds("id"), "summary").collect()) == [
+        (1730611800, "<Summarize: 1730611800>"),
+        (1730615400, "<Summarize: 1730615400>"),
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: a timestamp id in the second occurrence of a repeated DST hour comes back from the Python side "
+    "as the first occurrence, so the join misses it and its (paid-for) reply is silently dropped",
+)
+def test_a_timestamp_id_in_the_second_repeated_daylight_saving_hour_gets_its_reply(spark, clock, new_york_time):
+    df = spark.sql(
+        "SELECT timestamp_seconds(s) AS id, CAST(s AS STRING) AS text FROM VALUES (1730615400L), (1730619000L) AS t(s)"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert sorted(tuple(row) for row in out.select(F.unix_seconds("id"), "summary").collect()) == [
+        (1730615400, "<Summarize: 1730615400>"),  # 01:30 EST, after the clocks went back
+        (1730619000, "<Summarize: 1730619000>"),
+    ]
+
+
+# --- nested cells in the text column are sent as JSON --------------------------------------------------
+
+NESTED_SCHEMA = (
+    "id long, tags array<string>, pair struct<a:int,b:string>, items array<struct<k:string,n:int>>, "
+    "deep struct<inner:struct<xs:array<int>>>"
+)
+NESTED_ROWS = [
+    (1, ["x", "café 日本"], Row(a=1, b="y"), [Row(k="v", n=None)], Row(inner=Row(xs=[1, 2]))),
+    (2, [], Row(a=2, b=None), [], None),
+    (3, None, None, None, Row(inner=None)),
+]
+NESTED_PROMPTS = {
+    "tags": {1: '["x", "café 日本"]'},
+    "pair": {1: '{"a": 1, "b": "y"}', 2: '{"a": 2, "b": null}'},
+    "items": {1: '[{"k": "v", "n": null}]'},
+    "deep": {1: '{"inner": {"xs": [1, 2]}}', 3: '{"inner": null}'},
+}
+
+
+@pytest.fixture(params=["arrow", "rows", "id_column"])
+def collect_path(request):
+    """How the text column is read: through Arrow, as Rows (Arrow unavailable), or with an id_column. Gives the
+    id_column to pass."""
+    if request.param == "rows":
+        request.getfixturevalue("no_arrow")
+    return "id" if request.param == "id_column" else None
+
+
+@pytest.mark.parametrize("column", list(NESTED_PROMPTS))
+def test_arrays_and_structs_in_the_text_column_are_sent_as_json(spark, clock, collect_path, column):
+    df = spark.createDataFrame(NESTED_ROWS, NESTED_SCHEMA)
+    client = FakeClient()
+    out = make(client, clock).map(df, column, "summary", id_column=collect_path)
+    expected = NESTED_PROMPTS[column]
+    assert [content_of(m) for m in client.calls["sync"]] == [f"Summarize: {text}" for text in expected.values()]
+    assert by_id(out, "summary") == {i: (summarized(expected.get(i)),) for i in (1, 2, 3)}
+    assert out.schema[column] == df.schema[column]  # the input column itself is untouched
+
+
+MAP_ARROW_BUG = pytest.mark.xfail(
+    strict=True,
+    reason="BUG: through Arrow a MapType cell comes back from to_pylist() as a list of (key, value) pairs, so it "
+    'is sent as [["k", 1]] instead of the JSON object sent with an id_column (or when Rows are collected)',
+)
+
+
+@pytest.mark.parametrize(
+    "collect_path", [pytest.param("arrow", marks=MAP_ARROW_BUG), "rows", "id_column"], indirect=True
+)
+def test_maps_in_the_text_column_are_sent_as_json_objects(spark, clock, collect_path):
+    df = spark.sql(
+        "SELECT 1L AS id, map('k', 1, 'j', 2) AS m, named_struct('attrs', map('a', array(1))) AS s, "
+        "array(map('x', 'y')) AS am"
+    )
+    client = FakeClient()
+    make(client, clock).map(df, "m", "summary", id_column=collect_path)
+    make(client, clock).map(df, "s", "summary", id_column=collect_path)
+    make(client, clock).map(df, "am", "summary", id_column=collect_path)
+    prompts = [content_of(m).removeprefix("Summarize: ") for m in client.calls["sync"]]
+    assert [json.loads(prompt) for prompt in prompts] == [{"k": 1, "j": 2}, {"attrs": {"a": [1]}}, [{"x": "y"}]]
+
+
+def test_empty_arrays_and_maps_in_the_text_column_are_skipped(spark, clock, collect_path):
+    df = spark.sql("SELECT 1L AS id, array() AS a, map() AS m UNION ALL SELECT 2L, NULL, NULL")
+    client = FakeClient()
+    for column in ("a", "m"):
+        out = make(client, clock).map(df, column, "summary", id_column=collect_path)
+        assert by_id(out, "summary") == {1: (None,), 2: (None,)}
+    assert no_calls(client)
+
+
+VARIANT_ARROW_BUG = pytest.mark.xfail(
+    strict=True,
+    reason="BUG: through Arrow a VARIANT cell comes back as {'value': bytes, 'metadata': bytes}, so the model is "
+    "sent the variant's binary encoding instead of its JSON (sent correctly with an id_column or as Rows)",
+)
+
+
+@pytest.mark.parametrize(
+    "collect_path", [pytest.param("arrow", marks=VARIANT_ARROW_BUG), "rows", "id_column"], indirect=True
+)
+def test_variant_cells_in_the_text_column_are_sent_as_their_json(spark, clock, collect_path):
+    if not hasattr(T, "VariantType"):  # pragma: no cover - PySpark < 4
+        pytest.skip("needs the VARIANT type")
+    df = spark.sql("""SELECT 1L AS id, parse_json('{"a": 1, "b": [true, null]}') AS v""")
+    client = FakeClient()
+    out = make(client, clock).map(df, "v", "summary", id_column=collect_path)
+    assert [content_of(m) for m in client.calls["sync"]] == ['Summarize: {"a":1,"b":[true,null]}']
+    assert isinstance(out.schema["v"].dataType, T.VariantType)
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG (inconsistency): a timestamp cell is sent as '2024-01-02 03:04:05+00:00' through Arrow (session "
+    "time zone, with offset) but as '2024-01-02 03:04:05' with an id_column (driver-local, naive), so the prompt "
+    "depends on whether id_column was given",
+)
+def test_a_timestamp_cell_is_sent_the_same_way_with_or_without_id_column(spark, clock):
+    df = spark.sql(
+        "SELECT 1L AS id, timestamp_seconds(1704164645L) AS ts, "
+        "named_struct('at', timestamp_seconds(1704164645L)) AS info"
+    )
+    prompts = {}
+    for id_column in (None, "id"):
+        client = FakeClient()
+        make(client, clock).map(df, "ts", "summary", id_column=id_column)
+        make(client, clock).map(df, "info", "summary", id_column=id_column)
+        prompts[id_column] = [content_of(m) for m in client.calls["sync"]]
+    assert prompts[None] == prompts["id"]
+
+
+def test_reduce_an_array_column_sends_each_cell_as_json(spark, clock):
+    df = spark.createDataFrame(NESTED_ROWS, NESTED_SCHEMA)
+    result = make(FakeClient(), clock).reduce(df, "tags")
+    assert result.levels[0] == ['["x", "café 日本"]']
+    assert make(FakeClient(), clock).reduce(df, "pair").levels[0] == ['{"a": 1, "b": "y"}', '{"a": 2, "b": null}']
+
+
+# --- the id_column join keeps the column order; names are taken literally ------------------------------
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+@pytest.mark.parametrize(
+    ("schema", "output_column", "error_column", "columns"),
+    [
+        ("text string, id long, score double", "summary", None, ["text", "id", "score", "summary"]),
+        ("score double, summary int, text string, id long", "summary", None, ["score", "text", "id", "summary"]),
+        (
+            "error int, text string, summary int, id long, z int",
+            "summary",
+            "error",
+            ["text", "id", "z", "summary", "error"],
+        ),
+        ("id long, text string", "text", "error", ["id", "text", "error"]),
+    ],
+)
+def test_output_columns_go_at_the_end_and_the_others_keep_their_order(
+    spark, clock, id_column, schema, output_column, error_column, columns
+):
+    names = [part.split()[0] for part in schema.split(", ")]
+    row = {"id": 1, "text": "a", "score": 0.5, "summary": 7, "error": 9, "z": 3}
+    df = spark.createDataFrame([tuple(row[name] for name in names)], schema)
+    out = make(FakeClient(), clock).map(df, "text", output_column, error_column=error_column, id_column=id_column)
+    assert out.columns == columns
+    kept = columns[: -2 if error_column else -1]
+    assert [out.schema[name] for name in kept] == [df.schema[name] for name in kept]  # types unchanged
+    assert out.collect()[0][output_column] == "<Summarize: a>"
+
+
+def test_map_with_dotted_id_and_text_column_names(spark, clock):
+    df = spark.createDataFrame(
+        [(10, "a", 1), (20, None, 2), (30, "bad c", 3)], "`row.id` long, `review.text` string, `x.y` int"
+    )
+    out = make(FakeClient(responder=failing_on("bad")), clock).map(
+        df, "review.text", "the.summary", error_column="the.error", id_column="row.id"
+    )
+    assert out.columns == ["row.id", "review.text", "x.y", "the.summary", "the.error"]
+    assert {row["row.id"]: tuple(row)[1:] for row in out.collect()} == {
+        10: ("a", 1, "<Summarize: a>", None),
+        20: (None, 2, None, None),
+        30: ("bad c", 3, None, "content filtered"),
+    }
+
+
+@pytest.mark.parametrize("id_column", [None, "row`id"])
+def test_map_with_backticks_in_column_names(spark, clock, id_column):
+    df = spark.createDataFrame([(1, "a", 5), (2, "b", 6)], "`row``id` long, `re``view` string, `sum``mary` int")
+    assert df.columns == ["row`id", "re`view", "sum`mary"]
+    out = make(FakeClient(), clock).map(df, "re`view", "sum`mary", error_column="err`or", id_column=id_column)
+    assert out.columns == ["row`id", "re`view", "sum`mary", "err`or"]
+    assert {row["row`id"]: tuple(row)[1:] for row in out.collect()} == {
+        1: ("a", "<Summarize: a>", None),
+        2: ("b", "<Summarize: b>", None),
+    }
+
+
+def test_reduce_a_spark_column_with_backticks_and_dots_in_its_name(spark, clock):
+    df = spark.createDataFrame([(1, "a"), (2, "b")], "id long, `map.out``put` string")
+    assert make(FakeClient(), clock).reduce(df, "map.out`put").output == "<Combine: a\n\nb>"
+
+
+def test_run_with_dotted_names_through_the_batch_api(spark, clock):
+    df = spark.createDataFrame([(i, f"r{i}") for i in range(4)], "`row.id` long, `review.text` string")
+    result = make(FakeClient(), clock, strategies=STRATEGIES).run(df, "review.text", "the.summary", id_column="row.id")
+    assert result.frame.columns == ["row.id", "review.text", "the.summary"]
+    assert sorted(tuple(row) for row in result.frame.collect()) == [
+        (i, f"r{i}", f"<Summarize: r{i}>") for i in range(4)
+    ]
+    assert result.levels[0] == [f"<Summarize: r{i}>" for i in range(4)]
+
+
+def test_a_column_named_like_the_internal_join_key_is_left_alone(spark, clock):
+    df = spark.createDataFrame([(1, "a", 10), (2, "b", 20)], "id long, text string, __azure_mapreduce_id__ int")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert out.columns == ["id", "text", "__azure_mapreduce_id__", "summary"]
+    assert by_id(out, "text", "__azure_mapreduce_id__", "summary") == {
+        1: ("a", 10, "<Summarize: a>"),
+        2: ("b", 20, "<Summarize: b>"),
+    }
+
+
+def test_an_id_column_named_like_the_internal_join_key(spark, clock):
+    df = spark.createDataFrame([(1, "a"), (2, "b")], "__azure_mapreduce_id__ long, text string")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="__azure_mapreduce_id__")
+    assert out.columns == ["__azure_mapreduce_id__", "text", "summary"]
+    assert sorted(tuple(row) for row in out.collect()) == [(1, "a", "<Summarize: a>"), (2, "b", "<Summarize: b>")]
+
+
+def test_the_text_column_can_be_the_id_column(spark, clock):
+    df = spark.createDataFrame([("a", 1), ("b", 2)], "text string, n int")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="text")
+    assert out.columns == ["text", "n", "summary"]
+    assert sorted(tuple(row) for row in out.collect()) == [("a", 1, "<Summarize: a>"), ("b", 2, "<Summarize: b>")]
+
+
+# --- output/error column names and spark.sql.caseSensitive ---------------------------------------------
+
+
+@pytest.fixture
+def case_sensitive_spark(spark):
+    """Turn spark.sql.caseSensitive on for one test, and back to what it was afterwards."""
+    key = "spark.sql.caseSensitive"
+    previous = spark.conf.get(key)
+    spark.conf.set(key, "true")
+    try:
+        yield spark
+    finally:
+        spark.conf.set(key, previous)
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_error_column_differing_only_in_case_replaces_the_column(spark, clock, id_column):
+    df = spark.createDataFrame([(1, "bad", 0.5), (2, "good", 1.5)], "id long, text string, error double")
+    out = make(FakeClient(responder=failing_on("bad")), clock).map(
+        df, "text", "summary", error_column="ERROR", id_column=id_column
+    )
+    assert out.columns == ["id", "text", "summary", "ERROR"]
+    assert out.schema["ERROR"].dataType == StringType()
+    assert by_id(out, "summary", "ERROR") == {1: (None, "content filtered"), 2: ("<Summarize: good>", None)}
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_output_and_error_columns_differing_only_in_case_clash_before_any_request(spark, clock, id_column):
+    df = simple_df(spark, [(1, "a")])
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="The output and error columns need different names"):
+        make(client, clock).map(df, "text", "summary", error_column="Summary", id_column=id_column)
+    assert no_calls(client)
+
+
+@pytest.mark.parametrize(("output_column", "error_column"), [("ID", None), ("summary", "Id")])
+def test_output_columns_differing_only_in_case_from_the_id_column_are_rejected(
+    spark, clock, output_column, error_column
+):
+    df = simple_df(spark, [(1, "a")])
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="can't replace the id_column"):
+        make(client, clock).map(df, "text", output_column, error_column=error_column, id_column="id")
+    assert no_calls(client)
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_with_case_sensitive_spark_a_differently_cased_output_column_is_a_new_column(
+    case_sensitive_spark, clock, id_column
+):
+    df = case_sensitive_spark.createDataFrame([(1, "a", 10), (2, "b", 20)], "id long, text string, summary int")
+    out = make(FakeClient(), clock).map(df, "text", "Summary", error_column="SUMMARY", id_column=id_column)
+    assert out.columns == ["id", "text", "summary", "Summary", "SUMMARY"]
+    assert out.schema["summary"].dataType == IntegerType()
+    assert by_id(out, "summary", "Summary", "SUMMARY") == {
+        1: (10, "<Summarize: a>", None),
+        2: (20, "<Summarize: b>", None),
+    }
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_with_case_sensitive_spark_the_exactly_named_column_is_still_replaced(case_sensitive_spark, clock, id_column):
+    df = case_sensitive_spark.createDataFrame([(1, "a", 10, 11)], "id long, text string, summary int, Summary int")
+    out = make(FakeClient(), clock).map(df, "text", "Summary", id_column=id_column)
+    assert out.columns == ["id", "text", "summary", "Summary"]
+    assert tuple(out.collect()[0]) == (1, "a", 10, "<Summarize: a>")
+
+
+def test_with_case_sensitive_spark_output_and_error_may_differ_only_in_case(case_sensitive_spark, clock):
+    df = case_sensitive_spark.createDataFrame([(1, "a")], "id long, text string")
+    out = make(FakeClient(), clock).map(df, "text", "ID", error_column="Id", id_column="id")
+    assert out.columns == ["id", "text", "ID", "Id"]
+    assert tuple(out.collect()[0]) == (1, "a", "<Summarize: a>", None)
+
+
+def test_case_sensitive_fixture_restored_the_setting(spark):
+    assert spark.conf.get("spark.sql.caseSensitive") == "false"
+
+
+# --- repeated column names -----------------------------------------------------------------------------
+
+
+def two_text_columns(spark):
+    left = spark.createDataFrame([(1, "a")], "id long, text string")
+    right = spark.createDataFrame([(1, "b")], "other long, text string")
+    df = left.join(right, left.id == right.other)
+    assert df.columns == ["id", "text", "other", "text"]
+    return df
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+@pytest.mark.parametrize("step", ["map", "run"])
+def test_a_repeated_text_column_is_rejected_before_any_request(spark, clock, step, id_column):
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='more than one column named "text"; rename or alias them first'):
+        getattr(make(client, clock), step)(two_text_columns(spark), "text", "summary", id_column=id_column)
+    assert no_calls(client)
+
+
+def test_reducing_a_repeated_column_is_rejected(spark, clock):
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='more than one column named "text"'):
+        make(client, clock).reduce(two_text_columns(spark), "text")
+    assert no_calls(client)
+
+
+def test_a_repeated_id_column_is_rejected_before_any_request(spark, clock):
+    df = spark.createDataFrame([(1, "a")], "id long, text string").crossJoin(spark.createDataFrame([(2,)], "id long"))
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='more than one column named "id"'):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_repeated_columns_named_like_the_output_are_all_replaced_and_others_kept(spark, clock, id_column):
+    base = spark.createDataFrame([(1, "a")], "id long, text string")
+    df = base.crossJoin(spark.createDataFrame([(5, 6)], "summary int, x int")).crossJoin(
+        spark.createDataFrame([(7, 8)], "summary int, x int")
+    )
+    assert df.columns == ["id", "text", "summary", "x", "summary", "x"]
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column=id_column)
+    assert out.columns == ["id", "text", "x", "x", "summary"]
+    assert tuple(out.collect()[0]) == (1, "a", 6, 8, "<Summarize: a>")
+
+
+# --- ids that can't be joined on -----------------------------------------------------------------------
+
+
+def test_nan_float_ids_are_rejected_before_any_request(spark, clock):
+    df = spark.createDataFrame([(1.0, "a"), (float("nan"), "b")], "id float, text string")
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='id_column "id" has empty or NaN values; every row needs an id'):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+def test_nan_ids_are_rejected_in_a_dotted_id_column(spark, clock):
+    df = spark.createDataFrame([(float("nan"), "a"), (2.0, "b")], "`row.id` double, text string")
+    with pytest.raises(ConfigError, match='id_column "row.id" has empty or NaN values'):
+        make(FakeClient(), clock).map(df, "text", "summary", id_column="row.id")
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: a NaN inside a struct id passes the Python checks (nan != nan) but Spark's join matches NaN to "
+    "NaN, so the rows are duplicated and get each other's replies",
+)
+def test_struct_ids_holding_nan_are_rejected_before_any_request(spark, clock):
+    df = spark.createDataFrame(
+        [(Row(a=1.0, b=float("nan")), "x"), (Row(a=1.0, b=float("nan")), "y")],
+        "id struct<a:double,b:double>, text string",
+    )
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="NaN"):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+def test_struct_ids_with_null_fields_still_join(spark, clock):
+    df = spark.createDataFrame(
+        [(Row(a=1, b=None), "x"), (Row(a=2, b=None), "y")], "id struct<a:int,b:int>, text string"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert sorted((row["id"]["a"], row["summary"]) for row in out.collect()) == [
+        (1, "<Summarize: x>"),
+        (2, "<Summarize: y>"),
+    ]
+
+
+# --- a step that stops still hands back what was paid for ----------------------------------------------
+
+
+def failing_reduce_on(marker: str, error: Exception | None = None):
+    """Echoes the map prompts; fails every reduce prompt containing ``marker``."""
+
+    def responder(messages):
+        content = content_of(messages)
+        if content.startswith("Combine") and marker in content:
+            raise error or LLMRequestError("reduce group blocked", retryable=False, code="content_filter")
+        return echo(messages)
+
+    return responder
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_a_setup_error_during_a_spark_map_carries_the_partial_frame(spark, clock, id_column):
+    def responder(messages):
+        if "r2" in content_of(messages):
+            raise LLMSetupError("The deployment was deleted.")
+        return echo(messages)
+
+    df = simple_df(spark, [(i, f"r{i}") for i in range(4)])
+    with pytest.raises(LLMSetupError, match="deployment was deleted") as caught:
+        make(FakeClient(responder=responder), clock).run(
+            df, "text", "summary", error_column="error", id_column=id_column
+        )
+    assert caught.value.outputs == ["<Summarize: r0>", "<Summarize: r1>", None, None]
+    frame = caught.value.frame
+    assert is_spark_dataframe(frame)
+    assert frame.columns == ["id", "text", "summary", "error"]
+    assert by_id(frame, "summary", "error") == {
+        0: ("<Summarize: r0>", None),
+        1: ("<Summarize: r1>", None),
+        2: (None, None),
+        3: (None, None),
+    }
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_run_on_spark_attaches_the_mapped_frame_when_a_reduce_group_fails(spark, clock, id_column):
+    df = simple_df(spark, [(1, "r1"), (2, "bad r2"), (3, "r3"), (4, "r4"), (5, "r5")])
+    map_responder, reduce_responder = failing_on("bad"), failing_reduce_on("r1")
+
+    def responder(messages):
+        return (reduce_responder if content_of(messages).startswith("Combine") else map_responder)(messages)
+
+    client = FakeClient(responder=responder)
+    with pytest.raises(StepFailedError, match="1 of 2 groups failed in the reduce level 1") as caught:
+        make(client, clock, reduce_group_size=2).run(df, "text", "summary", error_column="error", id_column=id_column)
+
+    exc = caught.value
+    mapped = ["<Summarize: r1>", "<Summarize: r3>", "<Summarize: r4>", "<Summarize: r5>"]
+    assert exc.levels == [mapped]
+    assert exc.outputs == [None, "<Combine: <Summarize: r4>\n\n<Summarize: r5>>"]
+    assert list(exc.failures) == [0]
+    assert list(exc.map_failures) == [1]
+    assert str(exc.map_failures[1]) == "content filtered"
+    assert is_spark_dataframe(exc.frame)
+    assert exc.frame.columns == ["id", "text", "summary", "error"]
+    assert by_id(exc.frame, "summary", "error") == {
+        1: ("<Summarize: r1>", None),
+        2: (None, "content filtered"),
+        3: ("<Summarize: r3>", None),
+        4: ("<Summarize: r4>", None),
+        5: ("<Summarize: r5>", None),
+    }
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_run_on_spark_attaches_the_mapped_frame_when_the_reduce_hits_a_setup_error(spark, clock, id_column):
+    df = simple_df(spark, [(i, f"r{i}") for i in range(3)])
+    client = FakeClient(responder=failing_reduce_on("r0", LLMSetupError("The reduce deployment is gone.")))
+    with pytest.raises(LLMSetupError, match="reduce deployment is gone") as caught:
+        make(client, clock).run(df, "text", "summary", id_column=id_column)
+    assert caught.value.map_failures == {}
+    assert caught.value.outputs == [None]
+    assert caught.value.levels == [[f"<Summarize: r{i}>" for i in range(3)]]
+    assert by_id(caught.value.frame, "summary") == {i: (f"<Summarize: r{i}>",) for i in range(3)}
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_run_on_spark_with_reduce_on_error_warn_records_the_dropped_group(spark, clock, id_column, caplog):
+    df = simple_df(spark, [(i, f"r{i}") for i in range(5)])
+    client = FakeClient(responder=failing_reduce_on("r0"))
+    result = make(client, clock, reduce_group_size=2, reduce_on_error="warn").run(
+        df, "text", "summary", id_column=id_column
+    )
+    assert not result.complete
+    assert list(result.reduce_failures) == [1]
+    assert list(result.reduce_failures[1]) == [0]
+    assert str(result.reduce_failures[1][0]) == "reduce group blocked"
+    assert result.map_failures == {}
+    assert result.levels[1] == [
+        "<Combine: <Summarize: r2>\n\n<Summarize: r3>>",
+        "<Combine: <Summarize: r4>>",
+    ]
+    assert result.output == result.levels[-1][0]
+    assert "The final text leaves out what those groups held" in caplog.text
+    assert by_id(result.frame, "summary") == {i: (f"<Summarize: r{i}>",) for i in range(5)}
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_run_on_spark_where_every_reduce_group_fails_carries_the_frame(spark, clock, id_column):
+    df = simple_df(spark, [(i, f"r{i}") for i in range(3)])
+    client = FakeClient(responder=failing_reduce_on("Summarize"))
+    with pytest.raises(MapReduceError, match="Every group failed at reduce level 1") as caught:
+        make(client, clock, reduce_on_error="warn").run(df, "text", "summary", id_column=id_column)
+    assert by_id(caught.value.frame, "summary") == {i: (f"<Summarize: r{i}>",) for i in range(3)}
+    assert caught.value.map_failures == {}
+
+
+def test_reduce_a_spark_column_with_reduce_on_error_warn_records_the_failure(spark, clock):
+    df = spark.createDataFrame([(i, f"s{i}") for i in range(4)], "n int, summary string")
+    client = FakeClient(responder=failing_reduce_on("s3"))
+    result = make(client, clock, reduce_group_size=2, reduce_on_error="warn").reduce(df, "summary")
+    assert not result.complete
+    assert list(result.failures) == [1] and list(result.failures[1]) == [1]
+    assert result.levels == [["s0", "s1", "s2", "s3"], ["<Combine: s0\n\ns1>"], [result.output]]
+
+
+def test_reduce_a_spark_column_raises_by_default_when_a_group_fails(spark, clock):
+    df = spark.createDataFrame([(i, f"s{i}") for i in range(4)], "n int, summary string")
+    with pytest.raises(StepFailedError) as caught:
+        make(FakeClient(responder=failing_reduce_on("s3")), clock, reduce_group_size=2).reduce(df, "summary")
+    assert caught.value.outputs == ["<Combine: s0\n\ns1>", None]
+    assert caught.value.levels == [["s0", "s1", "s2", "s3"]]
+    assert not hasattr(caught.value, "frame")  # only run() has a mapped DataFrame to hand back

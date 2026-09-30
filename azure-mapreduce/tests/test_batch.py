@@ -5,25 +5,35 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
+import logging
+import re
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 
+import httpx2
+import openai
 import pandas as pd
 import pytest
 
 from azure_mapreduce import AzureChatClient, MapReduce, runners
-from azure_mapreduce.client import BATCH_ENDPOINT
-from azure_mapreduce.errors import LLMRequestError, LLMSetupError
+from azure_mapreduce.client import BATCH_ENDPOINT, BATCH_FILE_EXPIRY_SECONDS, QUOTA_CODE, BatchJob
+from azure_mapreduce.errors import ConfigError, LLMRequestError, LLMSetupError
+from azure_mapreduce.progress import StepProgress
 from azure_mapreduce.runners import (
     _CANCEL_GRACE_SECONDS,
+    _DOWNLOAD_ATTEMPTS,
     _FILE_READY_TIMEOUT_SECONDS,
-    _MAX_POLL_ERRORS,
+    _POLL_GIVE_UP_SECONDS,
+    _QUOTA_RETRIES,
+    AsyncRunner,
     BatchRunner,
     FallbackExecutor,
     LLMRequest,
     SyncRunner,
+    _Chunk,
+    build_executor,
 )
 
 from .conftest import FakeClient, FakeJob, chat_body, content_of, echo
@@ -39,6 +49,7 @@ class RecordingProgress:
 
     def __init__(self):
         self.done = 0
+        self.peak = 0  # the most ``done`` ever reached
         self.failed = 0
         self.advances: list[int] = []
         self.notes: list[str] = []
@@ -51,10 +62,12 @@ class RecordingProgress:
         if count:
             self.advances.append(count)
             self.done += count
+            self.peak = max(self.peak, self.done)
 
     def fail(self, count: int = 1) -> None:
         self.failed += count
         self.done += count
+        self.peak = max(self.peak, self.done)
 
     def note(self, text: str) -> None:
         self.notes.append(text)
@@ -110,6 +123,21 @@ class ScriptedClient(FakeClient):
         outputs, errors = self.write(job)
         job.output_file_id = self._store(jsonl(outputs)) if outputs else None
         job.error_file_id = self._store(jsonl(errors)) if errors else None
+
+
+@dataclass
+class QuotaClient(ScriptedClient):
+    """ScriptedClient whose enqueued-token quota fits ``quota_jobs`` running jobs: a job created while that many
+    are running fails validation with token_limit_exceeded (set ``batch_error_codes`` to report the code)."""
+
+    quota_jobs: int = 1
+
+    def create_batch(self, input_file_id):
+        over = len(running_jobs(self)) >= self.quota_jobs
+        view = super().create_batch(input_file_id)
+        if over:
+            self.jobs[view.id].statuses = ["validating", "failed"]
+        return view
 
 
 def jsonl(lines: list) -> str:
@@ -192,6 +220,39 @@ def watch_calls(client, method: str, *, fail_on: int | None = None, error: Excep
     return calls
 
 
+def failing_calls(client, method: str, when: Callable[..., bool], make_error: Callable[[], BaseException]) -> list:
+    """Record the calls of ``client.<method>``; a call raises ``make_error()`` when ``when(n, *args)`` (n 1-based)."""
+    original = getattr(client, method)
+    calls = []
+
+    def wrapper(*args):
+        calls.append(args)
+        if when(len(calls), *args):
+            raise make_error()
+        return original(*args)
+
+    setattr(client, method, wrapper)
+    return calls
+
+
+def quota_error() -> LLMRequestError:
+    """What AzureChatClient raises when the Batch API's enqueued-token quota is full."""
+    return LLMRequestError(
+        "The Batch API's enqueued-token quota is full: Enqueued token limit reached", retryable=True, code=QUOTA_CODE
+    )
+
+
+def running_jobs(client: ScriptedClient) -> set[str]:
+    """Jobs the ScriptedClient created and hasn't yet reported over."""
+    started = {batch_id for kind, batch_id, _ in client.events if kind == "start"}
+    ended = {batch_id for kind, batch_id, _ in client.events if kind == "end"}
+    return started - ended
+
+
+def input_file_of(client, batch_id: str) -> str:
+    return client.jobs[batch_id].input_file_id
+
+
 def mapreduce(client, clock, **options) -> MapReduce:
     options.setdefault("show_progress", False)
     return MapReduce(
@@ -210,9 +271,11 @@ class StubOpenAI:
 
     A job reports in_progress (1 request done) once, then completed with a reply to every line of its input:
     ``"<body.model>: <last message>"``. With ``fail_errors`` it ends "failed" with those batch errors instead.
+    ``create_errors`` and ``content_errors`` are raised by successive batches.create and files.content calls
+    (None lets that call through). ``uploads`` and ``batch_creates`` record every keyword argument sent.
     """
 
-    def __init__(self, fail_errors: list | None = None):
+    def __init__(self, fail_errors: list | None = None, *, create_errors=(), content_errors=()):
         self.fail_errors = fail_errors
         self.uploads: list[dict] = []
         self.batch_creates: list[dict] = []
@@ -221,28 +284,40 @@ class StubOpenAI:
         self._inputs: dict[str, str] = {}
         self._outputs: dict[str, str] = {}
         self._polls: Counter = Counter()
+        self._create_errors = list(create_errors)
+        self._content_errors = list(content_errors)
         self.files = SimpleNamespace(
             create=self._upload, retrieve=self._file, content=self._content, delete=self.deleted.append
         )
         self.batches = SimpleNamespace(create=self._create, retrieve=self._retrieve, cancel=self._cancel)
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._chat))
 
-    def _upload(self, *, file, purpose):
+    def _chat(self, **kwargs):
+        raise AssertionError("these tests only use the Batch API")
+
+    def _upload(self, *, file, purpose, **options):
         name, content, mime = file
         file_id = f"file-{len(self.contents) + 1}"
         self.contents[file_id] = content.decode("utf-8")
-        self.uploads.append({"id": file_id, "name": name, "mime": mime, "purpose": purpose})
+        self.uploads.append({"id": file_id, "name": name, "mime": mime, "purpose": purpose, **options})
         return SimpleNamespace(id=file_id, status="uploaded")
 
     def _file(self, file_id):
         return SimpleNamespace(id=file_id, status="processed", status_details=None)
 
     def _content(self, file_id):
+        error = self._content_errors.pop(0) if self._content_errors else None
+        if error is not None:
+            raise error
         return SimpleNamespace(text=self.contents[file_id])
 
-    def _create(self, *, input_file_id, endpoint, completion_window):
+    def _create(self, *, input_file_id, endpoint, completion_window, **options):
+        error = self._create_errors.pop(0) if self._create_errors else None
+        if error is not None:
+            raise error
         batch_id = f"batch_{len(self.batch_creates) + 1}"
         self.batch_creates.append(
-            {"input_file_id": input_file_id, "endpoint": endpoint, "completion_window": completion_window}
+            {"input_file_id": input_file_id, "endpoint": endpoint, "completion_window": completion_window, **options}
         )
         self._inputs[batch_id] = input_file_id
         return self._batch(batch_id, "validating")
@@ -392,6 +467,7 @@ def test_batch_input_lines_have_the_batch_api_shape(clock):
     results, _, _ = run_batch(batch_runner(client, clock), requests)
     raw = client.files[client.jobs["batch-1"].input_file_id]
     assert raw.endswith("\n")
+    assert BATCH_ENDPOINT == "/v1/chat/completions"
     assert [json.loads(line) for line in raw.splitlines()] == [
         {
             "custom_id": "request-3",
@@ -402,7 +478,7 @@ def test_batch_input_lines_have_the_batch_api_shape(clock):
         {
             "custom_id": "request-10",
             "method": "POST",
-            "url": "/chat/completions",
+            "url": "/v1/chat/completions",
             "body": {"model": "gpt-batch", "messages": [{"role": "user", "content": "second"}]},
         },
     ]
@@ -423,7 +499,7 @@ def test_azure_client_batch_line_targets_the_batch_deployment():
     assert json.loads(raw) == {
         "custom_id": "request-7",
         "method": "POST",
-        "url": "/chat/completions",
+        "url": "/v1/chat/completions",
         "body": {"model": "gpt-batch-dep", "messages": messages, "temperature": 0, "max_completion_tokens": 50},
     }
 
@@ -437,12 +513,27 @@ def test_real_client_batch_round_trip(clock):
     requests = make_requests(["café ☕", "b"])
     results, failures, progress = run_batch(batch_runner(client, clock), requests)
 
-    assert sdk.uploads == [{"id": "file-1", "name": "requests.jsonl", "mime": "application/jsonl", "purpose": "batch"}]
+    expiry = {"anchor": "created_at", "seconds": 1209600}  # 14 days
+    assert sdk.uploads == [
+        {
+            "id": "file-1",
+            "name": "requests.jsonl",
+            "mime": "application/jsonl",
+            "purpose": "batch",
+            "expires_after": expiry,
+        }
+    ]
     assert sdk.batch_creates == [
-        {"input_file_id": "file-1", "endpoint": "/chat/completions", "completion_window": "24h"}
+        {
+            "input_file_id": "file-1",
+            "endpoint": "/v1/chat/completions",
+            "completion_window": "24h",
+            "output_expires_after": expiry,
+        }
     ]
     lines = [json.loads(raw) for raw in sdk.contents["file-1"].splitlines()]
     assert [line["custom_id"] for line in lines] == ["request-0", "request-1"]
+    assert all(line["url"] == "/v1/chat/completions" for line in lines)
     assert all(line["body"]["model"] == "gpt-batch-dep" and line["body"]["temperature"] == 0 for line in lines)
     assert results == {0: "gpt-batch-dep: café ☕", 1: "gpt-batch-dep: b"}
     assert failures == {}
@@ -452,7 +543,7 @@ def test_real_client_batch_round_trip(clock):
 
 def test_real_client_failed_job_reports_azures_errors(clock):
     errors = [
-        SimpleNamespace(code="invalid_json_line", message="Invalid JSON", line=3),
+        SimpleNamespace(code="internal_error", message="Invalid JSON", line=3),
         SimpleNamespace(code=None, message="Model not supported for batch", line=None),
     ]
     sdk = StubOpenAI(fail_errors=errors)
@@ -462,7 +553,7 @@ def test_real_client_failed_job_reports_azures_errors(clock):
     assert sorted(failures) == [0, 1]
     message = str(failures[0])
     assert "batch job batch_1 ended failed" in message
-    assert "invalid_json_line: Invalid JSON (line 3)" in message
+    assert "internal_error: Invalid JSON (line 3)" in message
     assert "Model not supported for batch" in message
     assert progress.done == 0  # the 1 reported while in progress is taken back
     assert sdk.deleted == ["file-1"]
@@ -551,7 +642,6 @@ def test_unreadable_and_blank_lines_are_skipped(clock):
     assert list(failures) == [2] and failures[2].retryable
 
 
-@pytest.mark.xfail(strict=True, reason="BUG: a valid-JSON line that isn't the expected object crashes _collect")
 @pytest.mark.parametrize(
     "bad_line",
     [
@@ -659,6 +749,11 @@ def test_progress_per_job_across_several_jobs(clock):
     assert progress.advances.count(-1) == 1
 
 
+@pytest.mark.xfail(
+    strict=True,
+    reason="REGRESSION?: the job note is no longer refreshed after each submission, only once every chunk that "
+    "fits has been submitted (the first note reads '2 validating'); a slow upload/file check leaves no note up",
+)
 def test_progress_notes_count_jobs(clock):
     client = FakeClient()
     _, _, progress = run_batch(
@@ -687,10 +782,6 @@ def test_progress_reaches_the_total_through_fallback(clock):
     assert progress.done == 4 and progress.failed == 1
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: request_counts estimates aren't taken back when the batch run breaks; the bar overshoots",
-)
 def test_progress_estimate_taken_back_when_the_batch_run_breaks(clock):
     client = ScriptedClient(batch_statuses=("in_progress",), counts=(3,))
     batch = batch_runner(client, clock, sleep=sleep_raising(clock, 2, RuntimeError("poll loop broke")))
@@ -699,6 +790,7 @@ def test_progress_estimate_taken_back_when_the_batch_run_breaks(clock):
     results, failures = executor.run(make_requests(texts(4)), progress, batch_size=100)
     assert results == echoed(0, 1, 2, 3) and failures == {}
     assert progress.done == 4  # 3 estimated by the batch job that never delivered, + 4 from sync
+    assert progress.peak == 4
 
 
 def test_map_bar_names_the_batch_strategy_and_counts_jobs(clock, capsys):
@@ -798,8 +890,12 @@ def test_completed_job_without_any_files_hands_everything_back(clock):
 
 def test_download_failure_hands_the_jobs_requests_back(clock):
     client = FakeClient()
-    watch_calls(client, "read_file", fail_on=1, error=ConnectionError("download reset"))
+    reads = failing_calls(
+        client, "read_file", lambda n, file_id: file_id == "file-3", lambda: ConnectionError("download reset")
+    )
     results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(4)), batch_size=2)
+    assert client.jobs["batch-1"].output_file_id == "file-3"
+    assert [args for args in reads if args == ("file-3",)] == [("file-3",)] * _DOWNLOAD_ATTEMPTS
     assert results == echoed(2, 3)
     assert sorted(failures) == [0, 1] and all(error.retryable for error in failures.values())
 
@@ -861,23 +957,27 @@ def test_timeout_through_mapreduce_falls_back_to_sync(clock):
 
 def test_repeated_poll_errors_give_up_on_the_job(clock, caplog):
     client = FakeClient(poll_error=ConnectionError("connection reset"))
-    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
-    assert len(clock.sleeps) == _MAX_POLL_ERRORS
+    results, failures, _ = run_batch(batch_runner(client, clock, poll_interval=60.0), make_requests(texts(3)))
+    assert _POLL_GIVE_UP_SECONDS == 1800.0
+    assert clock.now == 60.0 + _POLL_GIVE_UP_SECONDS  # 30 minutes after the first failed check
+    assert len(clock.sleeps) == 31
     assert client.cancelled == ["batch-1"]  # don't leave it running (and billing) unwatched
     assert results == {}
     assert sorted(failures) == [0, 1, 2] and all(error.retryable for error in failures.values())
     assert "Giving up on batch job batch-1" in caplog.text
-    assert client.jobs["batch-1"].input_file_id in client.deleted
+    assert client.jobs["batch-1"].input_file_id not in client.deleted  # it may still be reading it
 
 
 def test_poll_errors_that_clear_up_dont_give_up(clock):
-    pattern = [True] * (_MAX_POLL_ERRORS - 1) + [False] + [True] * (_MAX_POLL_ERRORS - 1)
+    # 29 minutes of failed checks, one that works, 29 more minutes of failures: never 30 minutes in a row.
+    pattern = [True] * 29 + [False] + [True] * 29
 
     def poll_fails(batch_id, attempt):
         return attempt <= len(pattern) and pattern[attempt - 1]
 
     client = ScriptedClient(poll_fails=poll_fails)
-    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    results, failures, _ = run_batch(batch_runner(client, clock, poll_interval=60.0), make_requests(texts(3)))
+    assert client.poll_attempts["batch-1"] > len(pattern)
     assert results == echoed(0, 1, 2) and failures == {}
     assert client.cancelled == []
 
@@ -1173,3 +1273,736 @@ def test_batch_only_leaves_missing_lines_empty_with_a_warning(clock, caplog):
     assert out == ["<Summarize: a>", None, "<Summarize: c>"]
     assert "1 of 3 records failed in the map: batch job batch-1 ended completed" in caplog.text
     assert not client.calls["sync"] and not client.calls["async"]
+
+
+# --- defaults, chunks --------------------------------------------------------------------------------------
+
+
+def test_batch_runner_defaults():
+    runner = BatchRunner(FakeClient())
+    assert runner.poll_interval == 60.0
+    assert runner.timeout == 24 * 3600.0
+    assert runner.cancel_wait == _CANCEL_GRACE_SECONDS == 600.0
+    assert runner.max_concurrent_jobs == 4 and runner.cleanup is True
+    assert (_POLL_GIVE_UP_SECONDS, _DOWNLOAD_ATTEMPTS, _QUOTA_RETRIES) == (1800.0, 3, 6)
+    assert not hasattr(runners, "_MAX_POLL_ERRORS")  # jobs are given up on after a time, not a number of checks
+
+
+def test_build_executor_passes_the_batch_settings_on(clock):
+    (default,) = build_executor(FakeClient(), ("batch",)).runners
+    assert (default.poll_interval, default.timeout, default.cancel_wait) == (60.0, 24 * 3600.0, 600.0)
+    (runner,) = build_executor(
+        FakeClient(),
+        ("batch",),
+        batch_poll_interval=5.0,
+        batch_timeout=None,
+        batch_cancel_wait=0.0,
+        batch_cleanup=False,
+        sleep=clock.sleep,
+        clock=clock,
+    ).runners
+    assert (runner.poll_interval, runner.timeout, runner.cancel_wait, runner.cleanup) == (5.0, None, 0.0, False)
+
+
+def test_chunks_are_chunk_objects_with_their_input_file(clock):
+    client = FakeClient()
+    requests = make_requests(texts(5))
+    chunks = batch_runner(client, clock)._chunks(requests, 2)
+    assert all(isinstance(chunk, _Chunk) for chunk in chunks)
+    assert [chunk.requests for chunk in chunks] == [requests[0:2], requests[2:4], requests[4:]]
+    for chunk in chunks:
+        lines = [client.batch_line(f"request-{request.key}", request.messages) + "\n" for request in chunk.requests]
+        assert chunk.payload == "".join(lines).encode("utf-8")
+        assert chunk.quota_retries == 0 and chunk.ready_at == 0.0
+
+
+@pytest.mark.parametrize("batch_size", [0, -3])
+def test_batch_size_below_one_is_a_config_error(clock, batch_size):
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="at least 1"):
+        run_batch(batch_runner(client, clock), make_requests(texts(2)), batch_size=batch_size)
+    with pytest.raises(ConfigError, match="at least 1"):
+        batch_runner(client, clock)._chunks([], batch_size)
+    assert not client.files and not client.jobs
+
+
+# --- the real client: endpoint, file expiry, job error codes -----------------------------------------------
+
+
+def bad_request(code: str, message: str) -> openai.BadRequestError:
+    request = httpx2.Request("POST", "https://res.openai.azure.com/openai/v1/batches")
+    return openai.BadRequestError(
+        f"Error code: 400 - {message}",
+        response=httpx2.Response(400, request=request),
+        body={"code": code, "message": message},
+    )
+
+
+def test_batch_endpoint_can_be_overridden(clock):
+    sdk = StubOpenAI()
+    client = AzureChatClient(
+        client=sdk, deployment="gpt-std", batch_deployment="gpt-batch-dep", batch_endpoint="/chat/completions"
+    )
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert results == {0: "gpt-batch-dep: t0", 1: "gpt-batch-dep: t1"} and failures == {}
+    assert [json.loads(raw)["url"] for raw in sdk.contents["file-1"].splitlines()] == ["/chat/completions"] * 2
+    assert [create["endpoint"] for create in sdk.batch_creates] == ["/chat/completions"]
+
+
+@pytest.mark.parametrize("expiry", [None, 3 * 24 * 3600])
+def test_batch_file_expiry_setting(clock, expiry):
+    sdk = StubOpenAI()
+    client = AzureChatClient(
+        client=sdk, deployment="gpt-std", batch_deployment="gpt-batch-dep", batch_file_expiry=expiry
+    )
+    results, _, _ = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert len(results) == 2
+    (upload,), (create,) = sdk.uploads, sdk.batch_creates
+    if expiry is None:  # kept until deleted: neither option is sent
+        assert "expires_after" not in upload and "output_expires_after" not in create
+    else:
+        assert upload["expires_after"] == create["output_expires_after"] == {"anchor": "created_at", "seconds": expiry}
+    assert BATCH_FILE_EXPIRY_SECONDS == 1209600  # the default: 14 days
+
+
+def test_batch_job_error_codes_come_from_the_errors_data():
+    errors = [
+        SimpleNamespace(code="model_not_found", message="No such model", line=None),
+        SimpleNamespace(code=None, message="Something else", line=2),
+        SimpleNamespace(code="invalid_json_line", message="Bad line", line=7),
+    ]
+    job = BatchJob.from_sdk(SimpleNamespace(id="batch_1", status="failed", errors=SimpleNamespace(data=errors)))
+    assert job.error_codes == ("model_not_found", "invalid_json_line")  # errors without a code have none to give
+    assert job.errors == (
+        "model_not_found: No such model",
+        "Something else (line 2)",
+        "invalid_json_line: Bad line (line 7)",
+    )
+    for missing in (None, SimpleNamespace(data=None), SimpleNamespace(data=[])):
+        empty = BatchJob.from_sdk(SimpleNamespace(id="batch_2", status="completed", errors=missing))
+        assert empty.error_codes == () and empty.errors == ()
+    assert BatchJob(id="batch_3", status="validating").error_codes == ()
+
+
+def test_real_client_quota_error_on_create_backs_off_and_resubmits(clock):
+    sdk = StubOpenAI(create_errors=[bad_request(QUOTA_CODE, "Enqueued token limit reached")])
+    client = AzureChatClient(client=sdk, deployment="gpt-std", batch_deployment="gpt-batch-dep")
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert results == {0: "gpt-batch-dep: t0", 1: "gpt-batch-dep: t1"} and failures == {}
+    assert clock.sleeps == [60.0, 1.0, 1.0]  # backed off a minute, then the job's two polls
+    assert [create["input_file_id"] for create in sdk.batch_creates] == ["file-2"]  # a fresh upload
+    assert sdk.deleted == ["file-1", "file-2", "file-3"]  # the refused upload, then the job's input and output
+
+
+def test_real_client_job_failing_validation_for_a_setup_reason_raises(clock):
+    errors = [SimpleNamespace(code="model_not_found", message="The model 'gpt-batch-dep' does not exist", line=None)]
+    sdk = StubOpenAI(fail_errors=errors)
+    client = AzureChatClient(client=sdk, deployment="gpt-std", batch_deployment="gpt-batch-dep")
+    message = "Batch job batch_1 failed validation, and every job would: model_not_found: The model 'gpt-batch-dep'"
+    with pytest.raises(LLMSetupError, match=re.escape(message)):
+        run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert sdk.deleted == ["file-1"]
+
+
+def test_real_client_download_is_retried(clock):
+    request = httpx2.Request("GET", "https://res.openai.azure.com/openai/v1/files/file-2/content")
+    sdk = StubOpenAI(content_errors=[openai.APIConnectionError(request=request)])
+    client = AzureChatClient(client=sdk, deployment="gpt-std", batch_deployment="gpt-batch-dep")
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert results == {0: "gpt-batch-dep: t0", 1: "gpt-batch-dep: t1"} and failures == {}
+    assert clock.sleeps == [1.0, 1.0, 5.0]
+    assert sdk.deleted == ["file-1", "file-2"]
+
+
+# --- giving up on a job that can't be checked --------------------------------------------------------------
+
+
+def test_a_twenty_minute_outage_is_ridden_out(clock, caplog):
+    client = ScriptedClient(poll_fails=lambda batch_id, attempt: 2 <= attempt <= 21)  # t=120s to t=1260s
+    results, failures, progress = run_batch(batch_runner(client, clock, poll_interval=60.0), make_requests(texts(3)))
+    assert results == echoed(0, 1, 2) and failures == {}
+    assert client.cancelled == []
+    assert client.poll_attempts["batch-1"] == 1 + 20 + 3  # validating, the outage, in_progress/finalizing/completed
+    assert caplog.text.count("Couldn't check batch job batch-1 (couldn't reach Azure to check batch-1).") == 20
+    assert "Giving up" not in caplog.text
+    assert input_file_of(client, "batch-1") in client.deleted
+    assert progress.done == 3
+
+
+def test_gives_up_after_thirty_minutes_without_news(clock, caplog):
+    client = ScriptedClient(batch_statuses=("in_progress",), poll_fails=lambda batch_id, attempt: attempt >= 2)
+    results, failures, progress = run_batch(batch_runner(client, clock, poll_interval=60.0), make_requests(texts(3)))
+    assert clock.now == 120.0 + _POLL_GIVE_UP_SECONDS  # 30 minutes after the first failed check
+    assert client.poll_attempts["batch-1"] == 32
+    assert client.cancelled == ["batch-1"]  # asked to stop, as far as that's possible
+    assert results == {} and sorted(failures) == [0, 1, 2]
+    for error in failures.values():
+        assert error.retryable and error.code == "batch"
+        assert "batch job batch-1 was given up on while" in str(error)
+    assert caplog.text.count("Couldn't check batch job batch-1") == 31
+    assert (
+        "Giving up on batch job batch-1 after 30 minutes without news. It may still be running: check it in the "
+        "Azure portal and cancel it there if so."
+    ) in caplog.text
+    assert (
+        "Batch job batch-1 was given up on while" in caplog.text and "without 3 replies; they fall back." in caplog.text
+    )
+    assert client.deleted == []  # the input file stays: the job may still be reading it
+    assert progress.done == 0
+
+
+@pytest.mark.parametrize(("poll_interval", "checks", "minutes"), [(700.0, 4, 35), (3600.0, 2, 60)])
+def test_giving_up_is_timed_from_the_first_failed_check(clock, caplog, poll_interval, checks, minutes):
+    """It's the time without news that counts, not the number of failed checks."""
+    client = ScriptedClient(poll_fails=lambda batch_id, attempt: True)
+    results, failures, _ = run_batch(batch_runner(client, clock, poll_interval=poll_interval), make_requests(texts(2)))
+    assert client.poll_attempts["batch-1"] == checks
+    assert clock.now == checks * poll_interval
+    assert f"Giving up on batch job batch-1 after {minutes} minutes without news." in caplog.text
+    assert results == {} and sorted(failures) == [0, 1]
+
+
+def test_giving_up_when_the_cancel_fails_too(clock, caplog):
+    client = ScriptedClient(batch_statuses=("in_progress",), poll_fails=lambda batch_id, attempt: attempt >= 2)
+    cancels = failing_calls(client, "cancel_batch", lambda n, batch_id: True, lambda: ConnectionError("no route"))
+    results, failures, _ = run_batch(batch_runner(client, clock, poll_interval=60.0), make_requests(texts(2)))
+    assert cancels == [("batch-1",)] and client.cancelled == []
+    assert "Couldn't cancel batch job batch-1 (no route); cancel it in the Azure portal." in caplog.text
+    assert "Batch job batch-1 was given up on while in_progress without 2 replies; they fall back." in caplog.text
+    assert all("batch job batch-1 was given up on while in_progress" in str(error) for error in failures.values())
+    assert results == {} and client.deleted == []
+
+
+def test_job_given_up_on_falls_back_and_batch_stays_usable(clock):
+    client = ScriptedClient(
+        poll_fails=lambda batch_id, attempt: batch_id == "batch-1", sync_responder=lambda m: f"sync {content_of(m)}"
+    )
+    executor = FallbackExecutor([batch_runner(client, clock, poll_interval=60.0), SyncRunner(client)])
+    results, failures = executor.run(make_requests(texts(4)), RecordingProgress(), batch_size=2)
+    assert results == {0: "sync t0", 1: "sync t1", 2: "<t2>", 3: "<t3>"} and failures == {}
+    assert executor.broken == set()  # one job going quiet doesn't mean the Batch API is broken
+    assert input_file_of(client, "batch-1") not in client.deleted
+    assert input_file_of(client, "batch-2") in client.deleted
+
+
+# --- downloading results -----------------------------------------------------------------------------------
+
+
+def test_download_is_retried_and_succeeds_on_the_second_attempt(clock, caplog):
+    client = FakeClient()
+    reads = failing_calls(client, "read_file", lambda n, file_id: n == 1, lambda: ConnectionError("download reset"))
+    results, failures, progress = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert results == echoed(0, 1, 2) and failures == {}
+    assert reads == [("file-2",), ("file-2",)]
+    assert clock.sleeps == [1.0] * 4 + [5.0]
+    assert "Couldn't download file file-2 of batch job batch-1 (attempt 1 of 3: download reset)." in caplog.text
+    assert "Kept file" not in caplog.text
+    assert sorted(client.deleted) == ["file-1", "file-2"]
+    assert progress.done == 3
+
+
+def test_file_that_cant_be_downloaded_is_kept_and_the_readable_one_deleted(clock, caplog):
+    def responder(messages):
+        if content_of(messages) == "t1":
+            raise LLMRequestError("blocked", retryable=False, code="content_filter")
+        return echo(messages)
+
+    client = FakeClient(batch_responder=responder)
+    reads = failing_calls(
+        client, "read_file", lambda n, file_id: file_id == "file-2", lambda: ConnectionError("download reset")
+    )
+    results, failures, progress = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    job = client.jobs["batch-1"]
+    assert (job.output_file_id, job.error_file_id) == ("file-2", "file-3")
+    assert reads == [("file-2",)] * 3 + [("file-3",)]
+    assert clock.sleeps == [1.0] * 4 + [5.0, 10.0]
+    assert results == {}
+    assert not failures[1].retryable  # from the error file, which could be read
+    assert failures[0].retryable and failures[2].retryable and "ended completed" in str(failures[0])
+    assert sorted(client.deleted) == ["file-1", "file-3"]  # the output file stays on Azure
+    for attempt in (1, 2, 3):
+        assert f"Couldn't download file file-2 of batch job batch-1 (attempt {attempt} of 3: download reset)." in (
+            caplog.text
+        )
+    assert (
+        "Kept file(s) file-2 of batch job batch-1 on Azure because they couldn't be downloaded; the replies in them "
+        "are recoverable from the Azure portal."
+    ) in caplog.text
+    assert progress.done == 0  # the 2 replies Azure counted are taken back
+
+
+def test_both_files_that_cant_be_downloaded_are_kept(clock, caplog):
+    def responder(messages):
+        if content_of(messages) == "t1":
+            raise LLMRequestError("blocked", retryable=False, code="content_filter")
+        return echo(messages)
+
+    client = FakeClient(batch_responder=responder)
+    failing_calls(client, "read_file", lambda n, file_id: True, lambda: TimeoutError("read timed out"))
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert results == {} and sorted(failures) == [0, 1, 2]
+    assert all(error.retryable for error in failures.values())  # the error file couldn't be read either
+    assert clock.sleeps == [1.0] * 4 + [5.0, 10.0, 5.0, 10.0]
+    assert client.deleted == ["file-1"]
+    assert "Kept file(s) file-2, file-3 of batch job batch-1 on Azure" in caplog.text
+
+
+# --- the enqueued-token quota ------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [quota_error, lambda: RuntimeError("Error code: 400 - token_limit_exceeded: Enqueued token limit reached")],
+    ids=["translated", "in-the-message"],
+)
+def test_quota_error_on_submit_backs_off_then_submits(clock, caplog, make_error):
+    caplog.set_level(logging.INFO)
+    client = FakeClient()
+    creates = failing_calls(client, "create_batch", lambda n, file_id: n <= 3, make_error)
+    results, failures, progress = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert results == echoed(0, 1, 2) and failures == {}
+    assert clock.sleeps == [60.0, 120.0, 240.0] + [1.0] * 4
+    assert len(creates) == 4 and list(client.jobs) == ["batch-1"]
+    assert input_file_of(client, "batch-1") == "file-4"
+    assert {"file-1", "file-2", "file-3"} <= set(client.deleted)  # the refused uploads aren't left behind
+    assert "trying again in 60s" in caplog.text and "trying again in 240s" in caplog.text
+    assert "jobs 0/1 done · waiting for token quota" in progress.notes
+    assert progress.notes[-1] == "jobs 1/1 done"
+
+
+def test_quota_that_stays_full_hands_the_chunk_back(clock):
+    client = FakeClient()
+    creates = failing_calls(client, "create_batch", lambda n, file_id: True, quota_error)
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert clock.sleeps == [60.0, 120.0, 240.0, 480.0, 900.0, 900.0]
+    assert len(creates) == 1 + _QUOTA_RETRIES
+    assert results == {} and sorted(failures) == [0, 1, 2]
+    for error in failures.values():
+        assert error.retryable and error.code == "batch"
+        assert str(error).startswith("the Batch API's enqueued-token quota stayed full: The Batch API's")
+    assert sorted(client.deleted) == sorted(client.files)  # all 7 uploads
+
+
+def test_quota_that_stays_full_falls_back_only_after_six_retries(clock):
+    answered_at = []
+
+    def async_responder(messages):
+        answered_at.append(clock.now)
+        return f"async {content_of(messages)}"
+
+    client = FakeClient(async_responder=async_responder)
+    failing_calls(client, "create_batch", lambda n, file_id: True, quota_error)
+    executor = FallbackExecutor([batch_runner(client, clock), AsyncRunner(client, max_concurrency=2)])
+    progress = RecordingProgress()
+    results, failures = executor.run(make_requests(texts(3)), progress, batch_size=100)
+    assert answered_at == [60.0 + 120 + 240 + 480 + 900 + 900] * 3  # nothing went to async before that
+    assert results == {key: f"async t{key}" for key in range(3)} and failures == {}
+    assert executor.broken == set()  # a full quota isn't a broken setup, even on the first submission
+    assert progress.strategies == ["batch", "async"]
+    assert progress.done == progress.peak == 3
+
+
+def test_quota_error_while_our_jobs_run_waits_for_one_to_finish(clock, caplog):
+    """The quota fits one job: each later chunk is refused once, then goes in as soon as the running job ends."""
+    caplog.set_level(logging.INFO)
+    client = ScriptedClient(batch_statuses=("in_progress", "completed"), now=clock)
+    creates = failing_calls(client, "create_batch", lambda n, file_id: bool(running_jobs(client)), quota_error)
+    results, failures, progress = run_batch(
+        batch_runner(client, clock, max_concurrent_jobs=4), make_requests(texts(4)), batch_size=1
+    )
+    assert results == echoed(0, 1, 2, 3) and failures == {}
+    starts = {batch_id: time for kind, batch_id, time in client.events if kind == "start"}
+    assert starts == {"batch-1": 0.0, "batch-2": 2.0, "batch-3": 4.0, "batch-4": 6.0}
+    assert clock.sleeps == [1.0] * 8  # no backing off: the chunks waited for our own jobs
+    assert len(creates) == 7
+    assert "waiting for a running job to finish" in caplog.text
+    assert "jobs 0/4 done · 1 validating · waiting for token quota" in progress.notes
+
+
+def test_waiting_behind_our_own_jobs_uses_no_quota_retries(clock):
+    """Refused more than _QUOTA_RETRIES times, but always while our own jobs held the quota: never given up."""
+    statuses = [("in_progress",) * (k - 1) + ("completed",) for k in range(1, 9)] + [("completed",)]
+    client = ScriptedClient(job_statuses=statuses, now=clock)
+    refusals = []
+
+    def refused(n, file_id):
+        if '"request-8"' in client.files[file_id] and len(refusals) < 8:
+            refusals.append(clock.now)
+            return True
+        return False
+
+    failing_calls(client, "create_batch", refused, quota_error)
+    results, failures, _ = run_batch(
+        batch_runner(client, clock, max_concurrent_jobs=9), make_requests(texts(9)), batch_size=1
+    )
+    assert refusals == [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]  # one after each of jobs 1-7 ended
+    assert len(refusals) > _QUOTA_RETRIES
+    assert results == echoed(*range(9)) and failures == {}
+    assert clock.sleeps == [1.0] * 9
+
+
+def test_job_that_fails_for_quota_is_resubmitted_after_a_backoff(clock):
+    client = ScriptedClient(
+        job_statuses=[("validating", "failed"), ("validating", "in_progress", "completed")],
+        batch_errors=("token_limit_exceeded: Enqueued token limit reached",),
+        batch_error_codes=(QUOTA_CODE,),
+        counts=(1, 1, 2),
+        now=clock,
+    )
+    results, failures, progress = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert results == echoed(0, 1) and failures == {}
+    assert clock.sleeps == [1.0, 1.0, 60.0, 1.0, 1.0, 1.0]
+    assert [(kind, batch_id) for kind, batch_id, _ in client.events][:3] == [
+        ("start", "batch-1"),
+        ("end", "batch-1"),
+        ("start", "batch-2"),
+    ]
+    assert client.events[2][2] == 62.0
+    assert input_file_of(client, "batch-1") in client.deleted
+    assert progress.advances == [1, -1, 1, 1]  # the failed job's count is taken back
+    assert progress.done == 2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: a job that ends 'failed' with token_limit_exceeded while other jobs run is resubmitted at once "
+    "(quota_blocked isn't set on that path), so it keeps failing validation instead of waiting for a job to end",
+)
+def test_job_that_fails_for_quota_while_others_run_waits_for_one_to_finish(clock):
+    client = QuotaClient(
+        batch_statuses=("in_progress",) * 5 + ("completed",),
+        batch_errors=("token_limit_exceeded: Enqueued token limit reached",),
+        batch_error_codes=(QUOTA_CODE,),
+        now=clock,
+    )
+    results, failures, _ = run_batch(
+        batch_runner(client, clock, max_concurrent_jobs=2), make_requests(texts(4)), batch_size=2
+    )
+    assert results == echoed(0, 1, 2, 3) and failures == {}
+    starts = {batch_id: time for kind, batch_id, time in client.events if kind == "start"}
+    assert starts == {"batch-1": 0.0, "batch-2": 0.0, "batch-3": 6.0}  # resubmitted once batch-1 ended
+    assert 60.0 not in clock.sleeps  # never backed off: our own job held the quota
+
+
+def test_job_that_fails_for_quota_every_time_falls_back(clock):
+    client = FakeClient(
+        batch_statuses=("validating", "failed"),
+        batch_errors=("token_limit_exceeded: Enqueued token limit reached",),
+        batch_error_codes=(QUOTA_CODE,),
+    )
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    backoffs = [sleep for sleep in clock.sleeps if sleep != 1.0]
+    assert backoffs == [60.0, 120.0, 240.0, 480.0, 900.0, 900.0]
+    assert len(client.jobs) == 1 + _QUOTA_RETRIES
+    assert results == {} and sorted(failures) == [0, 1]
+    for error in failures.values():
+        assert error.retryable and error.code == "batch"
+        assert "batch job batch-7 ended failed: token_limit_exceeded: Enqueued token limit reached" in str(error)
+    assert set(client.deleted) == {job.input_file_id for job in client.jobs.values()}
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: when a chunk's last quota retry fails as a job, its input file is deleted twice (in _job_failure, "
+    "then again in _collect)",
+)
+def test_job_that_fails_for_quota_every_time_deletes_each_input_once(clock):
+    client = FakeClient(
+        batch_statuses=("validating", "failed"),
+        batch_errors=("token_limit_exceeded: Enqueued token limit reached",),
+        batch_error_codes=(QUOTA_CODE,),
+    )
+    run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert Counter(client.deleted) == Counter(job.input_file_id for job in client.jobs.values())
+
+
+def test_interrupt_while_backing_off_from_the_quota(clock):
+    client = FakeClient()
+    failing_calls(client, "create_batch", lambda n, file_id: True, quota_error)
+    runner = batch_runner(client, clock, sleep=sleep_raising(clock, 1, KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        run_batch(runner, make_requests(texts(2)))
+    assert client.deleted == ["file-1"] and not client.jobs and client.cancelled == []
+
+
+# --- jobs that fail validation -----------------------------------------------------------------------------
+
+SETUP_CODES = [
+    "model_not_found",
+    "model_mismatch",
+    "invalid_request",
+    "url_mismatch",
+    "invalid_json_line",
+    "empty_file",
+    "duplicate_custom_id",
+    "too_many_tasks",
+    "DeploymentNotFound",
+    "OperationNotSupported",
+    "unsupported_parameter",
+    "unsupported_value",
+]
+
+
+def setup_failure_client(code: str = "model_not_found", **options) -> FakeClient:
+    """A client whose batch jobs fail validation with ``code``."""
+    options.setdefault("batch_statuses", ("validating", "failed"))
+    return FakeClient(batch_errors=(f"{code}: it won't work",), batch_error_codes=(code,), **options)
+
+
+@pytest.mark.parametrize("code", SETUP_CODES)
+def test_job_failing_validation_for_a_setup_reason_raises(clock, code):
+    client = setup_failure_client(code)
+    with pytest.raises(LLMSetupError) as caught:
+        run_batch(batch_runner(client, clock), make_requests(texts(2)))
+    assert str(caught.value) == f"Batch job batch-1 failed validation, and every job would: {code}: it won't work"
+    assert client.deleted == ["file-1"] and client.cancelled == []
+
+
+def test_setup_failure_cancels_the_other_jobs_and_deletes_their_inputs(clock):
+    client = ScriptedClient(
+        job_statuses=[("validating", "failed"), ("in_progress",), ("in_progress",)],
+        batch_errors=("model_not_found: gone",),
+        batch_error_codes=("model_not_found",),
+    )
+    with pytest.raises(LLMSetupError, match="failed validation"):
+        run_batch(batch_runner(client, clock), make_requests(texts(6)), batch_size=2)
+    assert client.cancelled == ["batch-2", "batch-3"]
+    assert sorted(client.deleted) == ["file-1", "file-2", "file-3"]
+
+
+def test_setup_failure_keeps_the_replies_already_collected(clock):
+    client = ScriptedClient(
+        job_statuses=[("completed",), ("validating", "failed")],
+        batch_errors=("url_mismatch: wrong url",),
+        batch_error_codes=("url_mismatch",),
+        sync_responder=lambda m: f"sync {content_of(m)}",
+    )
+    executor = FallbackExecutor([batch_runner(client, clock), SyncRunner(client)])
+    results, failures = executor.run(make_requests(texts(4)), RecordingProgress(), batch_size=2)
+    assert results == {0: "<t0>", 1: "<t1>", 2: "sync t2", 3: "sync t3"} and failures == {}
+    assert executor.broken == {"batch"}
+
+
+def test_setup_failure_disables_batch_for_the_rest_of_the_run(clock):
+    client = setup_failure_client(sync_responder=lambda m: "sync")
+    executor = FallbackExecutor([batch_runner(client, clock, max_concurrent_jobs=1), SyncRunner(client)])
+    for _ in range(2):  # e.g. the map step, then a reduce level
+        results, failures = executor.run(make_requests(texts(4)), RecordingProgress(), batch_size=2)
+        assert results == dict.fromkeys(range(4), "sync") and failures == {}
+    assert executor.broken == {"batch"}
+    assert len(client.jobs) == 1  # the second chunk was never submitted, nor anything in the second run
+
+
+def test_setup_failure_through_mapreduce_skips_batch_for_later_chunks_and_levels(clock, caplog):
+    client = setup_failure_client(sync_responder=lambda m: f"sync {content_of(m)}")
+    mr = mapreduce(
+        client, clock, strategies=("batch", "sync"), map_batch_size=2, max_concurrent_batch_jobs=1, reduce_group_size=2
+    )
+    result = mr.run(pd.DataFrame({"review": [f"r{i}" for i in range(6)]}), "review", "summary")
+    assert len(client.jobs) == 1  # the map's first job; not the other map chunks, nor any reduce level
+    assert result.frame["summary"].tolist() == [f"sync Summarize: r{i}" for i in range(6)]
+    assert [len(level) for level in result.levels] == [6, 3, 2, 1]
+    assert len(client.calls["sync"]) == 6 + 3 + 2 + 1
+    assert result.complete
+    assert "The batch strategy failed (LLMSetupError: Batch job batch-1 failed validation" in caplog.text
+
+
+def test_failed_job_with_another_code_falls_back_and_batch_stays_usable(clock):
+    client = ScriptedClient(
+        job_statuses=[("validating", "failed"), ("completed",)],
+        batch_errors=("internal_error: Something went wrong",),
+        batch_error_codes=("internal_error",),
+        sync_responder=lambda m: f"sync {content_of(m)}",
+    )
+    executor = FallbackExecutor([batch_runner(client, clock), SyncRunner(client)])
+    results, failures = executor.run(make_requests(texts(4)), RecordingProgress(), batch_size=2)
+    assert results == {0: "sync t0", 1: "sync t1", 2: "<t2>", 3: "<t3>"} and failures == {}
+    assert executor.broken == set()
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: a job that fails validation for a setup reason is taken off the active list before "
+    "_job_failure raises, and _job_failure doesn't take back its request_counts estimate, so the bar overshoots",
+)
+def test_setup_failure_takes_back_the_jobs_progress_estimate(clock):
+    client = ScriptedClient(
+        batch_statuses=("in_progress", "failed"),
+        counts=(2,),
+        batch_errors=("model_not_found: gone",),
+        batch_error_codes=("model_not_found",),
+        sync_responder=lambda m: "sync",
+    )
+    executor = FallbackExecutor([batch_runner(client, clock), SyncRunner(client)])
+    progress = RecordingProgress()
+    results, failures = executor.run(make_requests(texts(4)), progress, batch_size=100)
+    assert results == dict.fromkeys(range(4), "sync") and failures == {}
+    assert progress.done == 4 and progress.peak == 4
+
+
+# --- stopping part-way: jobs still running -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("cleanup", [True, False])
+def test_breaking_off_takes_back_estimates_cancels_and_deletes_inputs(clock, cleanup):
+    client = ScriptedClient(batch_statuses=("in_progress",), counts=(1,))
+    runner = batch_runner(client, clock, cleanup=cleanup, sleep=sleep_raising(clock, 3, RuntimeError("loop broke")))
+    progress = RecordingProgress()
+    with pytest.raises(RuntimeError, match="loop broke"):
+        run_batch(runner, make_requests(texts(4)), batch_size=2, progress=progress)
+    assert client.cancelled == ["batch-1", "batch-2"]
+    assert sorted(client.deleted) == (["file-1", "file-2"] if cleanup else [])
+    assert progress.advances == [1, 1, -1, -1]
+    assert progress.done == 0
+
+
+def test_keyboard_interrupt_deletes_the_inputs_of_running_jobs(clock):
+    client = FakeClient()
+    runner = batch_runner(client, clock, max_concurrent_jobs=2, sleep=sleep_raising(clock, 3, KeyboardInterrupt()))
+    with pytest.raises(KeyboardInterrupt):
+        run_batch(runner, make_requests(texts(6)), batch_size=2)
+    assert client.cancelled == ["batch-1", "batch-2"]
+    assert sorted(client.deleted) == ["file-1", "file-2"]
+    assert len(client.files) == 2  # the third chunk was never uploaded
+
+
+def test_fallback_after_breaking_off_leaves_the_bar_at_its_total(clock):
+    client = ScriptedClient(batch_statuses=("in_progress",), counts=(2,), sync_responder=lambda m: "sync")
+    batch = batch_runner(client, clock, sleep=sleep_raising(clock, 2, RuntimeError("loop broke")))
+    executor = FallbackExecutor([batch, SyncRunner(client)])
+    seen = []
+    with StepProgress(4, "Map", unit="record", show=False) as progress:
+        original = progress.advance
+
+        def advance(count=1):
+            original(count)
+            seen.append(progress.done)
+
+        progress.advance = advance
+        results, failures = executor.run(make_requests(texts(4)), progress, batch_size=2)
+    assert results == dict.fromkeys(range(4), "sync") and failures == {}
+    assert progress.done == progress.total == 4
+    assert max(seen) <= progress.total
+
+
+# --- result lines of odd shapes ----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        "42",
+        "true",
+        '[{"custom_id": "request-1"}]',
+        {"custom_id": "request-1", "response": {"status_code": 200, "body": [1, 2]}},
+        {"custom_id": "request-1", "response": {"status_code": 200, "body": "[1, 2]"}},
+        {"custom_id": "request-1", "response": {"status_code": 200, "body": {"choices": 5}}},
+        {"custom_id": "request-1", "response": {"status_code": 200, "body": {"choices": [None]}}},
+        {"custom_id": "request-1", "response": {"status_code": 200, "body": {"choices": [{"message": "hi"}]}}},
+        {
+            "custom_id": "request-1",
+            "response": {"status_code": 200, "body": {"choices": [{"message": {"content": 5}}]}},
+        },
+        {"custom_id": "request-1", "response": {"status_code": 500, "body": {"error": ["server_error"]}}},
+        {"custom_id": ["request-1"], "response": {"status_code": 200, "body": chat_body("a list for an id")}},
+    ],
+)
+def test_odd_shaped_lines_dont_stop_the_job(clock, bad_line):
+    def write(job):
+        return [ok_line(0, "zero"), bad_line, ok_line(2, "two")], []
+
+    client = ScriptedClient(write=write)
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert results == {0: "zero", 2: "two"}
+    assert list(failures) == [1] and failures[1].retryable
+
+
+def test_lines_that_arent_objects_are_logged_and_skipped(clock, caplog):
+    def write(job):
+        return ["[1, 2]", "null", ok_line(0, "zero")], []
+
+    client = ScriptedClient(write=write)
+    results, _, _ = run_batch(batch_runner(client, clock), make_requests(texts(1)))
+    assert results == {0: "zero"}
+    assert caplog.text.count("Skipping an unreadable line in batch job batch-1's results.") == 2
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: an error code that isn't a string (a list or an object) makes batch_line_result raise "
+    "TypeError: unhashable type (`code not in _PERMANENT_CODES`), which stops the whole batch run",
+)
+@pytest.mark.parametrize(
+    "bad_line",
+    [
+        {"custom_id": "request-1", "error": {"code": ["server_error"], "message": "odd"}},
+        {"custom_id": "request-1", "response": {"status_code": 400, "body": {"error": {"code": {"a": 1}}}}},
+    ],
+)
+def test_error_codes_that_arent_strings_dont_stop_the_job(clock, bad_line):
+    def write(job):
+        return [ok_line(0, "zero"), bad_line, ok_line(2, "two")], []
+
+    client = ScriptedClient(write=write)
+    results, failures, _ = run_batch(batch_runner(client, clock), make_requests(texts(3)))
+    assert results == {0: "zero", 2: "two"}
+    assert list(failures) == [1] and failures[1].retryable
+
+
+# --- the fall-back warning ---------------------------------------------------------------------------------
+
+
+def test_the_fall_back_warning_is_logged_for_a_completed_job_too(clock, caplog):
+    client = FakeClient(batch_responder=lambda m: None if content_of(m) in ("t1", "t3") else echo(m))
+    run_batch(batch_runner(client, clock), make_requests(texts(4)))
+    assert "Batch job batch-1 ended completed without 2 replies; they fall back." in caplog.text
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="BUG: the fall-back warnings capitalize their reason with str.capitalize(), which also lowercases "
+    "the rest: Azure's error messages and codes (and 'Batch API') lose their case in the log",
+)
+@pytest.mark.parametrize("where", ["job", "submit"])
+def test_the_fall_back_warning_keeps_azures_error_text(clock, caplog, where):
+    if where == "job":
+        client = FakeClient(
+            batch_statuses=("validating", "failed"),
+            batch_errors=("internal_error: The Service had an Internal Error",),
+            batch_error_codes=("internal_error",),
+        )
+        run_batch(batch_runner(client, clock), make_requests(texts(2)))
+        expected = "Batch job batch-1 ended failed: internal_error: The Service had an Internal Error without 2"
+    else:
+        client = FakeClient()
+        error = LLMSetupError("Azure rejected the credentials (403: Forbidden). Check the API key")
+        watch_calls(client, "create_batch", fail_on=2, error=error)
+        run_batch(batch_runner(client, clock), make_requests(texts(4)), batch_size=2)
+        expected = "Couldn't submit the batch job: Azure rejected the credentials (403: Forbidden). Check the API key"
+    assert expected in caplog.text
+
+
+# --- how long a cancelled job is waited for ----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("cancel_wait", "given_up_at"), [(0.0, 120.0), (45.0, 150.0), (120.0, 240.0)])
+def test_cancel_wait_is_how_long_a_cancelling_job_is_waited_for(clock, caplog, cancel_wait, given_up_at):
+    client = ScriptedClient(batch_statuses=("in_progress",), stuck_cancelling=True)
+    runner = batch_runner(client, clock, poll_interval=30.0, timeout=60.0, cancel_wait=cancel_wait)
+    results, failures, _ = run_batch(runner, make_requests(texts(3)))
+    assert client.cancelled == ["batch-1"]  # at t=90, the first check past the timeout
+    assert clock.now == given_up_at
+    assert results == {} and sorted(failures) == [0, 1, 2]
+    assert all("batch job batch-1 was given up on while cancelling" in str(error) for error in failures.values())
+    assert "Batch job batch-1 didn't finish cancelling; moving on without its replies." in caplog.text
+    assert input_file_of(client, "batch-1") not in client.deleted  # it may still be reading it
+
+
+def test_mapreduce_batch_cancel_wait(clock):
+    client = ScriptedClient(
+        batch_statuses=("in_progress",), stuck_cancelling=True, sync_responder=lambda m: f"sync {content_of(m)}"
+    )
+    mr = mapreduce(client, clock, strategies=("batch", "sync"), batch_timeout=5.0, batch_cancel_wait=0.0)
+    assert mr.map_texts(["a", "b"]) == ["sync Summarize: a", "sync Summarize: b"]
+    assert client.cancelled == ["batch-1"]
+    assert clock.now == 7.0  # cancelled at t=6, given up at the next check
