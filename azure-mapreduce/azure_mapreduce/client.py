@@ -175,7 +175,7 @@ class AzureChatClient:
                 f"completion_options can't set {sdk_only!r}, which isn't part of the request body (and so can't go "
                 "in a batch file). Put body fields straight into completion_options; unknown ones are passed on."
             )
-        legacy = isinstance(client, openai.AzureOpenAI)
+        legacy = _is_classic_azure_client(client)
         self.batch_endpoint = batch_endpoint or (LEGACY_BATCH_ENDPOINT if legacy else BATCH_ENDPOINT)
         if batch_file_expiry == "auto":
             batch_file_expiry = None if legacy else BATCH_FILE_EXPIRY_SECONDS
@@ -196,11 +196,16 @@ class AzureChatClient:
         self._token_provider: Callable[[], str] | None = None
         self._base_url = foundry_base_url(endpoint) if endpoint else None
         self._async_client_factory = async_client_factory
+        if client is not None and async_client_factory is None:
+            log.warning(
+                "No async_client_factory was given with the client, so the async strategy is skipped; pass one "
+                "that returns a new openai.AsyncOpenAI (or AsyncAzureOpenAI) to use it."
+            )
         self._client = client or openai.OpenAI(
             base_url=self._base_url,
             api_key=api_key or self._sync_token_provider(),
             max_retries=max_retries,  # the SDK backs off on 429s and honours retry-after
-            timeout=timeout,
+            timeout=_timeouts(timeout),
         )
         self._chat_parameters = _parameter_names(self._client.chat.completions.create)
 
@@ -387,7 +392,7 @@ class AzureChatClient:
                 return await asyncio.to_thread(provider)
 
         return openai.AsyncOpenAI(
-            base_url=self._base_url, api_key=api_key, max_retries=self._max_retries, timeout=self._timeout
+            base_url=self._base_url, api_key=api_key, max_retries=self._max_retries, timeout=_timeouts(self._timeout)
         )
 
 
@@ -424,6 +429,8 @@ def translate_error(
 
     Returns None for exceptions it doesn't know, which the caller re-raises as they are.
     """
+    if isinstance(exc, UnicodeError):  # e.g. a lone surrogate the request can't be encoded with
+        return LLMRequestError(f"The text can't be sent as UTF-8: {exc}", retryable=False, code="encoding")
     if not isinstance(exc, openai.OpenAIError):
         return _translate_credential_error(exc)
     code = getattr(exc, "code", None)
@@ -455,6 +462,13 @@ def translate_error(
             "not the model name, and check the endpoint."
         )
     if isinstance(exc, openai.APITimeoutError):  # a subclass of APIConnectionError, so check it first
+        if type(exc.__cause__).__name__ in ("ConnectTimeout", "PoolTimeout"):
+            # No connection at all (a firewall dropping packets, say): the runners count these as unreachable.
+            return LLMRequestError(
+                "Couldn't connect to Azure OpenAI (the connection timed out). Check the endpoint and the network.",
+                retryable=True,
+                code="connection",
+            )
         return LLMRequestError("The request timed out.", retryable=True, code="timeout")
     if isinstance(exc, openai.APIConnectionError):
         # Only a failure on request after request means the endpoint is wrong; the runners count them.
@@ -514,6 +528,22 @@ def _translate_credential_error(exc: BaseException) -> LLMRequestError | LLMSetu
     if isinstance(exc, ClientAuthenticationError | ServiceRequestError | ServiceResponseError):
         return LLMRequestError(f"Couldn't get an Entra ID token: {exc}", retryable=True, code="credential")
     return None
+
+
+def _is_classic_azure_client(client: object) -> bool:
+    """An openai.AzureOpenAI client on the classic, api-version based API (not one pointed at /openai/v1/)."""
+    if not isinstance(client, openai.AzureOpenAI):
+        return False
+    return not str(getattr(client, "base_url", "")).rstrip("/").endswith("/openai/v1")
+
+
+def _timeouts(total: float) -> Any:
+    """The request timeout, with a short connect timeout so an endpoint that drops packets is noticed quickly."""
+    try:
+        import httpx2
+    except ImportError:  # pragma: no cover - the openai SDK's HTTP library
+        return total
+    return httpx2.Timeout(total, connect=min(15.0, total))
 
 
 def _without_retries(client: Any) -> Any:
@@ -592,7 +622,15 @@ def _error_details(error: object) -> tuple[str | None, str]:
             with contextlib.suppress(ValueError):
                 message = json.loads(message)
         if code is None and isinstance(message, Mapping):
-            return _error_details(message.get("error", message))
+            inner = message.get("error")
+            if isinstance(inner, Mapping):
+                return _error_details(inner)
+            if isinstance(inner, str) and inner:
+                return None, inner
+            if message.get("code") is not None:
+                return _error_details(message)
+        if isinstance(message, Mapping | list):
+            message = json.dumps(message, default=str)  # keep Azure's text rather than a Python repr
         return (str(code) if code is not None else None), str(message or "no details")
     return None, str(error)
 

@@ -6,23 +6,37 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from collections import Counter
 from collections.abc import Callable
 from email.parser import BytesParser
 from email.policy import default as email_policy
+from types import SimpleNamespace
 from typing import Any
 
 import httpx2
 import openai
 import pandas as pd
 import pytest
+from azure.core.exceptions import (
+    AzureError,
+    ClientAuthenticationError,
+    HttpResponseError,
+    ResourceNotFoundError,
+    ServiceRequestError,
+    ServiceResponseError,
+)
+from azure.identity import CredentialUnavailableError
 
 from azure_mapreduce import MapReduce
 from azure_mapreduce.client import (
     BATCH_ENDPOINT,
     BATCH_FILE_EXPIRY_SECONDS,
+    BATCH_SETUP_CODES,
     FOUNDRY_SCOPE,
+    LEGACY_BATCH_ENDPOINT,
+    QUOTA_CODE,
     AzureChatClient,
     BatchJob,
     batch_line_result,
@@ -38,6 +52,7 @@ from .conftest import chat_body
 # The real SDK classes, kept before any test swaps them out on the openai module.
 RealOpenAI = openai.OpenAI
 RealAsyncOpenAI = openai.AsyncOpenAI
+RealAzureOpenAI = openai.AzureOpenAI
 
 BASE_URL = "https://res.openai.azure.com/openai/v1/"
 MESSAGES = [{"role": "system", "content": "Be brief."}, {"role": "user", "content": "Hello"}]
@@ -77,6 +92,17 @@ def async_sdk_client(handler: Callable[[httpx2.Request], httpx2.Response]) -> op
     )
 
 
+def legacy_sdk_client(handler: Callable[[httpx2.Request], httpx2.Response], max_retries: int = 0) -> openai.AzureOpenAI:
+    """A classic, api-version based openai.AzureOpenAI client."""
+    return RealAzureOpenAI(
+        azure_endpoint="https://res.openai.azure.com",
+        api_key="secret",
+        api_version="2024-10-21",
+        max_retries=max_retries,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    )
+
+
 def client_on(handler, async_handler=None, **options) -> AzureChatClient:
     """An AzureChatClient whose sync and async SDK clients send every request to ``handler``."""
     options = {"deployment": "gpt-test", "batch_deployment": "gpt-batch", **options}
@@ -110,6 +136,41 @@ async def ask_async(client: AzureChatClient, messages=MESSAGES) -> str:
         return await complete(messages)
 
 
+# DefaultAzureCredential's error when no credential in its chain works (azure-identity 1.25, out of the box).
+NO_CREDENTIAL_WORKED = (
+    "DefaultAzureCredential failed to retrieve a token from the included credentials.\n"
+    "Attempted credentials:\n"
+    "\tEnvironmentCredential: EnvironmentCredential authentication unavailable. Environment variables are not "
+    "fully configured.\n"
+    "Visit https://aka.ms/azsdk/python/identity/environmentcredential/troubleshoot to troubleshoot this issue.\n"
+    "\tManagedIdentityCredential: ManagedIdentityCredential authentication unavailable, no response from the IMDS "
+    "endpoint.\n"
+    "\tAzureCliCredential: Azure CLI not found on path\n"
+    "To mitigate this issue, please refer to the troubleshooting guidelines here at "
+    "https://aka.ms/azsdk/python/identity/defaultazurecredential/troubleshoot."
+)
+
+
+def no_credential_worked() -> Exception:
+    return ClientAuthenticationError(message=NO_CREDENTIAL_WORKED)
+
+
+def credential_unavailable() -> Exception:
+    return CredentialUnavailableError("EnvironmentCredential authentication unavailable. No credential found.")
+
+
+def client_authentication_failed() -> Exception:
+    return ClientAuthenticationError("ManagedIdentityCredential: the token request timed out")
+
+
+def service_request_error() -> Exception:
+    return ServiceRequestError("Couldn't reach the managed identity endpoint: connection refused")
+
+
+def service_response_error() -> Exception:
+    return ServiceResponseError("The managed identity endpoint closed the connection")
+
+
 class FakeAzure:
     """A fake Azure OpenAI v1 service (chat completions, files and batch jobs) behind httpx2.MockTransport.
 
@@ -123,12 +184,19 @@ class FakeAzure:
     - ``fail["<METHOD> <route>"] = (status, code)`` fails those requests; ids in the route read ``{id}`` (e.g.
       ``"POST /batches"``, ``"GET /files/{id}"``). Prefix with ``"sync "`` or ``"async "`` to fail only that
       client's requests, or use ``"*"`` to fail everything. ``fail_times[key] = n`` limits the ``fail`` entry
-      ``key`` to the first n requests it matches (the route works after that).
+      ``key`` to the first n requests it matches (the route works after that). Failures carry
+      ``retry-after-ms: 1``, so an SDK client that does retry them doesn't slow the tests down.
+    - ``lose[key] = n`` handles the first n requests matching ``key`` (as in ``fail``) but loses the response:
+      the transport raises httpx2.ReadTimeout, or with ``lose_as`` set, answers with that status. E.g. a job
+      Azure created although the client never heard back.
     - ``disconnect`` holds routes (keys as in ``fail``) whose connection drops: the transport raises
       httpx2.ConnectError, as when Azure can't be reached. ``drop_prompts[prompt] = n`` drops the connection of
       the first n chat requests for that prompt.
+    - ``GET /batches?limit=n`` lists the newest n jobs first.
     - As on Azure, the Batch API only takes ``batch_url`` (the v1 API's ``/v1/chat/completions``): a job whose
       endpoint or input lines name another URL fails validation with ``url_mismatch``, one error per line.
+    - The classic API's paths (``/openai/files?api-version=...``, from an openai.AzureOpenAI client) are served
+      too, under the same routes.
     """
 
     def __init__(
@@ -145,7 +213,11 @@ class FakeAzure:
         disconnect: set[str] | frozenset[str] = frozenset(),
         drop_prompts: dict[str, int] | None = None,
         batch_url: str = "/v1/chat/completions",
+        lose: dict[str, int] | None = None,
+        lose_as: int | None = None,
     ):
+        self.lose = dict(lose or {})
+        self.lose_as = lose_as
         self.reply = reply
         self.file_statuses = file_statuses
         self.status_details = status_details
@@ -185,6 +257,16 @@ class FakeAzure:
         options = {"deployment": "gpt-test", "batch_deployment": "gpt-batch", **options}
         return AzureChatClient(client=self.sdk_client(), async_client_factory=self.async_sdk_client, **options)
 
+    def legacy_sdk_client(self) -> openai.AzureOpenAI:
+        """A classic openai.AzureOpenAI client (api-version paths, api-key header) on this service."""
+        return RealAzureOpenAI(
+            azure_endpoint="https://res.openai.azure.com",
+            api_key="secret",
+            api_version="2024-10-21",
+            max_retries=0,
+            http_client=httpx2.Client(transport=self.transport("sync")),
+        )
+
     # --- inspection --------------------------------------------------------------------------------------
 
     def sent(self, method: str, route: str) -> list[httpx2.Request]:
@@ -215,6 +297,17 @@ class FakeAzure:
     # --- the service -------------------------------------------------------------------------------------
 
     def handle(self, tag: str, request: httpx2.Request) -> httpx2.Response:
+        response = self._handle(tag, request)
+        key = f"{request.method} {_route(request)}"
+        losing = next((name for name in (f"{tag} {key}", key, "*") if self.lose.get(name, 0) > 0), None)
+        if losing is not None:  # handled, but the answer never reaches the client
+            self.lose[losing] -= 1
+            if self.lose_as is None:
+                raise httpx2.ReadTimeout("The read operation timed out", request=request)
+            return httpx2.Response(self.lose_as, json=error_json("server_error"), headers={"retry-after-ms": "1"})
+        return response
+
+    def _handle(self, tag: str, request: httpx2.Request) -> httpx2.Response:
         self.requests.append((tag, request))
         route = _route(request)
         key = f"{request.method} {route}"
@@ -231,7 +324,7 @@ class FakeAzure:
             if failing in self.fail_times:
                 self.fail_times[failing] -= 1
             status, code = self.fail[failing]
-            return httpx2.Response(status, json=error_json(code))
+            return httpx2.Response(status, json=error_json(code), headers={"retry-after-ms": "1"})
         found = re.search(r"/((?:file|batch)-\d+)", request.url.path)
         item = found.group(1) if found else None
 
@@ -285,6 +378,20 @@ class FakeAzure:
             self.batches[batch_id].update(cancelled=False, output_file_id=None, error_file_id=None, answered=0)
             self.batches[batch_id]["rejection"] = rejection
             return httpx2.Response(200, json=self._batch_json(batch_id))
+        if key == "GET /batches":
+            limit = int(request.url.params.get("limit", 20))
+            newest_first = [self._batch_json(batch_id) for batch_id in reversed(self.batches)]
+            page = newest_first[:limit]
+            return httpx2.Response(
+                200,
+                json={
+                    "object": "list",
+                    "data": page,
+                    "first_id": page[0]["id"] if page else None,
+                    "last_id": page[-1]["id"] if page else None,
+                    "has_more": len(newest_first) > limit,
+                },
+            )
         if key == "GET /batches/{id}":
             batch = self.batches[item]
             statuses = self.batch_statuses
@@ -367,7 +474,7 @@ class FakeAzure:
 
 
 def _route(request: httpx2.Request) -> str:
-    path = request.url.path.removeprefix("/openai/v1")
+    path = request.url.path.removeprefix("/openai/v1").removeprefix("/openai")  # the v1 or the classic API
     return re.sub(r"/(?:file|batch)-\d+", "/{id}", path)
 
 
@@ -627,7 +734,13 @@ def test_sdk_clients_get_the_base_url_key_retries_and_timeout(fake_endpoint):
     (kind, sync_kwargs), (async_kind, async_kwargs) = fake_endpoint.built
     assert (kind, async_kind) == ("sync", "async")
     for kwargs in (sync_kwargs, async_kwargs):
-        assert kwargs == {"base_url": BASE_URL, "api_key": "secret", "max_retries": 3, "timeout": 42.0}
+        # A short connect timeout notices an endpoint that drops packets; the rest of the request gets 42 s.
+        assert kwargs == {
+            "base_url": BASE_URL,
+            "api_key": "secret",
+            "max_retries": 3,
+            "timeout": httpx2.Timeout(42.0, connect=15.0),
+        }
 
 
 def test_sdk_clients_retry_six_times_by_default(fake_endpoint):
@@ -710,14 +823,43 @@ def test_batch_line_is_one_json_request_for_the_batch_deployment():
     messages = [{"role": "user", "content": "Café — naïve\nline two"}]
     raw = client.batch_line("request-7", messages)
     assert "\n" not in raw
-    assert "Café — naïve" in raw  # kept as is, not \u-escaped
-    assert json.loads(raw) == {
+    assert raw.isascii()  # non-ASCII text is \u-escaped ...
+    assert r"Caf\u00e9 \u2014 na\u00efve\nline two" in raw
+    assert json.loads(raw) == {  # ... and reads back as the same text
         "custom_id": "request-7",
         "method": "POST",
         "url": BATCH_ENDPOINT,
         "body": {"model": "gpt-batch", "messages": messages, "temperature": 0},
     }
     assert BATCH_ENDPOINT == "/v1/chat/completions"  # the v1 API's path, as Azure's v1 Batch API expects
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("a\u2028b\u2029c", id="line and paragraph separators"),
+        pytest.param("a\x85b\x0bc\x0cd\x1ce\r\nf", id="other characters str.splitlines splits on"),
+        pytest.param("lone \ud800 surrogate", id="lone surrogate"),
+        pytest.param("emoji 🎉 and 中文", id="astral and CJK"),
+    ],
+)
+def test_batch_line_is_ascii_so_no_character_can_split_or_break_the_jsonl_file(text):
+    client = client_on(responding(200))
+    raw = client.batch_line("request-0", [{"role": "user", "content": text}])
+    assert raw.isascii()
+    assert raw.splitlines() == [raw]  # even str.splitlines, which splits on \u2028 and the like, sees one line
+    assert (raw + "\n").encode("utf-8").count(b"\n") == 1
+    assert json.loads(raw)["body"]["messages"][0]["content"] == text
+
+
+def test_batch_line_byte_size_is_the_size_of_the_escaped_text():
+    client = client_on(responding(200))
+    short = client.batch_line("request-0", [{"role": "user", "content": "e" * 100}])
+    accented = client.batch_line("request-0", [{"role": "user", "content": "é" * 100}])
+    assert len(accented.encode("utf-8")) == len(accented)  # one byte per character: it's all ASCII
+    assert len(accented) - len(short) == 100 * (len(r"\u00e9") - 1)  # 6 bytes for each é, not 2 as in UTF-8
+    astral = client.batch_line("request-0", [{"role": "user", "content": "🎉"}])
+    assert r"\ud83c\udf89" in astral  # a surrogate pair: 12 bytes, not 4
 
 
 def test_complete_sends_the_completion_options():
@@ -803,26 +945,43 @@ def test_completion_options_go_by_name_to_a_create_that_takes_any_keyword():
     assert received == [{"model": "gpt-test", "messages": MESSAGES, **options}]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: _split_arguments overwrites an extra_body given in completion_options with the settings the SDK "
-    "doesn't name, so the extra_body contents are silently dropped from sync/async requests",
-)
 def test_completion_options_extra_body_is_not_silently_dropped():
-    """An SDK user may put Azure-only fields in completion_options["extra_body"]; none of them may vanish."""
+    """An SDK user may put Azure-only fields in completion_options["extra_body"]; none of them may vanish.
+
+    They're refused up front (they couldn't go in a batch body either), before any request is sent."""
     seen: list[httpx2.Request] = []
     options = {
         "extra_body": {"data_sources": [{"type": "azure_search"}]},
         "user_security_context": {"application_name": "reviews"},
     }
-    try:
-        client = client_on(responding(200, seen=seen), completion_options=options)
-    except ConfigError:
-        return  # refusing SDK-only arguments up front (they can't go in a batch body either) is fine too
+    with pytest.raises(ConfigError, match="extra_body"):
+        client_on(responding(200, seen=seen), completion_options=options)
+    assert seen == []
+    # The same fields straight in completion_options reach the body.
+    client = client_on(responding(200, seen=seen), completion_options={"data_sources": [{"type": "azure_search"}]})
     client.complete(MESSAGES)
-    body = json.loads(seen[0].content)
-    assert body["user_security_context"] == {"application_name": "reviews"}
-    assert body["data_sources"] == [{"type": "azure_search"}]
+    assert json.loads(seen[0].content)["data_sources"] == [{"type": "azure_search"}]
+
+
+@pytest.mark.parametrize("option", ["extra_body", "extra_headers", "extra_query", "timeout"])
+def test_completion_options_cant_set_what_only_shapes_the_sdk_call(option):
+    """These go to the SDK, not into the request body, so a batch input line couldn't carry them."""
+    with pytest.raises(ConfigError, match=rf"can't set '{option}'.*request body") as caught:
+        client_on(responding(200), completion_options={"temperature": 0, option: {"x": 1}})
+    assert "batch file" in str(caught.value)
+    with pytest.raises(ConfigError, match=option):  # the same for a client built from an endpoint
+        AzureChatClient("my-resource", deployment="gpt-test", api_key="k", completion_options={option: 1})
+
+
+def test_completion_options_with_several_sdk_only_options_name_one():
+    with pytest.raises(ConfigError, match="'extra_body'"):
+        client_on(responding(200), completion_options={"timeout": 5, "extra_body": {}, "extra_query": {}})
+
+
+def test_completion_options_that_only_look_like_sdk_options_are_body_fields():
+    options = {"extra": 1, "timeout_ms": 5, "extra_bodies": [], "Timeout": 2}
+    client = client_on(responding(200), completion_options=options)
+    assert client.request_body(MESSAGES) == {"model": "gpt-test", "messages": MESSAGES, **options}
 
 
 # --- complete() ------------------------------------------------------------------------------------------
@@ -1007,21 +1166,66 @@ def test_translate_error_leaves_unknown_exceptions_to_the_caller():
 
 
 def test_translate_error_sign_in_exceptions():
-    from azure.core.exceptions import ClientAuthenticationError
-    from azure.identity import CredentialUnavailableError
+    # DefaultAzureCredential found no credential that works: a setup problem.
+    none_worked = translate_error(no_credential_worked(), "gpt-test")
+    assert isinstance(none_worked, LLMSetupError)
+    assert str(none_worked).startswith("No Entra ID credential worked (DefaultAzureCredential failed to retrieve")
+    assert "Environment variables are not fully configured" in str(none_worked)
+    assert "az login" in str(none_worked) and "API key" in str(none_worked)
+    assert "AZURE_TENANT_ID" in str(none_worked)
 
-    unavailable = translate_error(CredentialUnavailableError("no credential in this environment"), "gpt-test")
-    assert isinstance(unavailable, LLMSetupError)
-    assert "no credential in this environment" in str(unavailable)
-    assert "az login" in str(unavailable) and "API key" in str(unavailable)
+    # Once a credential has worked, DefaultAzureCredential calls it directly; its failures can be passing ones.
+    unavailable = translate_error(CredentialUnavailableError("the managed identity endpoint didn't answer"), "x")
+    assert isinstance(unavailable, LLMRequestError)
+    assert (unavailable.retryable, unavailable.code) == (True, "credential")
+    assert str(unavailable) == "Couldn't get an Entra ID token: the managed identity endpoint didn't answer"
 
     rejected = translate_error(ClientAuthenticationError("IMDS endpoint timed out"), "gpt-test")
     assert isinstance(rejected, LLMRequestError)
     assert (rejected.retryable, rejected.code) == (True, "credential")
     assert "IMDS endpoint timed out" in str(rejected)
     # The same with batch=True: sign-in doesn't depend on the route.
-    assert isinstance(translate_error(CredentialUnavailableError("x"), None, batch=True), LLMSetupError)
+    assert isinstance(translate_error(no_credential_worked(), None, batch=True), LLMSetupError)
+    assert translate_error(CredentialUnavailableError("x"), None, batch=True).code == "credential"
     assert translate_error(ClientAuthenticationError("x"), None, batch=True).code == "credential"
+    # DefaultAzureCredential's words decide, whichever ClientAuthenticationError subclass carries them.
+    worded = CredentialUnavailableError("DefaultAzureCredential failed to retrieve a token from the included ...")
+    assert isinstance(translate_error(worded, "gpt-test"), LLMSetupError)
+    # Other wording from DefaultAzureCredential (e.g. its successful credential failing later) isn't a setup error.
+    assert translate_error(ClientAuthenticationError("DefaultAzureCredential: token expired"), "x").retryable
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [
+        pytest.param(credential_unavailable, id="CredentialUnavailableError"),
+        pytest.param(client_authentication_failed, id="other ClientAuthenticationError"),
+        pytest.param(service_request_error, id="ServiceRequestError"),
+        pytest.param(service_response_error, id="ServiceResponseError"),
+    ],
+)
+@pytest.mark.parametrize("batch", [False, True])
+def test_translate_error_passing_sign_in_failures_are_retryable_credential_errors(make_error, batch):
+    error = make_error()
+    translated = translate_error(error, "gpt-test", batch=batch)
+    assert type(translated) is LLMRequestError
+    assert (translated.retryable, translated.code) == (True, "credential")
+    assert str(translated) == f"Couldn't get an Entra ID token: {error}"
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(lambda: AzureError("x"), id="AzureError"),
+        pytest.param(lambda: HttpResponseError("x"), id="HttpResponseError"),
+        pytest.param(lambda: ResourceNotFoundError("x"), id="ResourceNotFoundError"),
+        pytest.param(lambda: RuntimeError("DefaultAzureCredential failed to retrieve a token"), id="phrase elsewhere"),
+    ],
+)
+def test_translate_error_leaves_other_azure_exceptions_to_the_caller(error):
+    """Only sign-in failures are translated; other exceptions are someone's bug, raised as they are."""
+    assert translate_error(error(), "gpt-test") is None
+    assert translate_error(error(), None, batch=True) is None
 
 
 def test_unknown_exceptions_from_the_sdk_propagate_as_they_are():
@@ -1239,50 +1443,84 @@ def failing_sign_in(monkeypatch) -> Callable[[BaseException], list[str]]:
     return use
 
 
-def credential_unavailable() -> Exception:
-    from azure.identity import CredentialUnavailableError
+@pytest.fixture
+def no_working_credential(monkeypatch) -> list[dict]:
+    """The real azure.identity DefaultAzureCredential and token provider, on a machine with no credential.
 
-    return CredentialUnavailableError("EnvironmentCredential authentication unavailable. No credential found.")
+    Only EnvironmentCredential stays in the chain (the others would look for az, a managed identity...), and the
+    environment variables it reads are unset, so every token request fails the way it does out of the box.
+    Returns the keyword arguments of each DefaultAzureCredential made.
+    """
+    import azure.identity
 
+    for name in list(os.environ):
+        if name.startswith(("AZURE_", "IDENTITY_", "MSI_")):
+            monkeypatch.delenv(name)
+    real = azure.identity.DefaultAzureCredential
+    others = ("managed_identity", "cli", "powershell", "developer_cli", "visual_studio_code", "shared_token_cache")
+    others += ("interactive_browser", "workload_identity", "broker")
+    exclusions = {f"exclude_{name}_credential": True for name in others}
+    made: list[dict] = []
 
-def client_authentication_failed() -> Exception:
-    from azure.core.exceptions import ClientAuthenticationError
+    def default_azure_credential(**kwargs):
+        made.append(kwargs)
+        return real(**exclusions, **kwargs)
 
-    return ClientAuthenticationError("ManagedIdentityCredential: the token request timed out")
+    monkeypatch.setattr(azure.identity, "DefaultAzureCredential", default_azure_credential)
+    return made
 
 
 ENTRA_ROUTES = {
     "sync": lambda client: client.complete(MESSAGES),
     "async": lambda client: asyncio.run(ask_async(client)),
     "batch upload": lambda client: client.upload_batch_file(b"{}\n"),
+    "batch create": lambda client: client.create_batch("file-1"),
     "batch poll": lambda client: client.get_batch("batch-1"),
 }
 
 
 @pytest.mark.parametrize("route", list(ENTRA_ROUTES))
 def test_entra_id_without_a_credential_is_a_setup_error(fake_endpoint, failing_sign_in, route):
-    error = credential_unavailable()
+    error = no_credential_worked()
     requested = failing_sign_in(error)
     client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch")
-    with pytest.raises(LLMSetupError, match="No Entra ID credential is available") as caught:
+    with pytest.raises(LLMSetupError, match=r"^No Entra ID credential worked \(DefaultAzureCredential") as caught:
         ENTRA_ROUTES[route](client)
-    assert "No credential found" in str(caught.value)
+    assert "Azure CLI not found on path" in str(caught.value)  # what DefaultAzureCredential tried, and why not
     assert "az login" in str(caught.value)
     assert caught.value.__cause__ is error
-    assert requested == [FOUNDRY_SCOPE]
+    assert requested == [FOUNDRY_SCOPE]  # a setup error: nothing else was tried (no looking for the batch job)
     assert fake_endpoint.requests == []  # nothing went out without a token
 
 
 @pytest.mark.parametrize("route", list(ENTRA_ROUTES))
-def test_entra_id_token_failure_is_a_retryable_credential_error(fake_endpoint, failing_sign_in, route):
+def test_entra_id_with_the_real_default_azure_credential_and_no_credential(fake_endpoint, no_working_credential, route):
+    client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch")
+    with pytest.raises(
+        LLMSetupError, match=r"^No Entra ID credential worked \(DefaultAzureCredential failed"
+    ) as caught:
+        ENTRA_ROUTES[route](client)
+    assert type(caught.value.__cause__) is ClientAuthenticationError
+    assert "EnvironmentCredential authentication unavailable" in str(caught.value)
+    assert "Pass an API key, run `az login`" in str(caught.value)
+    assert no_working_credential == [{}]  # the one AzureChatClient made for itself
+    assert fake_endpoint.requests == []
+
+
+@pytest.mark.parametrize(
+    "make_error",
+    [credential_unavailable, client_authentication_failed, service_request_error, service_response_error],
+)
+@pytest.mark.parametrize("route", list(ENTRA_ROUTES))
+def test_entra_id_token_failure_is_a_retryable_credential_error(fake_endpoint, failing_sign_in, route, make_error):
     """A failed token request can be a passing hiccup (a managed identity endpoint timing out)."""
-    error = client_authentication_failed()
+    error = make_error()
     failing_sign_in(error)
     client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch")
-    with pytest.raises(LLMRequestError, match="Couldn't get an Entra ID token") as caught:
+    with pytest.raises(LLMRequestError, match="^Couldn't get an Entra ID token: ") as caught:
         ENTRA_ROUTES[route](client)
     assert (caught.value.retryable, caught.value.code) == (True, "credential")
-    assert "the token request timed out" in str(caught.value)
+    assert str(error) in str(caught.value)
     assert caught.value.__cause__ is error
     assert fake_endpoint.requests == []
 
@@ -1399,6 +1637,127 @@ def test_batch_file_expiry_none_keeps_files_until_deleted():
         "endpoint": "/v1/chat/completions",
         "completion_window": "24h",
     }
+
+
+@pytest.mark.parametrize("expiry", [BATCH_FILE_EXPIRY_SECONDS, 20 * 24 * 3600, 30 * 24 * 3600, None])
+def test_batch_file_expiry_from_14_to_30_days_or_none(expiry):
+    assert client_on(responding(200), batch_file_expiry=expiry).batch_file_expiry == expiry
+    legacy = AzureChatClient(client=legacy_sdk_client(responding(200)), batch_deployment="b", batch_file_expiry=expiry)
+    assert legacy.batch_file_expiry == expiry
+
+
+@pytest.mark.parametrize(
+    "expiry",
+    [
+        pytest.param(0, id="0"),
+        pytest.param(-1, id="negative"),
+        pytest.param(3600, id="an hour"),
+        pytest.param(BATCH_FILE_EXPIRY_SECONDS - 1, id="a second under 14 days"),
+        pytest.param(30 * 24 * 3600 + 1, id="a second over 30 days"),
+        pytest.param(True, id="True"),
+        pytest.param(False, id="False"),
+        pytest.param(1209600.0, id="whole float"),
+        pytest.param(1209600.5, id="fractional float"),
+        pytest.param(float("inf"), id="infinity"),
+        pytest.param("1209600", id="numeric string"),
+        pytest.param("AUTO", id="AUTO"),
+        pytest.param("", id="empty string"),
+        pytest.param([1209600], id="list"),
+    ],
+)
+def test_batch_file_expiry_outside_what_azure_accepts_is_a_config_error(fake_endpoint, expiry):
+    words = r"^batch_file_expiry must be None or a whole number of seconds from 1209600 \(14 days\) to 2592000 \(30"
+    with pytest.raises(ConfigError, match=words) as caught:
+        client_on(responding(200), batch_file_expiry=expiry)
+    assert f"(got {expiry!r})" in str(caught.value)
+    with pytest.raises(ConfigError, match=words):
+        AzureChatClient(client=legacy_sdk_client(responding(200)), batch_deployment="b", batch_file_expiry=expiry)
+    with pytest.raises(ConfigError, match=words):
+        AzureChatClient("res", deployment="gpt-test", batch_file_expiry=expiry)
+    assert fake_endpoint.built == []  # refused before any SDK client (or Entra ID credential) was made
+
+
+def test_batch_file_expiry_auto_is_the_default():
+    assert client_on(responding(200), batch_file_expiry="auto").batch_file_expiry == BATCH_FILE_EXPIRY_SECONDS
+    legacy = AzureChatClient(client=legacy_sdk_client(responding(200)), batch_deployment="b", batch_file_expiry="auto")
+    assert legacy.batch_file_expiry is None
+
+
+# --- a legacy openai.AzureOpenAI client ------------------------------------------------------------------
+
+
+def test_a_legacy_azure_openai_client_gets_the_classic_batch_path_and_no_file_expiry():
+    client = AzureChatClient(client=legacy_sdk_client(responding(200)), batch_deployment="gpt-batch")
+    assert client.batch_endpoint == LEGACY_BATCH_ENDPOINT == "/chat/completions"
+    assert client.batch_file_expiry is None  # the older API versions don't take expires_after
+    assert json.loads(client.batch_line("request-0", MESSAGES))["url"] == "/chat/completions"
+
+
+def test_a_legacy_azure_openai_client_on_the_wire():
+    fake = FakeAzure(batch_url="/chat/completions")
+    client = AzureChatClient(client=fake.legacy_sdk_client(), batch_deployment="gpt-batch")
+    file_id = client.upload_batch_file((client.batch_line("request-0", MESSAGES) + "\n").encode())
+    job = client.create_batch(file_id)
+
+    (upload,) = fake.sent("POST", "/files")
+    assert (upload.url.path, upload.url.params["api-version"]) == ("/openai/files", "2024-10-21")
+    assert upload.headers["api-key"] == "secret"
+    assert set(multipart(upload)) == {"purpose", "file"}
+    assert b"expires_after" not in upload.content
+    (create,) = fake.sent("POST", "/batches")
+    assert (create.url.path, create.url.params["api-version"]) == ("/openai/batches", "2024-10-21")
+    assert json.loads(create.content) == {
+        "input_file_id": file_id,
+        "endpoint": "/chat/completions",
+        "completion_window": "24h",
+    }
+    assert client.get_batch(job.id).status == "in_progress"
+    assert client.get_batch(job.id).status == "completed"
+
+
+def test_explicit_batch_settings_win_over_the_legacy_client_defaults():
+    """E.g. a classic client pointed at a gateway that serves the v1 Batch API."""
+    fake = FakeAzure()  # the v1 Batch API: only /v1/chat/completions
+    client = AzureChatClient(
+        client=fake.legacy_sdk_client(),
+        batch_deployment="gpt-batch",
+        batch_endpoint=BATCH_ENDPOINT,
+        batch_file_expiry=30 * 24 * 3600,
+    )
+    job = client.create_batch(client.upload_batch_file((client.batch_line("request-0", MESSAGES) + "\n").encode()))
+    (upload,) = fake.sent("POST", "/files")
+    assert multipart(upload)["expires_after[seconds]"].get_payload(decode=True) == b"2592000"
+    (create,) = fake.sent("POST", "/batches")
+    assert json.loads(create.content)["endpoint"] == "/v1/chat/completions"
+    assert json.loads(create.content)["output_expires_after"] == {"anchor": "created_at", "seconds": 2592000}
+    assert client.get_batch(job.id).status == "in_progress"  # not failed: Azure took the lines and the job
+
+
+def test_a_v1_client_with_an_explicit_classic_path_and_no_expiry():
+    client = client_on(responding(200), batch_endpoint=LEGACY_BATCH_ENDPOINT, batch_file_expiry=None)
+    assert (client.batch_endpoint, client.batch_file_expiry) == ("/chat/completions", None)
+
+
+def test_a_client_built_from_the_endpoint_uses_the_v1_batch_settings(fake_endpoint):
+    client = AzureChatClient("res", batch_deployment="gpt-batch", api_key="k")
+    assert (client.batch_endpoint, client.batch_file_expiry) == (BATCH_ENDPOINT, BATCH_FILE_EXPIRY_SECONDS)
+
+
+def test_an_azure_openai_client_on_the_v1_base_url_gets_the_v1_batch_settings():
+    fake = FakeAzure()
+    sdk = RealAzureOpenAI(
+        base_url=BASE_URL,
+        api_key="secret",
+        api_version="preview",
+        max_retries=0,
+        http_client=httpx2.Client(transport=fake.transport("sync")),
+    )
+    client = AzureChatClient(client=sdk, batch_deployment="gpt-batch")
+    job = client.create_batch(client.upload_batch_file((client.batch_line("request-0", MESSAGES) + "\n").encode()))
+    (create,) = fake.sent("POST", "/batches")
+    assert create.url.path == "/openai/v1/batches"  # the v1 API ...
+    assert client.get_batch(job.id).status == "in_progress"  # ... so the v1 path, or the job fails validation
+    assert (client.batch_endpoint, client.batch_file_expiry) == (BATCH_ENDPOINT, BATCH_FILE_EXPIRY_SECONDS)
 
 
 # --- batch_endpoint --------------------------------------------------------------------------------------
@@ -1560,6 +1919,386 @@ def test_batch_api_errors_through_the_fake_service():
     with pytest.raises(LLMSetupError, match="Contributor"):
         client.delete_file("file-1")
     assert client.cancel_batch(job.id).status == "cancelling"
+
+
+# --- create_batch: never sent twice; a job Azure started despite a failure is adopted ----------------------
+
+QUICK_RETRY = {"retry-after-ms": "1"}  # so an SDK retry, where there is one, doesn't slow the tests down
+
+
+def batch_json(batch_id: str, input_file_id: str, status: str = "in_progress") -> dict:
+    return {
+        "id": batch_id,
+        "object": "batch",
+        "endpoint": BATCH_ENDPOINT,
+        "input_file_id": input_file_id,
+        "completion_window": "24h",
+        "status": status,
+        "created_at": 1,
+        "request_counts": {"total": 4, "completed": 1, "failed": 0},
+    }
+
+
+def batch_service(
+    seen: list[httpx2.Request],
+    *,
+    create: int | type[Exception] | tuple[int, dict] = 200,
+    listed: list[dict] = (),
+    list_status: int = 200,
+):
+    """A Batch API whose POST /batches answers ``create`` (a status, a status and a body, or an httpx2 exception
+    the transport raises) and whose job list holds ``listed``. Other calls fail with a 500, which the SDK retries."""
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        seen.append(request)
+        key = f"{request.method} {_route(request)}"
+        if key == "POST /batches":
+            if isinstance(create, type):
+                raise create("The read operation timed out", request=request)
+            if create == 200:
+                input_file_id = json.loads(request.content)["input_file_id"]
+                return httpx2.Response(200, json=batch_json("batch-new", input_file_id, "validating"))
+            status, body = create if isinstance(create, tuple) else (create, error_json("server_error", "Azure broke"))
+            return httpx2.Response(status, json=body, headers=QUICK_RETRY)
+        if key == "GET /batches" and list_status == 200:
+            return httpx2.Response(200, json={"object": "list", "data": list(listed), "has_more": False})
+        return httpx2.Response(
+            list_status if key == "GET /batches" else 500, json=error_json(None), headers=QUICK_RETRY
+        )
+
+    return handler
+
+
+def calls(seen: list[httpx2.Request]) -> list[str]:
+    return [f"{request.method} {_route(request)}" for request in seen]
+
+
+RETRYING_SDK_CLIENTS: dict[str, Callable[[Callable], openai.OpenAI]] = {
+    "v1": lambda handler: RealOpenAI(
+        base_url=BASE_URL,
+        api_key="k",
+        max_retries=3,
+        http_client=httpx2.Client(transport=httpx2.MockTransport(handler)),
+    ),
+    "legacy": lambda handler: legacy_sdk_client(handler, max_retries=3),
+}
+
+
+@pytest.mark.parametrize("sdk", list(RETRYING_SDK_CLIENTS))
+@pytest.mark.parametrize(
+    "create",
+    [
+        pytest.param(500, id="500"),
+        pytest.param(502, id="502"),
+        pytest.param(503, id="503"),
+        pytest.param(408, id="408"),
+        pytest.param(409, id="409"),
+        pytest.param(429, id="429"),
+        pytest.param(httpx2.ReadTimeout, id="timed out"),
+        pytest.param(httpx2.ConnectError, id="connection error"),
+    ],
+)
+def test_create_batch_sends_one_request_where_the_sdk_would_retry(sdk, create):
+    """Creating a job isn't idempotent: an SDK retry after a lost response would start a second, billed job."""
+    seen: list[httpx2.Request] = []
+    sdk_client = RETRYING_SDK_CLIENTS[sdk](batch_service(seen, create=create))
+    client = AzureChatClient(client=sdk_client, batch_deployment="gpt-batch")
+    with pytest.raises(LLMRequestError) as caught:
+        client.create_batch("file-1")
+    assert caught.value.retryable
+    assert calls(seen) == ["POST /batches", "GET /batches"]  # one try, then a look for the job it may have made
+    # The client keeps its own retries, which the other Batch API calls go on using.
+    assert sdk_client.max_retries == 3
+    seen.clear()
+    with pytest.raises(LLMRequestError):
+        client.get_batch("batch-1")
+    assert calls(seen) == ["GET /batches/{id}"] * (1 + 3)
+
+
+@pytest.mark.parametrize("sdk", list(RETRYING_SDK_CLIENTS))
+@pytest.mark.parametrize(
+    "create", [500, httpx2.ReadTimeout, httpx2.RemoteProtocolError], ids=["500", "timeout", "drop"]
+)
+def test_create_batch_adopts_the_job_azure_started_although_the_call_failed(sdk, create, caplog):
+    seen: list[httpx2.Request] = []
+    listed = [batch_json("batch-9", "file-9"), batch_json("batch-ours", "file-1", "validating"), batch_json("b", "f")]
+    client = AzureChatClient(
+        client=RETRYING_SDK_CLIENTS[sdk](batch_service(seen, create=create, listed=listed)), batch_deployment="gpt"
+    )
+    with caplog.at_level(logging.INFO, logger="azure_mapreduce.client"):
+        job = client.create_batch("file-1")
+    assert job == BatchJob(id="batch-ours", status="validating", completed=1, failed=0, total=4)
+    assert calls(seen) == ["POST /batches", "GET /batches"]
+    assert seen[1].url.params["limit"] == "50"
+    assert "Creating the batch job failed" in caplog.text and "carrying on with it" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "listed",
+    [
+        pytest.param([], id="no jobs"),
+        pytest.param([batch_json("batch-9", "file-9"), batch_json("batch-10", "file-10")], id="other files' jobs"),
+        pytest.param([batch_json("batch-9", "file-10")], id="a file id that only starts the same"),
+    ],
+)
+def test_create_batch_raises_the_create_error_when_no_job_uses_the_file(listed):
+    seen: list[httpx2.Request] = []
+    client = AzureChatClient(client=sdk_client(batch_service(seen, create=500, listed=listed)), batch_deployment="b")
+    with pytest.raises(LLMRequestError, match="Azure broke") as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (True, "server_error")
+    assert type(caught.value.__cause__) is openai.InternalServerError
+    assert calls(seen) == ["POST /batches", "GET /batches"]
+
+
+@pytest.mark.parametrize("list_status", [500, 401, 403, 404, 400])
+def test_create_batch_raises_the_create_error_when_the_job_list_fails_too(list_status):
+    seen: list[httpx2.Request] = []
+    client = AzureChatClient(
+        client=sdk_client(batch_service(seen, create=httpx2.ReadTimeout, list_status=list_status)), batch_deployment="b"
+    )
+    with pytest.raises(LLMRequestError) as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (True, "timeout")  # the create's error, not the list's
+    assert type(caught.value.__cause__) is openai.APITimeoutError
+    assert calls(seen) == ["POST /batches", "GET /batches"]
+
+
+def test_create_batch_raises_the_create_error_when_the_job_list_cant_connect():
+    seen: list[httpx2.Request] = []
+    service = batch_service(seen, create=503)
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        if request.method == "GET":
+            seen.append(request)
+            raise httpx2.ConnectError("Connection refused", request=request)
+        return service(request)
+
+    client = AzureChatClient(client=sdk_client(handler), batch_deployment="b")
+    with pytest.raises(LLMRequestError, match="Azure broke") as caught:
+        client.create_batch("file-1")
+    assert type(caught.value.__cause__) is openai.InternalServerError
+    assert calls(seen) == ["POST /batches", "GET /batches"]
+
+
+@pytest.mark.parametrize(
+    ("create", "error"),
+    [
+        pytest.param((400, error_json("invalid_request", "not a batch file")), LLMRequestError, id="400 final"),
+        pytest.param((400, error_json("content_filter")), LLMRequestError, id="400 content_filter"),
+        pytest.param((401, error_json("invalid_api_key")), LLMSetupError, id="401"),
+        pytest.param((403, error_json("PermissionDenied")), LLMSetupError, id="403"),
+        pytest.param((404, error_json("404", "Resource not found")), LLMSetupError, id="404"),
+        pytest.param((422, error_json("unprocessable")), LLMRequestError, id="422"),
+        pytest.param((400, {"errors": [{"code": "model_not_found"}]}), LLMSetupError, id="400 batch setup code"),
+    ],
+)
+def test_create_batch_doesnt_look_for_a_job_after_a_failure_that_isnt_passing(create, error):
+    """Azure answered no: there's no job to find (and one listed on the file isn't adopted)."""
+    seen: list[httpx2.Request] = []
+    listed = [batch_json("batch-ours", "file-1")]
+    client = AzureChatClient(client=sdk_client(batch_service(seen, create=create, listed=listed)), batch_deployment="b")
+    with pytest.raises(error) as caught:
+        client.create_batch("file-1")
+    assert not getattr(caught.value, "retryable", False)
+    assert calls(seen) == ["POST /batches"]
+
+
+def test_create_batch_quota_rejection_stays_the_quota_error():
+    seen: list[httpx2.Request] = []
+    create = (400, error_json(QUOTA_CODE, "Enqueued token limit reached for gpt-batch"))
+    client = AzureChatClient(
+        client=sdk_client(batch_service(seen, create=create, listed=[batch_json("batch-9", "file-9")])),
+        batch_deployment="gpt-batch",
+    )
+    with pytest.raises(LLMRequestError, match="enqueued-token quota is full") as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (True, QUOTA_CODE)
+    assert type(caught.value.__cause__) is openai.BadRequestError
+    assert calls(seen).count("POST /batches") == 1
+
+
+def test_create_batch_that_succeeds_doesnt_list_jobs():
+    seen: list[httpx2.Request] = []
+    client = AzureChatClient(client=RETRYING_SDK_CLIENTS["v1"](batch_service(seen)), batch_deployment="gpt-batch")
+    assert client.create_batch("file-1") == BatchJob(id="batch-new", status="validating", completed=1, total=4)
+    assert calls(seen) == ["POST /batches"]
+
+
+class WrappedBatches:
+    """The batches of a wrapped SDK that can't list jobs, whose job creation fails without an answer."""
+
+    def __init__(self):
+        self.created: list[dict] = []
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+        raise openai.APIConnectionError(request=httpx2.Request("POST", BASE_URL + "batches"))
+
+
+class WrappedListingBatches(WrappedBatches):
+    def __init__(self, listed: list[dict]):
+        super().__init__()
+        self.listed = listed
+        self.listed_with: list[dict] = []
+
+    def list(self, **kwargs):
+        self.listed_with.append(kwargs)
+        return SimpleNamespace(data=[openai.types.Batch.model_validate(batch) for batch in self.listed])
+
+
+class WrappedClient:
+    """A wrapped SDK client without with_options."""
+
+    def __init__(self, batches: WrappedBatches):
+        self.batches = batches
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=lambda **kwargs: None))
+
+
+def test_create_batch_on_a_wrapped_client_without_with_options():
+    wrapped = WrappedClient(WrappedListingBatches([batch_json("batch-ours", "file-1")]))
+    client = AzureChatClient(client=wrapped, batch_deployment="gpt-batch")
+    assert client.create_batch("file-1").id == "batch-ours"
+    assert wrapped.batches.created == [
+        {
+            "input_file_id": "file-1",
+            "endpoint": BATCH_ENDPOINT,
+            "completion_window": "24h",
+            "output_expires_after": {"anchor": "created_at", "seconds": BATCH_FILE_EXPIRY_SECONDS},
+        }
+    ]
+    assert wrapped.batches.listed_with == [{"limit": 50}]
+
+
+def test_create_batch_on_a_wrapped_client_that_cant_list_jobs_raises_the_create_error():
+    wrapped = WrappedClient(WrappedBatches())  # no batches.list at all
+    client = AzureChatClient(client=wrapped, batch_deployment="gpt-batch")
+    with pytest.raises(LLMRequestError, match="Couldn't connect") as caught:
+        client.create_batch("file-1")
+    assert caught.value.code == "connection"
+    assert len(wrapped.batches.created) == 1
+
+
+def test_create_batch_without_retries_still_signs_in_with_a_fresh_entra_id_token(fake_endpoint, entra):
+    client = AzureChatClient("res", batch_deployment="gpt-batch")
+    job = client.create_batch(client.upload_batch_file((client.batch_line("request-0", MESSAGES) + "\n").encode()))
+    client.get_batch(job.id)
+    assert [request.headers["authorization"] for _, request in fake_endpoint.requests] == [
+        "Bearer entra-token-1",
+        "Bearer entra-token-2",
+        "Bearer entra-token-3",
+    ]
+    assert [str(request.url) for request in fake_endpoint.sent("POST", "/batches")] == [BASE_URL + "batches"]
+    assert entra == [FOUNDRY_SCOPE]
+    assert client._client.max_retries == 6  # the client's own retries are left as they were
+
+
+# --- create_batch: Azure's {"errors": ...} replies -------------------------------------------------------
+
+ERRORS_SHAPES = {
+    "errors list": lambda errors: {"errors": errors},
+    "errors.data": lambda errors: {"errors": {"object": "list", "data": errors}},
+}
+
+
+@pytest.mark.parametrize("code", sorted(BATCH_SETUP_CODES))
+@pytest.mark.parametrize("shape", list(ERRORS_SHAPES))
+def test_create_batch_400_with_a_batch_setup_code_in_its_errors_is_a_setup_error(shape, code):
+    """Azure turns down the job for a reason every job would hit (e.g. no such batch deployment)."""
+    seen: list[httpx2.Request] = []
+    body = ERRORS_SHAPES[shape]([{"code": code, "message": f"{code} for this job", "line": None}])
+    client = AzureChatClient(client=sdk_client(batch_service(seen, create=(400, body))), batch_deployment="gpt-b")
+    with pytest.raises(LLMSetupError, match=r"^Azure rejected the batch job, and would reject every one: ") as caught:
+        client.create_batch("file-1")
+    assert f"{code} for this job" in str(caught.value)
+    assert type(caught.value.__cause__) is openai.BadRequestError
+    assert caught.value.__cause__.code is None  # the SDK saw no code: it's in the errors
+    assert calls(seen) == ["POST /batches"]
+
+
+@pytest.mark.parametrize("shape", list(ERRORS_SHAPES))
+@pytest.mark.parametrize(
+    "errors",
+    [
+        pytest.param([{"code": QUOTA_CODE, "message": "Enqueued token limit reached"}], id="quota"),
+        pytest.param(
+            [{"code": "invalid_json_line", "message": "bad line", "line": 3}, {"code": QUOTA_CODE, "message": "full"}],
+            id="quota and a setup code",  # the quota decides: a setup problem shows on the next try
+        ),
+    ],
+)
+def test_create_batch_400_with_token_limit_exceeded_in_its_errors_is_the_quota_error(shape, errors):
+    seen: list[httpx2.Request] = []
+    client = AzureChatClient(
+        client=sdk_client(batch_service(seen, create=(400, ERRORS_SHAPES[shape](errors)))), batch_deployment="b"
+    )
+    with pytest.raises(LLMRequestError, match="^The Batch API's enqueued-token quota is full: ") as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (True, QUOTA_CODE)
+    assert type(caught.value.__cause__) is openai.BadRequestError
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param({"errors": [{"code": "brand_new_code", "message": "?"}]}, id="unknown code"),
+        pytest.param({"errors": []}, id="empty list"),
+        pytest.param({"errors": {"object": "list", "data": []}}, id="empty data"),
+        pytest.param({"errors": None}, id="null"),
+        pytest.param({"errors": "model_not_found"}, id="a string"),
+        pytest.param({"errors": {"data": "model_not_found"}}, id="data a string"),
+        pytest.param({"errors": {"model_not_found": True}}, id="an object without data"),
+        pytest.param({"errors": [None, 3, "model_not_found", {"code": 5}, {"message": "no code"}]}, id="odd items"),
+    ],
+)
+def test_create_batch_400_without_a_known_code_in_its_errors_is_a_final_request_error(body):
+    client = AzureChatClient(client=sdk_client(batch_service([], create=(400, body))), batch_deployment="b")
+    with pytest.raises(LLMRequestError, match="^Azure rejected the request: ") as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (False, None)
+
+
+def test_the_error_code_the_sdk_found_wins_over_the_errors_list():
+    body = {"code": "invalid_prompt", "message": "m", "errors": [{"code": "model_not_found"}]}
+    client = AzureChatClient(client=sdk_client(batch_service([], create=(400, body))), batch_deployment="b")
+    with pytest.raises(LLMRequestError) as caught:
+        client.create_batch("file-1")
+    assert (caught.value.retryable, caught.value.code) == (False, "invalid_prompt")
+
+
+def test_upload_batch_file_400_with_a_setup_code_in_its_errors_is_a_setup_error():
+    body = {"errors": {"object": "list", "data": [{"code": "invalid_json_line", "message": "Line 1", "line": 1}]}}
+    client = client_on(responding(400, body))
+    with pytest.raises(LLMSetupError, match="Azure rejected the batch job"):
+        client.upload_batch_file(b"not json\n")
+
+
+def test_chat_calls_dont_read_the_batch_errors_list():
+    """The {"errors": ...} shape is the Batch API's; a chat call with it is just a rejected request."""
+    client = client_on(responding(400, {"errors": [{"code": "model_not_found", "message": "x"}]}))
+    with pytest.raises(LLMRequestError, match="^Azure rejected the request: ") as caught:
+        client.complete(MESSAGES)
+    assert (caught.value.retryable, caught.value.code) == (False, None)
+    for code in ("unsupported_value", QUOTA_CODE):  # neither a setup error nor the quota: no batch=True
+        error = translate_error(
+            openai.BadRequestError(
+                "Error code: 400",
+                response=httpx2.Response(400, request=httpx2.Request("POST", BASE_URL + "chat/completions")),
+                body={"errors": [{"code": code}]},
+            ),
+            "gpt-test",
+        )
+        assert type(error) is LLMRequestError
+        assert (error.retryable, error.code) == (False, None)
+
+
+def test_batch_setup_codes_live_in_the_client():
+    from azure_mapreduce import runners
+
+    assert runners.BATCH_SETUP_CODES is BATCH_SETUP_CODES
+    assert {"model_not_found", "url_mismatch", "invalid_json_line", "DeploymentNotFound"} <= BATCH_SETUP_CODES
+    assert QUOTA_CODE not in BATCH_SETUP_CODES  # a full quota is passing
+    assert "server_error" not in BATCH_SETUP_CODES
 
 
 def test_get_batch_follows_the_job_to_its_output_file():
@@ -1795,6 +2534,98 @@ def test_batch_line_result_200_with_an_empty_reply():
     assert (outcome.retryable, outcome.code) == (True, "empty")
 
 
+@pytest.mark.parametrize(
+    ("code", "expected"),
+    [(429, "429"), (500, "500"), (0, "0"), (400.0, "400.0"), ("server_error", "server_error"), (None, None)],
+)
+@pytest.mark.parametrize("where", ["error field", "response body"])
+def test_batch_line_result_error_codes_are_strings(code, expected, where):
+    error = {"code": code, "message": "went wrong"}
+    line = output_line(None, error=error) if where == "error field" else output_line(500, {"error": error})
+    outcome = batch_line_result(line)
+    assert isinstance(outcome, LLMRequestError)
+    assert outcome.code == expected
+    assert outcome.retryable
+    assert str(outcome) == (f"{expected}: went wrong" if expected is not None else "went wrong")
+
+
+WRAPPED_FILTER_ERROR = {"error": {"code": "content_filter", "message": "hate: high", "param": None, "type": None}}
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(WRAPPED_FILTER_ERROR, id="object"),
+        pytest.param(json.dumps(WRAPPED_FILTER_ERROR), id="JSON string"),
+        pytest.param(" \n\t" + json.dumps(WRAPPED_FILTER_ERROR) + "\n", id="JSON string with whitespace"),
+        pytest.param(WRAPPED_FILTER_ERROR["error"], id="object without the error wrapper"),
+        pytest.param(json.dumps(WRAPPED_FILTER_ERROR["error"]), id="JSON string without the error wrapper"),
+        pytest.param(
+            json.dumps({"error": {"code": None, "message": json.dumps(WRAPPED_FILTER_ERROR)}}), id="wrapped twice"
+        ),
+    ],
+)
+@pytest.mark.parametrize("where", ["error field", "response body", "response body as a string"])
+def test_batch_line_result_unwraps_an_error_hidden_in_the_message(message, where):
+    """Some gateways put the whole error object in the message and leave the code null."""
+    error = {"code": None, "message": message}
+    line = {
+        "error field": output_line(None, error=error),
+        "response body": output_line(400, {"error": error}),
+        "response body as a string": output_line(400, json.dumps({"error": error})),
+    }[where]
+    outcome = batch_line_result(line)
+    assert isinstance(outcome, LLMRequestError)
+    assert (outcome.retryable, outcome.code) == (False, "content_filter")  # not sent again: it's the text
+    assert str(outcome) == "Azure's content filter blocked this text: hate: high"
+
+
+def test_batch_line_result_unwrapped_passing_error_stays_retryable():
+    error = {"code": None, "message": json.dumps({"error": {"code": "server_error", "message": "try later"}})}
+    outcome = batch_line_result(output_line(None, error=error))
+    assert (outcome.retryable, outcome.code, str(outcome)) == (True, "server_error", "server_error: try later")
+    no_message = {"code": None, "message": {"error": {"code": 503}}}
+    outcome = batch_line_result(output_line(None, error=no_message))
+    assert (outcome.retryable, outcome.code, str(outcome)) == (True, "503", "503: no details")
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "text"),
+    [
+        pytest.param(
+            {"code": "server_error", "message": json.dumps(WRAPPED_FILTER_ERROR)},
+            "server_error",
+            "server_error: " + json.dumps(WRAPPED_FILTER_ERROR),
+            id="a code of its own: the message is left as it is",
+        ),
+        pytest.param({"code": None, "message": "{not json"}, None, "{not json", id="not JSON after all"),
+        pytest.param({"code": None, "message": '{"error": '}, None, '{"error": ', id="cut-off JSON"),
+        pytest.param({"code": None, "message": "[1, 2]"}, None, "[1, 2]", id="a JSON list"),
+        pytest.param({"code": None, "message": "  plain words "}, None, "  plain words ", id="plain text"),
+        pytest.param({"code": None, "message": {"error": "a plain string"}}, None, "a plain string", id="string error"),
+    ],
+)
+def test_batch_line_result_messages_that_arent_a_wrapped_error(error, code, text):
+    outcome = batch_line_result(output_line(None, error=error))
+    assert isinstance(outcome, LLMRequestError)
+    assert (outcome.code, str(outcome)) == (code, text)
+    assert outcome.retryable
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        pytest.param(json.dumps({"detail": "The gateway timed out"}), id="JSON string of another shape"),
+        pytest.param({"detail": "The gateway timed out"}, id="object of another shape"),
+        pytest.param({"error": None, "detail": "The gateway timed out"}, id="null error"),
+    ],
+)
+def test_batch_line_result_keeps_a_json_message_it_cant_unwrap(message):
+    outcome = batch_line_result(output_line(None, error={"code": None, "message": message}))
+    assert isinstance(outcome, LLMRequestError) and outcome.retryable
+    assert "The gateway timed out" in str(outcome)
+
+
 # --- end to end: MapReduce through the real SDK against the fake Azure service ---------------------------
 
 
@@ -1904,10 +2735,10 @@ def test_end_to_end_batch_then_async_then_sync(clock, code, retired):
     assert {model for model, _ in sync_calls} == {"gpt-test"}
     if retired:
         # A job that failed for a setup reason (every job would) retires the Batch API for the rest of the run:
-        # the map step's two jobs ran at once; the first failure cancelled the other, and the reduce skipped it.
+        # the map step's two jobs ran at once and failed validation together, and the reduce skipped it.
         assert len(fake.batches) == 2
-        assert [batch["status"] for batch in fake.batches.values()] == ["failed", "cancelling"]
-        assert len(fake.sent("POST", "/batches/{id}/cancel")) == 1
+        assert [batch["status"] for batch in fake.batches.values()] == ["failed", "failed"]
+        assert fake.sent("POST", "/batches/{id}/cancel") == []
     else:
         # Any other failed job doesn't retire the Batch API: each step tried it again.
         assert len(fake.batches) == 2 + 1 + 1
@@ -1925,11 +2756,11 @@ def test_end_to_end_batch_endpoint_rejected_by_azure_falls_back_to_async(clock, 
     assert result.frame["summary"].tolist() == SEVEN_MAPPED
     assert result.output == SEVEN_OUTPUT
     assert [(tag, model) for tag, model, _ in fake.chat_calls] == [("async", "gpt-test")] * (7 + 3 + 1)
-    # The map step's three jobs were submitted at once; the first to fail validation retired the Batch API and
-    # the other two were cancelled; the reduce levels didn't try it again.
+    # The map step's three jobs were submitted at once and failed validation together, which retired the Batch
+    # API (nothing left running to cancel); the reduce levels didn't try it again.
     assert len(fake.batches) == 3
     assert all(batch["endpoint"] == "/chat/completions" for batch in fake.batches.values())
-    assert len(fake.sent("POST", "/batches/{id}/cancel")) == 2
+    assert fake.sent("POST", "/batches/{id}/cancel") == []
     assert fake.batch_lines == []  # nothing ran
     assert sorted(fake.deleted) == sorted(fake.uploads())
     assert "url_mismatch" in caplog.text
@@ -2035,6 +2866,67 @@ def test_end_to_end_batch_quota_error_on_submit_waits_and_submits_again(clock):
     assert sorted(fake.deleted) == sorted(fake.files)  # ... and the refused ones were deleted
 
 
+@pytest.mark.parametrize("lose_as", [None, 500, 503], ids=["timed out", "500", "503"])
+def test_end_to_end_a_job_created_despite_a_lost_answer_is_adopted_not_started_twice(
+    fake_endpoint, clock, caplog, lose_as
+):
+    """Azure made the job but the answer never arrived: the SDK (6 retries on this client) mustn't send the
+    create again, and the runner carries on with the job it finds on the input file."""
+    fake_endpoint.lose = {"POST /batches": 1}
+    fake_endpoint.lose_as = lose_as
+    client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch", api_key="k")
+    with caplog.at_level(logging.INFO, logger="azure_mapreduce"):
+        mapped = mapreduce(client, clock, map_batch_size=4).map(reviews(4), "review", "summary")
+
+    assert mapped["summary"].tolist() == [f"S(r{i})" for i in range(4)]
+    assert fake_endpoint.chat_calls == []  # the adopted job's replies were used
+    assert len(fake_endpoint.sent("POST", "/batches")) == 1
+    assert len(fake_endpoint.batches) == 1  # one job, not two billed ones
+    (listing,) = fake_endpoint.sent("GET", "/batches")
+    assert listing.url.params["limit"] == "50"
+    assert len(fake_endpoint.uploads()) == 1
+    assert not [delay for delay in clock.sleeps if delay >= 30]  # nothing to back off from
+    assert sorted(fake_endpoint.deleted) == sorted(fake_endpoint.files)  # each file deleted, once
+    assert "carrying on with it" in caplog.text
+
+
+def test_end_to_end_a_create_that_azure_never_got_is_submitted_again(fake_endpoint, clock):
+    fake_endpoint.fail = {"POST /batches": (500, "server_error")}
+    fake_endpoint.fail_times = {"POST /batches": 1}
+    client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch", api_key="k")
+    mapped = mapreduce(client, clock, map_batch_size=4).map(reviews(4), "review", "summary")
+
+    assert mapped["summary"].tolist() == [f"S(r{i})" for i in range(4)]
+    assert fake_endpoint.chat_calls == []
+    # One request per attempt, although this client retries 500s: the first found no job, so the runner
+    # uploaded the input again 30 s later and created the job then.
+    assert len(fake_endpoint.sent("POST", "/batches")) == 2
+    assert len(fake_endpoint.sent("GET", "/batches")) == 1
+    assert len(fake_endpoint.batches) == 1
+    assert len(fake_endpoint.uploads()) == 2
+    assert 30.0 in clock.sleeps
+    assert sorted(fake_endpoint.deleted) == sorted(fake_endpoint.files)
+
+
+def test_end_to_end_batch_api_through_a_legacy_azure_openai_client(clock):
+    fake = FakeAzure(batch_url="/chat/completions")  # the classic API's Batch API
+    client = AzureChatClient(client=fake.legacy_sdk_client(), batch_deployment="gpt-batch")
+    result = mapreduce(client, clock).run(reviews(7), "review", "summary")
+
+    assert result.output == SEVEN_OUTPUT
+    assert fake.chat_calls == []
+    assert len(fake.batches) == 3 + 1 + 1  # no job failed validation
+    assert {line["url"] for line in fake.batch_lines} == {"/chat/completions"}
+    assert {batch["endpoint"] for batch in fake.batches.values()} == {"/chat/completions"}
+    assert all("output_expires_after" not in batch for batch in fake.batches.values())
+    assert all(fake.files[file_id]["expires_after"] is None for file_id in fake.uploads())
+    for _, request in fake.requests:
+        assert request.url.path.startswith("/openai/") and not request.url.path.startswith("/openai/v1/")
+        assert request.url.params["api-version"] == "2024-10-21"
+        assert request.headers["api-key"] == "secret"
+    assert sorted(fake.deleted) == sorted(fake.files)
+
+
 def test_end_to_end_unicode_newlines_and_empty_records_survive_the_jsonl_round_trip(clock):
     fake = FakeAzure()
     texts = ["Café ☕ — naïve", 'line one\nline two "quoted" \\ backslash', None, "   ", "emoji 🎉 {json: [1]}"]
@@ -2044,9 +2936,30 @@ def test_end_to_end_unicode_newlines_and_empty_records_survive_the_jsonl_round_t
     assert mapped["summary"].tolist() == [f"S({texts[0]})", f"S({texts[1]})", None, None, f"S({texts[4]})"]
     system = {"role": "system", "content": "Réponds en français."}
     assert [line["body"]["messages"][0] for line in fake.batch_lines] == [system] * 3
-    uploaded = fake.files["file-1"]["content"].decode("utf-8")
-    assert "Café ☕" in uploaded  # UTF-8, not \u escapes
+    uploaded = fake.files["file-1"]["content"].decode("ascii")  # \u escapes: pure ASCII
+    assert "Caf\\u00e9 \\u2615" in uploaded
+    assert "\\ud83c\\udf89" in uploaded  # the emoji as a surrogate pair
     assert len(uploaded.splitlines()) == 3  # one line per request: newlines inside the texts are escaped
+    # Azure reads the escapes back as the very same texts.
+    sent = [line["body"]["messages"][-1]["content"] for line in fake.batch_lines]
+    assert sent == [f"Summarize: {texts[i]}" for i in (0, 1, 4)]
+    assert fake.chat_calls == []
+
+
+def test_end_to_end_batch_files_are_split_by_the_size_of_the_escaped_text(clock, monkeypatch):
+    """Each \u00e9 takes 6 bytes in the file, so a file holds fewer accented texts than their UTF-8 size suggests."""
+    from azure_mapreduce import runners
+
+    limit = 3000
+    monkeypatch.setattr(runners, "MAX_BATCH_FILE_BYTES", limit)
+    fake = FakeAzure()
+    texts = [f"{i}" + "\u00e9" * 200 for i in range(6)]  # about 1.4 kB a line escaped, 0.6 kB in UTF-8
+    mapped = mapreduce(fake.client(), clock, map_batch_size=100).map(pd.DataFrame({"review": texts}), "review", "s")
+
+    assert mapped["s"].tolist() == [f"S({text})" for text in texts]
+    contents = [fake.files[file_id]["content"] for file_id in fake.uploads()]
+    assert all(content.isascii() and len(content) <= limit for content in contents)
+    assert [len(content.splitlines()) for content in contents] == [2, 2, 2]
     assert fake.chat_calls == []
 
 
@@ -2122,7 +3035,7 @@ def test_end_to_end_dropped_connections_after_a_reply(clock, dropped, stops):
     fake = FakeAzure(drop_prompts={f"Summarize: r{i}": 1 for i in range(1, dropped + 1)})
     mr = mapreduce(fake.client(), clock, strategies=("sync",), map_batch_size=100)
     if stops:
-        with pytest.raises(LLMSetupError, match="10 requests in a row couldn't reach Azure") as caught:
+        with pytest.raises(LLMSetupError, match="Azure couldn't be reached on 10 attempts in a row") as caught:
             mr.run(reviews(12), "review", "summary")
         assert caught.value.outputs[0] == "S(r0)"  # the reply that arrived is kept
         assert len(fake.requests) == 1 + 10
@@ -2138,20 +3051,24 @@ def test_end_to_end_dropped_connections_after_a_reply(clock, dropped, stops):
     [
         pytest.param(("sync",), {"sync": 3}, id="sync"),
         pytest.param(("async",), {"async": 3}, id="async"),
-        pytest.param(("batch", "async", "sync"), {"sync": 4, "async": 3}, id="all three"),
+        # The batch upload is a passing error to the batch runner: 4 tries (30, 60 and 120 s apart), then async.
+        pytest.param(("batch", "async", "sync"), {"sync": 4 + 3, "async": 3}, id="all three"),
     ],
 )
 def test_end_to_end_azure_out_of_reach_stops_the_run_after_3_attempts(clock, strategies, attempts):
     """A wrong endpoint or no network: every request fails to connect, so each strategy gives up after 3."""
     fake = FakeAzure(disconnect={"*"})
     mr = mapreduce(fake.client(), clock, strategies=strategies, max_concurrency=1)
-    with pytest.raises(LLMSetupError, match="3 requests in a row couldn't reach Azure") as caught:
+    with pytest.raises(LLMSetupError, match="Azure couldn't be reached on 3 attempts in a row") as caught:
         mr.run(reviews(7), "review", "summary")
     assert "Couldn't connect to Azure OpenAI" in str(caught.value)  # the last error says what to check
     assert caught.value.outputs == [None] * 7
     assert Counter(tag for tag, _ in fake.requests) == attempts
     if "batch" in strategies:
-        assert len(fake.sent("POST", "/files")) == 1  # the upload couldn't connect: on to async
+        # Every upload couldn't connect; after the last submit retry, on to async.
+        assert len(fake.sent("POST", "/files")) == 1 + 3
+        assert [delay for delay in clock.sleeps if delay >= 30] == [30.0, 60.0, 120.0]
+        assert fake.batches == {}
     assert fake.chat_calls == []
 
 
@@ -2159,7 +3076,7 @@ def test_end_to_end_azure_out_of_reach_with_full_concurrency(clock):
     """With many requests in flight the async strategy may send more than 3 before it stops, but not all."""
     fake = FakeAzure(disconnect={"*"})
     mr = mapreduce(fake.client(batch_deployment=None), clock, strategies=("async",), map_batch_size=50)
-    with pytest.raises(LLMSetupError, match="couldn't reach Azure"):
+    with pytest.raises(LLMSetupError, match="couldn't be reached"):
         mr.run(reviews(50), "review", "summary")
     assert 3 <= len(fake.requests) < 50
 
@@ -2168,9 +3085,21 @@ def test_end_to_end_azure_out_of_reach_with_full_concurrency(clock):
     ("error", "words", "token_requests"),
     [
         # Each strategy stops at its first request: batch upload, async, sync.
-        pytest.param(credential_unavailable, "No Entra ID credential is available", 1 + 1 + 1, id="no credential"),
-        # A failed token request is retryable, so async and sync each give up after 3 in a row.
-        pytest.param(client_authentication_failed, "3 requests in a row couldn't reach", 1 + 3 + 3, id="token fails"),
+        pytest.param(no_credential_worked, "No Entra ID credential worked", 1 + 1 + 1, id="no credential"),
+        # A failed token request is retryable: the batch upload is tried 4 times (3 submit retries), then async
+        # and sync each give up after 3 in a row.
+        pytest.param(
+            client_authentication_failed,
+            "Azure couldn't be reached on 3 attempts in a row",
+            4 + 3 + 3,
+            id="token fails",
+        ),
+        pytest.param(
+            credential_unavailable, "Azure couldn't be reached on 3 attempts in a row", 4 + 3 + 3, id="unavailable"
+        ),
+        pytest.param(
+            service_request_error, "Azure couldn't be reached on 3 attempts in a row", 4 + 3 + 3, id="no token endpoint"
+        ),
     ],
 )
 def test_end_to_end_entra_id_sign_in_failure_stops_the_run(
@@ -2183,6 +3112,18 @@ def test_end_to_end_entra_id_sign_in_failure_stops_the_run(
     assert caught.value.outputs == [None] * 5
     assert fake_endpoint.requests == []  # no token, so nothing was sent
     assert requested == [FOUNDRY_SCOPE] * token_requests
+
+
+def test_end_to_end_with_the_real_default_azure_credential_and_no_credential(
+    fake_endpoint, no_working_credential, clock
+):
+    client = AzureChatClient("res", deployment="gpt-test", batch_deployment="gpt-batch")
+    with pytest.raises(LLMSetupError, match="^No Entra ID credential worked") as caught:
+        mapreduce(client, clock).run(reviews(5), "review", "summary")
+    assert "DefaultAzureCredential failed to retrieve a token" in str(caught.value)
+    assert caught.value.outputs == [None] * 5
+    assert fake_endpoint.requests == []
+    assert not [delay for delay in clock.sleeps if delay >= 30]  # a setup error isn't waited out
 
 
 def test_end_to_end_batch_only_client_never_calls_chat_completions(clock):

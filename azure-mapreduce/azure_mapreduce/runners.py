@@ -93,6 +93,8 @@ class _Reachability:
     def __init__(self) -> None:
         self.streak = 0
         self.succeeded = False
+        self.stopped = False
+        self.failed_requests = 0  # every request that couldn't reach Azure in the current streak
         self._counted = 0  # failures counted so far; a request started before the last one shares its outage
 
     def begin(self) -> int:
@@ -100,19 +102,26 @@ class _Reachability:
 
     def success(self) -> None:
         self.streak = 0
+        self.failed_requests = 0
         self.succeeded = True
 
     def failure(self, error: LLMRequestError, started: int | None = None) -> None:
         if error.code not in _UNREACHABLE_CODES:
             self.streak = 0  # Azure answered, so it can be reached
+            self.failed_requests = 0
             return
+        self.failed_requests += 1
         if started is not None and started < self._counted:
             return  # in flight during an outage that was already counted
         self._counted += 1
         self.streak += 1
         limit = _UNREACHABLE_LIMIT if self.succeeded else _UNREACHABLE_LIMIT_BEFORE_SUCCESS
         if self.streak >= limit:
-            raise LLMSetupError(f"{self.streak} requests in a row couldn't reach Azure. The last error: {error}")
+            self.stopped = True
+            raise LLMSetupError(
+                f"Azure couldn't be reached on {self.streak} attempts in a row ({self.failed_requests} requests "
+                f"failed). The last error: {error}"
+            )
 
 
 class SyncRunner:
@@ -172,6 +181,8 @@ class AsyncRunner:
 
             async def answer(request: LLMRequest) -> None:
                 async with semaphore:
+                    if reachability.stopped:  # woken after the strategy gave up: don't start another request
+                        return
                     started = reachability.begin()
                     try:
                         text = await complete(request.messages)
@@ -274,12 +285,20 @@ class _Chunk:
 
     requests: list[LLMRequest]
     payload: bytes
-    quota_retries: int = 0
     submit_retries: int = 0
     ready_at: float = 0.0  # don't submit before this time (backing off)
+    waiting_for: str = ""  # "quota" or "retry" while backing off
 
 
 @dataclass
+class _QuotaWait:
+    """The step's one budget for waiting out a full enqueued-token quota."""
+
+    retries: int = 0
+    ready_at: float = 0.0
+
+
+@dataclass(eq=False)
 class _Job:
     """A submitted batch job."""
 
@@ -342,6 +361,7 @@ class BatchRunner:
         active: list[_Job] = []
         submitted_any = False
         quota_blocked = False  # our own running jobs hold the quota: wait for one of them to end
+        quota = _QuotaWait()
 
         def give_up(chunks: list[_Chunk], reason: str) -> None:
             nonlocal finished_jobs
@@ -360,7 +380,7 @@ class BatchRunner:
                         job = self._submit(chunk)
                     except Exception as exc:
                         if _is_quota_error(exc):
-                            if self._requeue_for_quota(chunk, queue, active, exc):
+                            if self._requeue_for_quota(chunk, queue, bool(active), quota, exc):
                                 quota_blocked = bool(active)
                                 continue
                             # Full with none of our jobs holding it, for the whole wait: the rest gives up too.
@@ -383,26 +403,34 @@ class BatchRunner:
                         self._sleep(max(queue[0].ready_at - self._clock(), 1.0))
                     continue
                 self._sleep(self.poll_interval)
-                freed = requeued = False
-                for job in list(active):
-                    if not self._poll(job, progress):
-                        continue
+                # Check every job first, then deal with the ones that ended, so jobs that ended together are
+                # seen together (none of them holds any quota any more).
+                ended = [job for job in list(active) if self._poll(job, progress)]
+                for job in ended:
                     active.remove(job)
-                    if job.batch.status == "failed" and QUOTA_CODE in job.batch.error_codes:
-                        if self._quota_failure(job, queue, active, progress):
-                            requeued = True
-                            continue
+                setup_failed = [job for job in ended if _failed_with(job, BATCH_SETUP_CODES)]
+                quota_failed = [job for job in ended if job not in setup_failed and _failed_with(job, {QUOTA_CODE})]
+                freed = requeued = False
+                for job in ended:
+                    if job not in setup_failed and job not in quota_failed:
+                        freed = True  # a job ended for its own reasons, so its quota is free again
                         self._collect(job, results, failures, progress)
                         finished_jobs += 1
-                        if queue:
-                            give_up(list(queue), f"the Batch API's enqueued-token quota stayed full: {job.batch.id}")
-                            queue.clear()
+                if setup_failed:  # every job would fail the same way: the executor sends everything else elsewhere
+                    self._discard(setup_failed + quota_failed, progress)
+                    details = "; ".join(setup_failed[0].batch.errors[:3]) or "no details"
+                    raise LLMSetupError(
+                        f"Batch job {setup_failed[0].batch.id} failed validation, and every job would: {details}"
+                    )
+                for job in quota_failed:
+                    if self._quota_failure(job, queue, bool(active) or freed, quota, progress):
+                        requeued = True
                         continue
-                    if job.batch.status == "failed":
-                        self._check_setup_failure(job, progress)  # raises when every job would fail the same way
-                    freed = True  # a job ended for its own reasons, so its quota is free again
                     self._collect(job, results, failures, progress)
                     finished_jobs += 1
+                    if queue:
+                        give_up(list(queue), f"the Batch API's enqueued-token quota stayed full: {job.batch.id}")
+                        queue.clear()
                 if freed:
                     quota_blocked = False
                 elif requeued:
@@ -466,19 +494,28 @@ class BatchRunner:
                 )
             self._sleep(min(self.poll_interval, 5.0))
 
-    def _requeue_for_quota(self, chunk: _Chunk, queue: deque[_Chunk], active: list[_Job], error: object) -> bool:
-        """Put a chunk back after a full-quota error; False once it has waited long enough."""
-        if active:
-            # Our own jobs hold the quota: try again when one of them ends, without using up a retry.
+    def _requeue_for_quota(
+        self, chunk: _Chunk, queue: deque[_Chunk], ours_running: bool, quota: _QuotaWait, error: object
+    ) -> bool:
+        """Put a chunk back after a full-quota error; False once the step has waited long enough.
+
+        While our own jobs hold the quota the chunk simply waits for one of them to end. Otherwise the step backs
+        off 1, 2, 4, 8, 15 and 15 minutes; chunks that hit the full quota during the same wait share it.
+        """
+        chunk.waiting_for = "quota"
+        if ours_running:
             chunk.ready_at = 0.0
             log.info("The Batch API's token quota is full; waiting for a running job to finish.")
         else:
-            chunk.quota_retries += 1
-            if chunk.quota_retries > _QUOTA_RETRIES:
-                return False
-            delay = min(_QUOTA_BACKOFF_SECONDS * 2 ** (chunk.quota_retries - 1), _QUOTA_BACKOFF_MAX_SECONDS)
-            chunk.ready_at = self._clock() + delay
-            log.info("The Batch API's token quota is full (%s); trying again in %.0fs.", error, delay)
+            now = self._clock()
+            if quota.ready_at <= now:  # not already waiting: start the next wait
+                if quota.retries >= _QUOTA_RETRIES:
+                    return False
+                delay = min(_QUOTA_BACKOFF_SECONDS * 2**quota.retries, _QUOTA_BACKOFF_MAX_SECONDS)
+                quota.retries += 1
+                quota.ready_at = now + delay
+                log.info("The Batch API's token quota is full (%s); trying again in %.0fs.", error, delay)
+            chunk.ready_at = quota.ready_at
         queue.appendleft(chunk)
         return True
 
@@ -489,6 +526,7 @@ class BatchRunner:
         delay = _SUBMIT_BACKOFF_SECONDS * 2**chunk.submit_retries
         chunk.submit_retries += 1
         chunk.ready_at = self._clock() + delay
+        chunk.waiting_for = "retry"
         log.warning("Couldn't submit a batch job (%s); trying again in %.0fs.", error, delay)
         queue.appendleft(chunk)
         return True
@@ -541,26 +579,26 @@ class BatchRunner:
             return True
         return False
 
-    def _quota_failure(self, job: _Job, queue: deque[_Chunk], active: list[_Job], progress: StepProgress) -> bool:
+    def _quota_failure(
+        self, job: _Job, queue: deque[_Chunk], ours_running: bool, quota: _QuotaWait, progress: StepProgress
+    ) -> bool:
         """A job that failed validation because the token quota was full: True if its chunk was put back."""
         progress.advance(-job.shown)
         job.shown = 0
-        if not self._requeue_for_quota(job.chunk, queue, active, "; ".join(job.batch.errors[:1]) or job.batch.id):
+        reason = "; ".join(job.batch.errors[:1]) or job.batch.id
+        if not self._requeue_for_quota(job.chunk, queue, ours_running, quota, reason):
             return False  # _collect reports it and cleans up
         if self.cleanup:
             self._delete(job.input_file_id)
         return True
 
-    def _check_setup_failure(self, job: _Job, progress: StepProgress) -> None:
-        """Raise when a job failed validation for a reason every other job would hit too."""
-        if not set(job.batch.error_codes) & BATCH_SETUP_CODES:
-            return
-        progress.advance(-job.shown)
-        job.shown = 0
-        if self.cleanup:
-            self._delete(job.input_file_id)
-        details = "; ".join(job.batch.errors[:3]) or "no details"
-        raise LLMSetupError(f"Batch job {job.batch.id} failed validation, and every job would: {details}")
+    def _discard(self, jobs: list[_Job], progress: StepProgress) -> None:
+        """Forget jobs whose requests go to the next strategy: take back their estimates, delete their input."""
+        for job in jobs:
+            progress.advance(-job.shown)
+            job.shown = 0
+            if self.cleanup:
+                self._delete(job.input_file_id)
 
     def _collect(self, job: _Job, results: dict[int, str], failures: dict[int, LLMRequestError], progress) -> None:
         """Read an ended job's output and error files into results and failures."""
@@ -643,7 +681,8 @@ class BatchRunner:
         if statuses:
             parts.append(", ".join(f"{count} {status}" for status, count in sorted(statuses.items())))
         if queue and (quota_blocked or queue[0].ready_at > self._clock()):
-            parts.append("waiting for token quota")
+            waiting_for_quota = quota_blocked or queue[0].waiting_for == "quota"
+            parts.append("waiting for token quota" if waiting_for_quota else "retrying a submission")
         progress.note(" · ".join(parts))
 
     # --- housekeeping ------------------------------------------------------------------------------------
@@ -674,6 +713,10 @@ class BatchRunner:
 
 def _is_quota_error(exc: BaseException) -> bool:
     return getattr(exc, "code", None) == QUOTA_CODE or QUOTA_CODE in str(exc)
+
+
+def _failed_with(job: _Job, codes: set[str]) -> bool:
+    return job.batch.status == "failed" and bool(set(job.batch.error_codes) & codes)
 
 
 def _is_transient(exc: BaseException) -> bool:

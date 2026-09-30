@@ -109,8 +109,15 @@ def bar_safe_logging() -> Iterator[None]:
         if type(handler) is logging.StreamHandler and handler.stream in (sys.stdout, sys.stderr)
     ]
     originals = [handler.setStream(_BarSafeStream(handler.stream)) for handler in handlers]  # type: ignore[arg-type]
+    # With no logging set up at all, Python prints warnings through its last-resort handler: route that too.
+    last_resort = logging.lastResort
+    if last_resort is not None and type(last_resort).__name__ == "_StderrHandler":
+        replacement = logging.StreamHandler(_BarSafeStream(sys.stderr))
+        replacement.setLevel(last_resort.level)
+        logging.lastResort = replacement
     try:
         yield
     finally:
         for handler, stream in zip(handlers, originals, strict=True):
             handler.setStream(stream)
+        logging.lastResort = last_resort

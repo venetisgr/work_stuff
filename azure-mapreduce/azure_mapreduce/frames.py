@@ -10,8 +10,9 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from collections.abc import Iterable, Mapping, Sequence
-from datetime import UTC, datetime, tzinfo
+from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -70,17 +71,25 @@ def _plain(value: Any) -> Any:
     if hasattr(value, "asDict"):
         value = value.asDict(recursive=True)
     if isinstance(value, Mapping):
-        return {str(key): _plain(item) for key, item in value.items()}
+        return {_key(key): _plain(item) for key, item in value.items()}
     if isinstance(value, list | tuple | set | frozenset):
         return [_plain(item) for item in value]
     if isinstance(value, bytes | bytearray):
         return bytes(value).decode("utf-8", "replace")
-    if getattr(getattr(value, "dtype", None), "kind", None) in ("M", "m"):  # numpy dates and durations
-        # as strings: .tolist() would turn nanosecond ones into bare integers
-        return value.astype(str).tolist() if getattr(value, "ndim", 0) else str(value)
+    kind = getattr(getattr(value, "dtype", None), "kind", None)
+    if kind in ("M", "m"):  # numpy dates and durations, item by item: .tolist() turns nanosecond ones into integers
+        if getattr(value, "ndim", 0):
+            return [_plain(item) for item in value]
+        if kind == "m" and value == value:  # a duration (not NaT) reads best as a Python timedelta: "1:00:00"
+            return str(value.astype("timedelta64[us]").item())
+        return str(value)
     if hasattr(value, "tolist") and getattr(value, "ndim", None) is not None:
         return _plain(value.tolist()) if value.ndim else value.item()
     return value
+
+
+def _key(key: object) -> str:
+    return bytes(key).decode("utf-8", "replace") if isinstance(key, bytes | bytearray) else str(key)
 
 
 def _is_missing(value: object) -> bool:
@@ -155,30 +164,49 @@ class SparkFrame(Frame):
         _check_single_column(column, self.df.columns)
         if self.id_column is not None:
             _check_single_column(self.id_column, self.df.columns)
+            self._check_id_type(self.df.schema[self.id_column].dataType)
         self.check_names(output_column, error_column)
+
+    def _check_id_type(self, data_type: Any) -> None:
+        """Reject id types the replies can't be joined back on exactly, before any request is sent."""
+        unjoinable = _type_names(data_type) & {"MapType", "VariantType", "UserDefinedType", *_SPATIAL_TYPES}
+        if unjoinable:
+            raise ConfigError(
+                f'id_column "{self.id_column}" is of a type Spark can\'t join on ({", ".join(sorted(unjoinable))}); '
+                "use a column of numbers or strings."
+            )
+        collations = _collations(data_type) - {"UTF8_BINARY"}
+        if collations:
+            raise ConfigError(
+                f'id_column "{self.id_column}" compares strings with the {", ".join(sorted(collations))} collation, '
+                "so ids that differ (in case, say) could match each other; cast it to a plain string first."
+            )
 
     def values(self, column: str) -> list[Any]:
         columns = self.df.columns
         _check_single_column(column, columns)
         if self.id_column is None:
             index = columns.index(column)
+            text_type = self.df.schema.fields[index].dataType
             self._table = _collect_arrow(self.df)
             if self._table is not None:
-                return self._arrow_values(self._table.column(index), self.df.schema.fields[index].dataType)
-            self._rows = self.df.collect()
-            return [row[index] for row in self._rows]
+                return self._session_times(_arrow_list(self._table.column(index)), text_type)
+            self._rows = _collect_rows(self.df)
+            return self._session_times([row[index] for row in self._rows], text_type)
 
         from pyspark.sql import functions as F
 
         _check_single_column(self.id_column, columns)
+        self._check_id_type(self.df.schema[self.id_column].dataType)
         pairs = self.df.select(F.col(_quoted(self.id_column)), F.col(_quoted(column)))
+        text_type = pairs.schema.fields[1].dataType
         table = _collect_arrow(pairs)
         if table is not None:
-            ids = table.column(0).to_pylist()
-            texts = self._arrow_values(table.column(1), pairs.schema.fields[1].dataType)
+            ids, texts = table.column(0).to_pylist(), _arrow_list(table.column(1))
         else:
-            rows = pairs.collect()
+            rows = _collect_rows(pairs)
             ids, texts = [row[0] for row in rows], [row[1] for row in rows]
+        texts = self._session_times(texts, text_type)
         self._check_ids(ids)
         self._ids = ids
         self._id_array = table.column(0) if table is not None else None
@@ -253,20 +281,13 @@ class SparkFrame(Frame):
         if unique != len(ids):
             raise ConfigError(f'id_column "{self.id_column}" has repeated values; every row needs its own id.')
 
-    def _arrow_values(self, array: Any, data_type: Any) -> list[Any]:
-        """A column collected through Arrow as Python values, the way collect() would give them.
-
-        Maps come out as dicts, and timestamps as wall-clock times in the session time zone (what df.show()
-        prints) rather than as UTC.
-        """
-        try:
-            values = array.to_pylist(maps_as_pydicts="lossy")
-        except TypeError:  # pyarrow before 13
-            values = array.to_pylist()
-        if _has_type(data_type, "TimestampType"):
-            zone = _session_zone(self.df)
-            values = [_wall_clock(value, zone) for value in values]
-        return values
+    def _session_times(self, values: list[Any], data_type: Any) -> list[Any]:
+        """Timestamps as wall-clock times in the session time zone, what df.show() prints, whichever way the
+        data was collected (Arrow gives UTC, Rows give the driver's local time)."""
+        if "TimestampType" not in _type_names(data_type):
+            return values
+        zone = _session_zone(self.df)
+        return [_wall_clock(value, data_type, zone) for value in values]
 
     def _same(self, left: str | None, right: str | None) -> bool:
         if left is None or right is None:
@@ -296,6 +317,27 @@ _NOT_THROUGH_ARROW = {
 }
 
 
+_SPATIAL_TYPES = {"GeometryType", "GeographyType"}
+
+
+def _arrow_list(array: Any) -> list[Any]:
+    """An Arrow column as Python values the way collect() gives them (maps as dicts, not key-value pairs)."""
+    try:
+        return array.to_pylist(maps_as_pydicts="lossy")
+    except TypeError:  # pyarrow before 13
+        return array.to_pylist()
+
+
+def _collect_rows(df: Any) -> list[Any]:
+    try:
+        return df.collect()
+    except NotImplementedError as exc:  # a type PySpark can't turn into Python values
+        raise ConfigError(
+            f"Spark can't hand this DataFrame's values to Python ({exc}). Cast or drop the columns of that type, "
+            "or pass id_column so that only the ids and texts are collected."
+        ) from exc
+
+
 def _collect_arrow(df: Any) -> Any:
     """The DataFrame as a pyarrow Table (PySpark 4+), which keeps timestamps exact; None if it can't be.
 
@@ -306,17 +348,49 @@ def _collect_arrow(df: Any) -> Any:
         return None
     try:
         return df.toArrow()
-    except (ImportError, TypeError, ValueError, NotImplementedError) as exc:  # a conversion problem, not the query
+    except _arrow_conversion_errors() as exc:  # a conversion problem, not the query failing
         log.debug("Collecting through Arrow failed (%s); collecting rows instead.", exc)
         return None
 
 
+def _arrow_conversion_errors() -> tuple[type[BaseException], ...]:
+    errors: tuple[type[BaseException], ...] = (ImportError, TypeError, ValueError, NotImplementedError)
+    try:  # raised while the schema is converted, before the query runs
+        from pyspark.errors.exceptions.base import UnsupportedOperationException
+    except ImportError:  # pragma: no cover - older PySpark
+        return errors
+    return (*errors, UnsupportedOperationException)
+
+
 def _arrow_safe(data_type: Any) -> bool:
-    return not any(_type_names(data_type) & _NOT_THROUGH_ARROW)
+    return not (_type_names(data_type) & _NOT_THROUGH_ARROW) and not _repeated_field_names(data_type)
 
 
-def _has_type(data_type: Any, name: str) -> bool:
-    return data_type is not None and name in _type_names(data_type)
+def _repeated_field_names(data_type: Any) -> bool:
+    """True if a nested struct has two fields of the same name (Arrow refuses those; a join can make them)."""
+    fields = getattr(data_type, "fields", None) or []
+    names = [field.name for field in fields]
+    if isinstance(data_type, _struct_class()) and len(names) != len(set(names)):
+        return True
+    nested = [field.dataType for field in fields]
+    nested += [getattr(data_type, name) for name in ("elementType", "keyType", "valueType") if hasattr(data_type, name)]
+    return any(_repeated_field_names(item) for item in nested)
+
+
+def _struct_class() -> type:
+    from pyspark.sql.types import StructType
+
+    return StructType
+
+
+def _collations(data_type: Any) -> set[str]:
+    found = {data_type.collation} if isinstance(getattr(data_type, "collation", None), str) else set()
+    for field in getattr(data_type, "fields", None) or []:
+        found |= _collations(field.dataType)
+    for name in ("elementType", "keyType", "valueType"):
+        if hasattr(data_type, name):
+            found |= _collations(getattr(data_type, name))
+    return found
 
 
 def _type_names(data_type: Any) -> set[str]:
@@ -331,20 +405,50 @@ def _type_names(data_type: Any) -> set[str]:
     return names
 
 
+_OFFSET = re.compile(r"^(?:GMT|UTC|UT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
+
 def _session_zone(df: Any) -> tzinfo:
+    """spark.sql.session.timeZone as a tzinfo: a region ("Europe/Paris") or an offset ("+01:00", "GMT+05:30")."""
     try:
-        return ZoneInfo(str(df.sparkSession.conf.get("spark.sql.session.timeZone")))
-    except Exception:  # an offset such as "+01:00", or no setting
+        name = str(df.sparkSession.conf.get("spark.sql.session.timeZone")).strip()
+    except Exception:  # pragma: no cover - a session that can't report its settings
+        return UTC
+    match = _OFFSET.match(name)
+    if match:
+        sign, hours, minutes = match.groups()
+        offset = timedelta(hours=int(hours), minutes=int(minutes or 0))
+        return timezone(-offset if sign == "-" else offset)
+    try:
+        return ZoneInfo(name)
+    except Exception:  # an unknown name
+        log.debug("Unknown session time zone %r; showing timestamps in UTC.", name)
         return UTC
 
 
-def _wall_clock(value: Any, zone: tzinfo) -> Any:
-    if isinstance(value, datetime) and value.tzinfo is not None:
-        return value.astimezone(zone).replace(tzinfo=None)
-    if isinstance(value, dict):
-        return {key: _wall_clock(item, zone) for key, item in value.items()}
-    if isinstance(value, list | tuple):
-        return type(value)(_wall_clock(item, zone) for item in value)
+def _wall_clock(value: Any, data_type: Any, zone: tzinfo) -> Any:
+    """Convert the TIMESTAMP values inside a value, following its Spark type (TIMESTAMP_NTZ is left alone)."""
+    if value is None:
+        return None
+    type_name = type(data_type).__name__
+    if type_name == "TimestampType":
+        if not isinstance(value, datetime):
+            return value
+        aware = value if value.tzinfo is not None else value.astimezone()  # Rows are in the driver's zone
+        return aware.astimezone(zone).replace(tzinfo=None)
+    fields = getattr(data_type, "fields", None)
+    if fields is not None and type_name == "StructType":
+        items = value.asDict() if hasattr(value, "asDict") else value
+        if isinstance(items, Mapping):
+            return {field.name: _wall_clock(items.get(field.name), field.dataType, zone) for field in fields}
+        return value
+    if type_name == "ArrayType" and isinstance(value, list | tuple):
+        return [_wall_clock(item, data_type.elementType, zone) for item in value]
+    if type_name == "MapType" and isinstance(value, Mapping):
+        return {
+            _wall_clock(key, data_type.keyType, zone): _wall_clock(item, data_type.valueType, zone)
+            for key, item in value.items()
+        }
     return value
 
 
@@ -361,10 +465,10 @@ def _has_nan(value: Any) -> bool:
 
 
 def _frozen(value: Any) -> Any:
-    """A hashable stand-in for an id (Arrow hands structs back as dicts and arrays as lists)."""
+    """A hashable stand-in for an id (Arrow hands structs back as dicts and arrays as lists; Rows are tuples)."""
     if isinstance(value, Mapping):
         return tuple((key, _frozen(item)) for key, item in value.items())
-    if isinstance(value, list):
+    if isinstance(value, list | tuple):
         return tuple(_frozen(item) for item in value)
     return value
 

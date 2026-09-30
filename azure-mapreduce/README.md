@@ -14,9 +14,12 @@ levels with a bar per level counting its groups.
 
 ```text
 Map [batch]: 100%|██████████| 2500/2500 [14:02<00:00, 2.97record/s, jobs 3/3 done]
-Reduce:  75%|███████▌  | 3/4 [09:41<03:13, level 4: 3 texts in 1 group of up to 10]
-Level 4/4: 3 → 1 [async]:   0%|          | 0/1 [00:00<?, ?group/s]
+Reduce:  75%|███████▌  | 3/4 [31:18<10:26, 626.00s/level, level 4: 3 texts in 1 group of up to 10]
+Level 4/4: 3 → 1 [batch]:   0%|          | 0/1 [02:03<?, ?group/s, jobs 0/1 done · 1 in_progress]
 ```
+
+The map bar counts records; the outer reduce bar counts levels (2,500 summaries in groups of 10 take four:
+2,500 → 250 → 25 → 3 → 1), and the inner bar counts the current level's groups, with the batch jobs behind them.
 
 ## Quick start
 
@@ -45,22 +48,26 @@ mr = MapReduce(
     reduce_group_size=10,  # map outputs joined into each reduce request
 )
 
-reviews = pd.DataFrame({"review": ["Great battery life...", "Stopped working after a week...", ...]})
+reviews = pd.DataFrame({"review": ["Great battery life.", "Stopped working after a week.", "Does the job."]})
 result = mr.run(reviews, column="review", output_column="summary")
 
 result.frame  # the reviews with a "summary" column
 result.output  # the single reduced text
-result.levels  # every level: levels[0] are the summaries, levels[-1] == [result.output]
+result.levels  # every level: levels[0] holds the map outputs that went into the reduce (empty ones left out),
+#                and levels[-1] == [result.output]
 result.complete  # True when no record or reduce group failed
 ```
+
+With the Batch API first in line, even a tiny run waits for a batch job (minutes, sometimes hours). To try things
+out, pass `strategies=("async", "sync")`.
 
 The two steps also work on their own:
 
 ```python
 summaries = mr.map(reviews, "review", "summary", error_column="summary_error")
 overview = mr.reduce(summaries, column="summary").output
-overview = mr.reduce(["text one", "text two", ...]).output  # any list of texts
-outputs = mr.map_texts(["text one", "text two", ...])  # the map step on a plain list
+overview = mr.reduce(["first text", "second text"]).output  # any list of texts
+outputs = mr.map_texts(["first text", "second text"])  # the map step on a plain list
 ```
 
 `AzureChatClient.from_env()` reads `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_DEPLOYMENT`,
@@ -82,15 +89,17 @@ quota allows.
 
 - **Without `id_column`** the whole DataFrame is collected and rebuilt with the new columns at the end, keeping
   every column's type and the row order.
-- **With `id_column`** (unique values, no nulls or NaN, not even inside a struct) only the ids and texts are
-  collected, and the replies are joined back on the id. The column order is kept, but, as with any Spark join,
+- **With `id_column`** (unique values, no nulls or NaN, not even inside a struct; numbers, strings, dates or
+  structs of them, but not maps, VARIANT or strings with a collation other than the default) only the ids and
+  texts are collected, and the replies are joined back on the id. The column order is kept, but, as with any Spark join,
   the row order may not be. This suits wide or large tables, and it's the way to go if rebuilding the DataFrame
   fails (Spark Connect limits how much local data a DataFrame can be built from).
 
 On PySpark 4 the data is collected through Arrow (install `pyarrow`, which the `[spark]` extra does), which keeps
 timestamps exact: a plain `collect()` can't tell apart the two occurrences of the hour repeated when daylight
 saving time ends. DataFrames holding types Arrow can't carry both ways (user-defined types such as ML vectors,
-VARIANT, intervals) are collected as Rows instead.
+VARIANT, intervals, structs with two fields of the same name) are collected as Rows instead. Year-month and
+calendar intervals can't reach Python at all: pass `id_column`, or cast or drop those columns.
 
 It works with classic Spark and Spark Connect (Databricks serverless and shared clusters; locally that needs
 `pyspark[connect]`). Column names with dots are fine, and an output column replaces an existing one whose name
@@ -121,8 +130,9 @@ What happens when something goes wrong:
   strategy, and it's skipped for the rest of the run. Strategies the client isn't set up for are skipped quietly;
   without a `batch_deployment`, for example, the chain starts at `async`.
 - **The Batch API's enqueued-token quota is full**: the job is submitted again once one of the run's own jobs
-  finishes, or, if none is running, after waiting 1, 2, 4, 8, 15 and 15 minutes. If the quota is still full after
-  that, the step's remaining requests fall back to full price.
+  finishes, or, if none is running, after waiting 1, 2, 4, 8, 15 and 15 minutes (one budget for the whole step,
+  shared by every job that hits the full quota). If the quota is still full after that, the step's remaining
+  requests fall back to full price.
 - **Submitting a batch job hits a passing error** (a timeout, a 5xx): it's tried again after 30, 60 and 120
   seconds. Creating a job isn't retried blindly, since a retry after a lost response could start a second, billed
   job: the framework first looks for a job already running on the same input file.
@@ -139,7 +149,8 @@ What happens when something goes wrong:
 - **The setup is wrong** (bad key, missing role, unknown deployment, no Entra ID credential, an endpoint that
   can't be reached three times in a row): the last strategy stops the run with an `LLMSetupError` that says what
   to check. Requests that fail together in one outage count once, so a network blip during a busy async run
-  doesn't end the strategy; ten outages in a row after a success do.
+  doesn't end the strategy; ten outages in a row after a success do. Connecting times out after 15 seconds, so an
+  endpoint that silently drops traffic is noticed quickly.
 
 Requests that fail every strategy leave `None` in the output (and their error in `error_column`, if you set
 one). For the map, `on_error="warn"` (the default) sums up what failed in a warning and goes on, and
@@ -147,10 +158,11 @@ one). For the map, `on_error="warn"` (the default) sums up what failed in a warn
 the final text, so `reduce_on_error` defaults to `"raise"`; with `"warn"`, the result's `reduce_failures` (and
 `complete`) show what was left out.
 
-Nothing already paid for is lost when a step stops, even on Ctrl+C: the exception carries the replies that did
-arrive in `.outputs` (and the requests that failed for good in `.failures`), `map()` and `run()` add the partial
-DataFrame as `.frame`, a reduce that stops adds the finished levels as `.levels`, and `run()` attaches the mapped
-DataFrame as `.frame` when the reduce stops.
+Replies that arrived aren't lost when a step stops, even on Ctrl+C: the exception carries them in `.outputs` (and
+the requests that failed for good in `.failures`), `map()` and `run()` add the partial DataFrame as `.frame`, a
+reduce that stops adds the finished levels as `.levels`, and `run()` attaches the mapped DataFrame as `.frame` when
+the reduce stops. The one exception is batch jobs still running when you press Ctrl+C: they're cancelled, and
+whatever they had finished isn't downloaded (on Azure, their output files expire with the rest).
 
 ## Options
 
@@ -174,7 +186,7 @@ DataFrame as `.frame` when the reduce stops.
 | `batch_cleanup` | True | Delete the uploaded input files and the downloaded output files afterwards. |
 | `on_error` | `"warn"` | Records that fail every strategy: `"warn"` or `"raise"`. |
 | `reduce_on_error` | `"raise"` | Reduce groups that fail every strategy: `"raise"` or `"warn"` (leave the group out). |
-| `show_progress` | True | Show the tqdm bars (`tqdm.auto`, so they render as widgets in notebooks). |
+| `show_progress` | True | Show the tqdm bars (`tqdm.auto`: widgets in notebooks when `ipywidgets` is installed, text bars otherwise). |
 
 Prompts replace only the `{text}` placeholder, so other braces (JSON examples, say) are left as they are. Use
 `placeholder="<<TEXT>>"` for a different marker.
@@ -201,9 +213,10 @@ fit in a single group, uses `reduce_prompt`. Map outputs that are `None` are lef
   skipped after a warning and everything is sent at full price.
 - **Your own client**: pass `client=openai.OpenAI(...)` or `openai.AzureOpenAI(...)`, plus
   `async_client_factory=lambda: openai.AsyncOpenAI(...)` for the async strategy (it must return a new client each
-  time). With a legacy `openai.AzureOpenAI(api_version=...)` client, batch files use the classic path
-  `/chat/completions` and no file expiry, which older API versions don't take (set `batch_endpoint` and
-  `batch_file_expiry` to override).
+  time); without a factory the async strategy is skipped, with a warning. With an `openai.AzureOpenAI` client on
+  the classic, `api-version` based API, batch files use the classic path `/chat/completions` and no file expiry,
+  which older API versions don't take (an `AzureOpenAI` client pointed at `/openai/v1/` gets the v1 settings; set
+  `batch_endpoint` and `batch_file_expiry` to override).
 - **Model settings** such as `temperature`, `max_completion_tokens`, `reasoning_effort` or `response_format` go
   in `completion_options` and are sent with every request, batch or not. Settings the `openai` SDK doesn't know
   by name are passed through in the request body. SDK call options (`timeout`, `extra_body`, `extra_headers`,
@@ -225,8 +238,11 @@ fit in a single group, uses `reduce_prompt`. Map outputs that are `None` are lef
   (the framework gives them a loop on a worker thread).
 - **Interrupting**: stopping a run (Ctrl+C, or "Interrupt kernel" in a notebook) cancels its async requests and
   its running batch jobs.
-- **Logging**: while the bars are shown, log lines from console handlers are printed above the bars instead of
-  through them. Handlers keep their levels, and none are added.
+- **Logging**: while the bars are shown, log lines from console handlers (and Python's own last-resort warning
+  output, when logging isn't set up) are printed above the bars instead of through them. Handlers keep their
+  levels, and none are added.
+- **Odd characters**: a lone surrogate in a text (half of an emoji cut off, say) is replaced with `?` so every
+  route can send it.
 - **Context length**: the reduce groups by count, so choose `reduce_group_size` so that that many map outputs
   (plus the prompt) fit in the model's context window. Keep map outputs short with the map prompt or
   `max_completion_tokens`.

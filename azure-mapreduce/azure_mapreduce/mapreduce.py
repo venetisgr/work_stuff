@@ -381,8 +381,8 @@ class MapReduce:
         content = prompt(text) if callable(prompt) else prompt.replace(self.placeholder, text)
         messages: Messages = []
         if self.system_prompt:
-            messages.append({"role": "system", "content": self.system_prompt})
-        messages.append({"role": "user", "content": content})
+            messages.append({"role": "system", "content": _sendable(self.system_prompt)})
+        messages.append({"role": "user", "content": _sendable(content)})
         return messages
 
     def _new_executor(self) -> FallbackExecutor:
@@ -418,6 +418,15 @@ class MapReduce:
             yield
 
 
+def _sendable(text: str) -> str:
+    """Text every route can send: lone surrogates (half an emoji cut off, say) become "?"."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-8", "replace").decode("utf-8")
+    return text
+
+
 def _count(number: int, noun: str) -> str:
     return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
 
@@ -444,11 +453,11 @@ def _with_outputs(
     except BaseException as exc:
         attach(exc, outputs=outputs, failures=failures)
         if isinstance(exc, Exception) and is_spark_dataframe(getattr(frame, "df", None)):
-            log.error(
-                "Couldn't add the replies to the Spark DataFrame (%s). They're kept on the exception as .outputs "
-                "(in row order); passing id_column avoids rebuilding the DataFrame.",
-                exc,
-            )
+            if getattr(frame, "id_column", None) is None:
+                hint = "They're kept on the exception as .outputs, in row order; id_column avoids the rebuild."
+            else:
+                hint = "They're kept on the exception as .outputs, in the order the ids were collected."
+            log.error("Couldn't add the replies to the Spark DataFrame (%s). %s", exc, hint)
         raise
 
 

@@ -10,10 +10,12 @@ import signal
 import threading
 import time
 import traceback
+import types
 
 import pytest
 
 from azure_mapreduce import progress as progress_module
+from azure_mapreduce import runners as runners_module
 from azure_mapreduce.errors import ConfigError, LLMRequestError, LLMSetupError
 from azure_mapreduce.progress import StepProgress
 from azure_mapreduce.runners import (
@@ -24,6 +26,7 @@ from azure_mapreduce.runners import (
     LLMRequest,
     SyncRunner,
     _main_error,
+    _Reachability,
     build_executor,
     chunked,
     run_coroutine,
@@ -119,14 +122,16 @@ class TimedAsyncClient:
     """An async-only client whose replies take real (short) time, to watch concurrency, chunks and cancellation.
 
     ``script[content] = (delay, error)``: wait ``delay`` seconds, then raise ``error`` if set. Unscripted prompts
-    wait ``delay`` and reply ``"<content>"``.
+    wait ``delay`` and reply ``"<content>"``. With ``tick``, requests wait in steps of at most ``tick`` seconds, so
+    the event loop keeps waking up (as it does with a real HTTP client) and sees an interrupt promptly.
     """
 
     supports_async = True
 
-    def __init__(self, script=None, delay=0.005):
+    def __init__(self, script=None, delay=0.005, tick=None):
         self.script = dict(script or {})
         self.delay = delay
+        self.tick = tick
         self.in_flight = 0
         self.max_in_flight = 0
         self.events: list[tuple[str, str]] = []
@@ -144,7 +149,12 @@ class TimedAsyncClient:
             self.max_in_flight = max(self.max_in_flight, self.in_flight)
             self.events.append(("start", text))
             try:
-                await asyncio.sleep(delay)
+                if self.tick:
+                    deadline = time.monotonic() + delay
+                    while (left := deadline - time.monotonic()) > 0:
+                        await asyncio.sleep(min(left, self.tick))
+                else:
+                    await asyncio.sleep(delay)
             except asyncio.CancelledError:
                 self.events.append(("cancelled", text))
                 raise
@@ -548,6 +558,85 @@ def test_an_exception_that_refuses_the_results_attribute_still_propagates_unchan
         run_executor([only], 2)
     assert caught.value is error
     assert error.results == "fixed"
+    assert error.failures == {}  # the other attribute is still attached
+
+
+def test_last_strategy_raising_carries_the_final_failures_of_earlier_strategies():
+    blocked = permanent()
+    first = ScriptedRunner("a", {0: blocked, 1: retryable(), 2: retryable()})
+    second = ScriptedRunner("b", raises=LLMSetupError("No deployment named gpt-x"), raise_after=1)
+    with pytest.raises(LLMSetupError) as caught:
+        run_executor([first, second], 4)
+    assert caught.value.results == {1: "b:1", 3: "a:3"}
+    assert caught.value.failures == {0: blocked}
+    assert type(caught.value.failures) is dict
+
+
+def test_last_strategy_raising_with_no_final_failure_carries_empty_failures():
+    only = ScriptedRunner("a", {0: retryable()}, raises=LLMSetupError("broken"), raise_after=2)
+    with pytest.raises(LLMSetupError) as caught:
+        run_executor([only], 3)
+    assert caught.value.results == {1: "a:1"}
+    assert caught.value.failures == {}  # t0 failed in the strategy that raised, so it isn't final
+
+
+# --- FallbackExecutor: interrupts keep what was paid for -------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "make_interrupt",
+    [KeyboardInterrupt, lambda: SystemExit(1), asyncio.CancelledError],
+    ids=["ctrl-c", "exit", "cancel"],
+)
+def test_an_interrupt_from_a_strategy_carries_the_replies_and_final_failures(make_interrupt):
+    interrupt = make_interrupt()
+    blocked = permanent()
+    first = ScriptedRunner("a", {0: blocked, 1: retryable(), 2: retryable()})
+    second = ScriptedRunner("b", raises=interrupt, raise_after=1)
+    third = ScriptedRunner("c")
+    executor = FallbackExecutor([first, second, third])
+    progress = RecordingProgress(4)
+    with pytest.raises(type(interrupt)) as caught:
+        executor.run(make_requests(4), progress, batch_size=10)
+    assert caught.value is interrupt
+    assert interrupt.results == {1: "b:1", 3: "a:3"}
+    assert interrupt.failures == {0: blocked}
+    assert type(interrupt.results) is dict and type(interrupt.failures) is dict
+    assert third.calls == []  # an interrupt isn't a broken strategy: nothing falls back
+    assert executor.broken == set()
+    assert progress.strategies == ["a", "b"]
+
+
+def test_an_interrupt_in_the_first_strategy_carries_its_replies():
+    first = ScriptedRunner("a", raises=KeyboardInterrupt(), raise_after=2)
+    second = ScriptedRunner("b")
+    with pytest.raises(KeyboardInterrupt) as caught:
+        run_executor([first, second], 4)
+    assert caught.value.results == {0: "a:0", 1: "a:1"}
+    assert caught.value.failures == {}
+    assert second.calls == []
+
+
+def test_an_interrupt_in_the_last_strategy_carries_the_replies_too():
+    first = ScriptedRunner("a", {1: retryable()})
+    second = ScriptedRunner("b", raises=KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt) as caught:
+        run_executor([first, second], 3)
+    assert caught.value.results == {0: "a:0", 2: "a:2"}
+    assert caught.value.failures == {}
+
+
+def test_the_replies_on_an_interrupt_are_a_snapshot():
+    class KeepsTheDict(ScriptedRunner):
+        def run(self, requests, results, progress, batch_size):
+            self.kept = results
+            return super().run(requests, results, progress, batch_size)
+
+    only = KeepsTheDict("a", raises=KeyboardInterrupt(), raise_after=1)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        run_executor([only], 2)
+    only.kept[1] = "written late by a straggler"
+    assert caught.value.results == {0: "a:0"}
 
 
 # --- FallbackExecutor: availability and edge cases -------------------------------------------------------
@@ -800,14 +889,18 @@ def test_sync_runner_stops_after_three_unreachable_requests_before_any_success(c
     results: dict[int, str] = {}
     with pytest.raises(LLMSetupError) as caught:
         SyncRunner(client).run(make_requests(6), results, RecordingProgress(6), batch_size=10)
-    assert str(caught.value) == f"3 requests in a row couldn't reach Azure. The last error: request failed ({code})"
+    assert str(caught.value) == (
+        f"Azure couldn't be reached on 3 attempts in a row (3 requests failed). The last error: request failed ({code})"
+    )
     assert len(client.calls["sync"]) == 3  # nothing sent after the third
     assert results == {}
 
 
 def test_sync_runner_counts_connection_and_credential_failures_in_one_streak():
     client = FakeClient(sync_responder=pattern_responder(["credential", "connection", "credential", "ok"]))
-    with pytest.raises(LLMSetupError, match=r"^3 requests in a row .* request failed \(credential\)$"):
+    with pytest.raises(
+        LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row .* request failed \(credential\)$"
+    ):
         SyncRunner(client).run(make_requests(4), {}, RecordingProgress(4), batch_size=10)
     assert len(client.calls["sync"]) == 3
 
@@ -827,7 +920,10 @@ def test_sync_runner_allows_ten_unreachable_requests_in_a_row_after_a_success():
     results: dict[int, str] = {}
     with pytest.raises(LLMSetupError) as caught:
         SyncRunner(client).run(make_requests(len(pattern)), results, RecordingProgress(len(pattern)), 100)
-    assert str(caught.value) == "10 requests in a row couldn't reach Azure. The last error: request failed (credential)"
+    assert str(caught.value) == (
+        "Azure couldn't be reached on 10 attempts in a row (10 requests failed). "
+        "The last error: request failed (credential)"
+    )
     assert len(client.calls["sync"]) == 21  # 9 in a row were fine; the 10th of the second run stopped it
     assert results == {0: "ok", 10: "ok"}
 
@@ -865,7 +961,7 @@ def test_sync_runner_other_failures_do_not_lift_the_limit_to_ten():
     """Only a reply shows the deployment works; before one, three unreachable requests in a row stop the run."""
     pattern = ["rate_limit", "content_filter"] + ["connection"] * 3 + ["ok"]
     client = FakeClient(sync_responder=pattern_responder(pattern))
-    with pytest.raises(LLMSetupError, match=r"^3 requests in a row"):
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
         SyncRunner(client).run(make_requests(len(pattern)), {}, RecordingProgress(len(pattern)), 100)
     assert len(client.calls["sync"]) == 5
 
@@ -883,7 +979,7 @@ def test_unreachable_last_strategy_raises_a_setup_error_carrying_the_replies():
     pattern = ["ok", "ok"] + ["connection"] * 10 + ["ok"] * 3
     client = FakeClient(batch_deployment=None, sync_responder=pattern_responder(pattern))
     executor = build_executor(client, ("sync",))
-    with pytest.raises(LLMSetupError, match=r"^10 requests in a row") as caught:
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 10 attempts in a row") as caught:
         executor.run(make_requests(len(pattern)), RecordingProgress(len(pattern)), batch_size=100)
     assert caught.value.results == {0: "ok", 1: "ok"}
     assert len(client.calls["sync"]) == 12
@@ -1145,11 +1241,6 @@ def test_unexpected_async_error_falls_back_to_sync_for_what_is_left():
     assert executor.broken == {"async"}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: AsyncRunner re-raises the TaskGroup's error with `raise ... from None`, which wipes its "
-    "__cause__ (the SDK error an LLMSetupError was translated from); SyncRunner keeps it",
-)
 def test_async_runner_keeps_the_cause_of_a_translated_error():
     def responder(messages):
         try:
@@ -1162,22 +1253,99 @@ def test_async_runner_keeps_the_cause_of_a_translated_error():
             make_requests(1), {}, RecordingProgress(1), batch_size=10
         )
     assert isinstance(caught.value.__cause__, ConnectionRefusedError)
+    assert caught.value.__suppress_context__  # as `raise ... from exc` left it
+    assert "the SDK's own error" in "".join(traceback.format_exception(caught.value))
+
+
+def test_async_runner_keeps_the_cause_of_a_translated_error_inside_a_running_event_loop():
+    def responder(messages):
+        try:
+            raise ConnectionRefusedError("the SDK's own error")
+        except ConnectionRefusedError as exc:
+            raise LLMSetupError("Azure rejected the credentials (401: bad key)") from exc
+
+    async def notebook_cell():
+        AsyncRunner(FakeClient(async_responder=responder), max_concurrency=2).run(
+            make_requests(1), {}, RecordingProgress(1), batch_size=10
+        )
+
+    with pytest.raises(LLMSetupError) as caught:
+        asyncio.run(notebook_cell())
+    assert isinstance(caught.value.__cause__, ConnectionRefusedError)
+
+
+def test_async_runner_error_keeps_its_own_context_and_not_the_task_group():
+    def responder(messages):
+        try:
+            {}["choices"]
+        except KeyError:
+            raise RuntimeError("unexpected response shape")  # noqa: B904 - an implicit context, on purpose
+
+    with pytest.raises(RuntimeError, match="unexpected response shape") as caught:
+        AsyncRunner(FakeClient(async_responder=responder), max_concurrency=2).run(
+            make_requests(1), {}, RecordingProgress(1), batch_size=10
+        )
+    assert caught.value.__cause__ is None
+    assert isinstance(caught.value.__context__, KeyError)
+    assert not caught.value.__suppress_context__
+    text = "".join(traceback.format_exception(caught.value))
+    assert "KeyError: 'choices'" in text
+    assert "TaskGroup" not in text and "ExceptionGroup" not in text
+
+
+def test_async_runner_raises_a_leaf_with_no_context_as_it_came():
+    def responder(messages):
+        raise LLMSetupError("No deployment named gpt-x")
+
+    with pytest.raises(LLMSetupError) as caught:
+        AsyncRunner(FakeClient(async_responder=responder), max_concurrency=2).run(
+            make_requests(2), {}, RecordingProgress(2), batch_size=10
+        )
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None  # neither the error group nor run_coroutine's loop probe
+    text = "".join(traceback.format_exception(caught.value))
+    assert "During handling" not in text and "direct cause" not in text
+
+
+def test_async_runner_unreachable_stop_carries_the_last_request_error_as_its_context():
+    client = pattern_async_client(["connection", "credential", "connection", "ok"])
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row") as caught:
+        AsyncRunner(client, max_concurrency=1).run(make_requests(4), {}, RecordingProgress(4), batch_size=10)
+    assert caught.value.__context__ is client.script["t2"][1]
+    assert not isinstance(caught.value.__context__, BaseExceptionGroup)
+
+
+def test_async_runner_error_when_opening_the_session_outside_a_loop_has_no_context():
+    with pytest.raises(LLMSetupError, match="no async client") as caught:
+        AsyncRunner(FakeClient(async_ok=False), max_concurrency=2).run(
+            make_requests(2), {}, RecordingProgress(2), batch_size=10
+        )
+    assert caught.value.__context__ is None
+    assert "no running event loop" not in "".join(traceback.format_exception(caught.value))
 
 
 # --- AsyncRunner: stopping when Azure can't be reached ---------------------------------------------------
 
 
 def test_async_runner_stops_after_three_unreachable_requests_and_cancels_those_in_flight():
-    pattern = ["connection", "credential", "connection", "ok", "ok", "ok"]
-    client = pattern_async_client(pattern, delays=[0.01, 0.02, 0.03, 10.0, 10.0, 10.0])
+    # t0 holds one of the two slots; t1, t2 and t3 go through the other one after another, so each of them
+    # started after the previous failure was counted: three separate failures, not one outage seen three times.
+    pattern = ["ok", "connection", "credential", "connection", "ok", "ok"]
+    client = pattern_async_client(pattern, delays=[10.0, 0.01, 0.01, 0.01, 10.0, 10.0])
     results: dict[int, str] = {}
     started = time.monotonic()
     with pytest.raises(LLMSetupError) as caught:
-        AsyncRunner(client, max_concurrency=10).run(make_requests(6), results, RecordingProgress(6), batch_size=10)
-    assert str(caught.value) == "3 requests in a row couldn't reach Azure. The last error: request failed (connection)"
+        AsyncRunner(client, max_concurrency=2).run(make_requests(6), results, RecordingProgress(6), batch_size=10)
+    assert str(caught.value) == (
+        "Azure couldn't be reached on 3 attempts in a row (3 requests failed). "
+        "The last error: request failed (connection)"
+    )
     assert time.monotonic() - started < 5
-    assert client.keys("error") == {0, 1, 2}
-    assert client.keys("cancelled") == {3, 4, 5}
+    assert client.keys("error") == {1, 2, 3}
+    assert 0 in client.keys("cancelled")  # in flight when the run stopped
+    # (t3's slot may go to t4 just before the task group cancels it; t5 never gets one.)
+    assert client.keys("cancelled") == client.keys("start") - {1, 2, 3} <= {0, 4}
+    assert client.keys("end") == set()
     assert results == {}
     assert client.closed == 1
 
@@ -1187,7 +1355,10 @@ def test_async_runner_allows_ten_unreachable_requests_in_a_row_after_a_success(c
     pattern = ["ok"] + [code] * 10 + ["ok"] * 2
     client = pattern_async_client(pattern)
     results: dict[int, str] = {}
-    with pytest.raises(LLMSetupError, match=rf"^10 requests in a row couldn't reach Azure\. .*\({code}\)$"):
+    with pytest.raises(
+        LLMSetupError,
+        match=rf"^Azure couldn't be reached on 10 attempts in a row \(\d+ requests failed\)\. .*\({code}\)$",
+    ):
         AsyncRunner(client, max_concurrency=1).run(make_requests(13), results, RecordingProgress(13), 100)
     assert client.keys("error") == set(range(1, 11))
     assert results == {0: "<t0>"}
@@ -1209,20 +1380,22 @@ def test_async_runner_below_the_limits_and_with_resets_returns_the_failures():
 def test_async_runner_other_failures_do_not_lift_the_limit_to_ten():
     pattern = ["rate_limit"] + ["connection"] * 3 + ["ok"]
     client = pattern_async_client(pattern)
-    with pytest.raises(LLMSetupError, match=r"^3 requests in a row"):
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
         AsyncRunner(client, max_concurrency=1).run(make_requests(5), {}, RecordingProgress(5), 100)
     assert client.keys("error") == {0, 1, 2, 3}
 
 
 def test_async_runner_streak_carries_across_chunks():
-    pattern = ["connection", "connection", "connection", "ok", "ok", "ok"]
-    client = pattern_async_client(pattern, delays=[0.001, 0.001, 0.001, 10.0, 0.001, 0.001])
-    progress = RecordingProgress(6)
-    with pytest.raises(LLMSetupError, match=r"^3 requests in a row"):
-        AsyncRunner(client, max_concurrency=4).run(make_requests(6), {}, progress, batch_size=2)
-    assert client.keys("start") == {0, 1, 2, 3}
-    assert client.keys("cancelled") == {3}
-    assert progress.notes == ["chunk 1/3", "chunk 2/3"]
+    # Both requests of a chunk are in flight together, so a chunk's failures count once; each chunk is a new wave.
+    pattern = ["connection"] * 5 + ["ok"] * 3
+    client = pattern_async_client(pattern, delays=[0.001] * 5 + [10.0, 0.001, 0.001])
+    progress = RecordingProgress(8)
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
+        AsyncRunner(client, max_concurrency=4).run(make_requests(8), {}, progress, batch_size=2)
+    assert client.keys("start") == {0, 1, 2, 3, 4, 5}
+    assert client.keys("error") == {0, 1, 2, 3, 4}
+    assert client.keys("cancelled") == {5}
+    assert progress.notes == ["chunk 1/4", "chunk 2/4", "chunk 3/4"]
 
 
 def test_unreachable_async_strategy_hands_everything_to_sync():
@@ -1250,6 +1423,189 @@ def test_a_few_unreachable_async_requests_are_retried_by_sync_without_breaking_a
     assert results == {0: "ok", 1: "sync", 2: "ok", 3: "sync", 4: "sync", 5: "ok"}
     assert failures == {}
     assert executor.broken == set()
+
+
+# --- _Reachability: requests in flight together share one outage ----------------------------------------
+
+
+def unreachable_wave(reachability: _Reachability, size: int, code: str = "connection") -> None:
+    """``size`` requests start together, then all of them fail to reach Azure."""
+    started = [reachability.begin() for _ in range(size)]
+    for start in started:
+        reachability.failure(request_error(code), start)
+
+
+def test_reachability_sixteen_failures_in_flight_together_count_once():
+    reachability = _Reachability()
+    unreachable_wave(reachability, 16)
+    assert reachability.streak == 1
+
+
+def test_reachability_a_later_wave_counts_again_and_the_third_stops_the_strategy():
+    reachability = _Reachability()
+    unreachable_wave(reachability, 16)
+    unreachable_wave(reachability, 16, "credential")
+    assert reachability.streak == 2
+    with pytest.raises(LLMSetupError) as caught:
+        unreachable_wave(reachability, 16)
+    # Three outages, and every request caught in them (the rest of the third wave was never looked at).
+    assert str(caught.value) == (
+        "Azure couldn't be reached on 3 attempts in a row (33 requests failed). "
+        "The last error: request failed (connection)"
+    )
+
+
+def test_reachability_only_the_first_failure_among_requests_started_after_a_count_counts():
+    reachability = _Reachability()
+    old = reachability.begin()
+    reachability.failure(request_error("connection"), reachability.begin())  # counted: streak 1
+    new = [reachability.begin() for _ in range(3)]  # started after it
+    reachability.failure(request_error("connection"), old)  # the first outage again: ignored
+    assert reachability.streak == 1
+    for start in new:
+        reachability.failure(request_error("connection"), start)  # a new outage, counted once
+    assert reachability.streak == 2
+
+
+def test_reachability_a_success_resets_the_streak_and_lifts_the_limit_to_ten():
+    reachability = _Reachability()
+    unreachable_wave(reachability, 16)
+    unreachable_wave(reachability, 16)
+    reachability.success()
+    assert reachability.streak == 0
+    for _ in range(9):
+        unreachable_wave(reachability, 16)
+    assert reachability.streak == 9
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 10 attempts in a row"):
+        unreachable_wave(reachability, 16)
+
+
+def test_reachability_failures_of_an_outage_counted_before_a_success_stay_ignored_after_it():
+    reachability = _Reachability()
+    in_flight = [reachability.begin() for _ in range(5)]
+    reachability.failure(request_error("connection"), in_flight[0])
+    reachability.success()  # a reply came back after that outage
+    for start in in_flight[1:]:
+        reachability.failure(request_error("connection"), start)
+    assert reachability.streak == 0
+
+
+def test_reachability_an_answer_from_azure_resets_the_streak_even_from_an_earlier_wave():
+    reachability = _Reachability()
+    old = reachability.begin()
+    unreachable_wave(reachability, 4)
+    unreachable_wave(reachability, 4)
+    assert reachability.streak == 2
+    reachability.failure(request_error("rate_limit"), old)  # Azure answered that one
+    assert reachability.streak == 0
+
+
+def test_reachability_requests_one_after_another_each_count():
+    """What SyncRunner does: every request starts after the previous one failed."""
+    reachability = _Reachability()
+    for count in (1, 2):
+        reachability.failure(request_error("connection"), reachability.begin())
+        assert reachability.streak == count
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
+        reachability.failure(request_error("connection"), reachability.begin())
+
+
+def test_reachability_a_failure_without_a_start_always_counts():
+    reachability = _Reachability()
+    started = reachability.begin()
+    reachability.failure(request_error("connection"), started)
+    reachability.failure(request_error("connection"))
+    assert reachability.streak == 2
+    with pytest.raises(LLMSetupError):
+        reachability.failure(request_error("credential"))
+
+
+# --- AsyncRunner: waves of an outage ----------------------------------------------------------------------
+
+
+def test_async_runner_sixteen_requests_failing_in_one_outage_count_once():
+    client = pattern_async_client(["connection"] * 16, delays=[0.02] * 16)
+    results: dict[int, str] = {}
+    failures = AsyncRunner(client, max_concurrency=16).run(make_requests(16), results, RecordingProgress(16), 100)
+    assert sorted(failures) == list(range(16))  # one outage, one strike: the strategy goes on
+    assert all(error.code == "connection" for error in failures.values())
+    assert client.keys("error") == set(range(16))
+    assert results == {}
+
+
+def test_one_outage_wave_does_not_break_async_and_the_next_strategy_retries_its_requests():
+    client = pattern_async_client(["connection"] * 16 + ["ok"] * 4, delays=[0.02] * 16 + [0.001] * 4)
+    second = ScriptedRunner("sync")
+    executor = FallbackExecutor([AsyncRunner(client, max_concurrency=16), second])
+    results, failures = executor.run(make_requests(20), RecordingProgress(20), batch_size=16)
+    assert failures == {}
+    assert second.calls == [list(range(16))]
+    assert results == {**{key: f"sync:{key}" for key in range(16)}, **{key: f"<t{key}>" for key in range(16, 20)}}
+    assert executor.broken == set()  # async stays in use for the next step
+
+
+def test_async_runner_two_waves_of_an_outage_are_below_the_limit():
+    client = pattern_async_client(["connection"] * 32, delays=[0.01] * 32)
+    failures = AsyncRunner(client, max_concurrency=16).run(make_requests(32), {}, RecordingProgress(32), 16)
+    assert sorted(failures) == list(range(32))
+
+
+def test_async_runner_a_third_wave_of_an_outage_stops_the_strategy():
+    client = pattern_async_client(["connection"] * 64, delays=[0.01] * 64)
+    progress = RecordingProgress(64)
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
+        AsyncRunner(client, max_concurrency=16).run(make_requests(64), {}, progress, batch_size=16)
+    assert client.keys("start") == set(range(48))  # the fourth chunk never started
+    assert progress.notes == ["chunk 1/4", "chunk 2/4", "chunk 3/4"]
+
+
+def test_async_runner_a_success_between_waves_resets_the_streak():
+    pattern = ["connection"] * 32 + ["ok"] * 16 + ["connection"] * 32
+    client = pattern_async_client(pattern, delays=[0.005] * len(pattern))
+    results: dict[int, str] = {}
+    failures = AsyncRunner(client, max_concurrency=16).run(
+        make_requests(len(pattern)), results, RecordingProgress(len(pattern)), batch_size=16
+    )
+    assert sorted(results) == list(range(32, 48))
+    assert sorted(failures) == list(range(32)) + list(range(48, 80))
+
+
+def test_async_runner_after_a_success_the_tenth_wave_stops_the_strategy():
+    pattern = ["ok"] * 4 + ["connection"] * 44
+    client = pattern_async_client(pattern, delays=[0.002] * len(pattern))
+    results: dict[int, str] = {}
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 10 attempts in a row"):
+        AsyncRunner(client, max_concurrency=4).run(
+            make_requests(len(pattern)), results, RecordingProgress(len(pattern)), batch_size=4
+        )
+    assert sorted(results) == [0, 1, 2, 3]
+    assert client.keys("start") == set(range(44))  # the tenth chunk of failures stopped it; the last never ran
+
+
+def test_async_runner_still_stops_when_a_steady_outage_keeps_every_slot_busy():
+    # No chunk boundaries: each request that takes a freed slot starts after the last count, so waves still form.
+    client = pattern_async_client(["connection"] * 200, delays=[0.002] * 200)
+    started = time.monotonic()
+    with pytest.raises(LLMSetupError, match=r"^Azure couldn't be reached on 3 attempts in a row"):
+        AsyncRunner(client, max_concurrency=4).run(make_requests(200), {}, RecordingProgress(200), batch_size=200)
+    assert time.monotonic() - started < 5
+    assert len(client.keys("start")) < 40  # stopped after a few waves, not after every request was tried
+
+
+def test_async_runner_requests_that_never_overlap_each_count_and_sync_takes_over():
+    # FakeClient's calls never wait, so each request starts after the previous one failed.
+    client = FakeClient(
+        batch_deployment=None,
+        async_responder=pattern_responder(["connection"] * 6),
+        sync_responder=lambda messages: "sync",
+    )
+    executor = build_executor(client, ("async", "sync"), max_concurrency=2)
+    results, failures = executor.run(make_requests(6), RecordingProgress(6), batch_size=2)
+    assert results == {key: "sync" for key in range(6)}
+    assert failures == {}
+    assert executor.broken == {"async"}
+    # t2's failure was the third, which stopped the strategy: t3, already waiting for a slot, didn't start.
+    assert [content_of(messages) for messages in client.calls["async"]] == ["t0", "t1", "t2"]
 
 
 # --- run_coroutine ---------------------------------------------------------------------------------------
@@ -1309,12 +1665,6 @@ def test_run_coroutine_inside_a_running_event_loop_leaves_no_worker_thread_behin
     assert all(thread.ident != worker for thread in threading.enumerate())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: run_coroutine calls asyncio.run() inside its `except RuntimeError:` block, so every error from "
-    "the coroutine gets __context__ = RuntimeError('no running event loop') and tracebacks show a misleading "
-    "'During handling of the above exception, another exception occurred'",
-)
 def test_run_coroutine_errors_do_not_carry_the_no_running_loop_probe():
     async def fails():
         await asyncio.sleep(0)
@@ -1361,12 +1711,6 @@ def test_interrupting_run_coroutine_inside_a_running_loop_cancels_the_coroutine(
     assert wait_until(lambda: all(thread.ident != ticker.thread for thread in threading.enumerate()))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: run_coroutine re-raises the interrupt before the coroutine is cancelled: on Python 3.11 a "
-    "Thread.join() interrupted by KeyboardInterrupt marks the still-running worker as stopped, so the "
-    "worker.join(10) meant to let the cancellation finish returns at once",
-)
 def test_interrupting_run_coroutine_inside_a_running_loop_waits_for_the_cancellation():
     ticker = Ticker(close_delay=0.2)
     seen_at_interrupt: list[str] = []
@@ -1409,6 +1753,78 @@ def test_interrupting_the_executor_in_a_notebook_is_not_treated_as_a_broken_stra
     assert wait_until(lambda: client.closed == 1)
     assert executor.broken == set()
     assert second.calls == []
+
+
+def test_interrupting_the_async_runner_in_a_notebook_closes_the_session_before_the_interrupt_returns():
+    client = TimedAsyncClient(delay=10.0)
+    closed_at_interrupt: list[int] = []
+
+    def cell():
+        try:
+            return AsyncRunner(client, max_concurrency=2).run(make_requests(4), {}, RecordingProgress(4), 10)
+        except KeyboardInterrupt:
+            closed_at_interrupt.append(client.closed)
+            raise
+
+    interrupted_in_a_running_loop(cell)
+    assert closed_at_interrupt == [1]
+    assert client.keys("cancelled") == {0, 1}
+
+
+def test_an_interrupt_inside_a_running_loop_waits_at_most_ten_seconds_for_the_cancellation(monkeypatch):
+    """A coroutine that takes too long to cancel doesn't hold the interrupt back for more than 10 s."""
+    waits: list[float | None] = []
+
+    class ShortEvent(threading.Event):
+        def wait(self, timeout=None):
+            if timeout is not None and timeout >= 1:
+                waits.append(timeout)
+                timeout = 0.3  # stands in for the 10 s, to keep the test quick
+            return super().wait(timeout)
+
+    monkeypatch.setattr(runners_module, "threading", types.SimpleNamespace(Thread=threading.Thread, Event=ShortEvent))
+    ticker = Ticker(close_delay=1.5)  # closing takes far longer than the wait allows
+    seen_at_interrupt: list[str] = []
+
+    def cell():
+        try:
+            return run_coroutine(ticker.run())
+        except KeyboardInterrupt:
+            seen_at_interrupt.extend(ticker.events)
+            raise
+
+    started = time.monotonic()
+    try:
+        interrupted_in_a_running_loop(cell)
+        elapsed = time.monotonic() - started
+    finally:
+        if ticker.thread is not None:
+            ticker.finished.wait(5)  # don't leave the worker running into other tests
+    assert seen_at_interrupt == ["cancelled"]  # it gave up waiting before the coroutine closed
+    assert waits == [10]
+    assert elapsed < 1.2
+    assert ticker.events == ["cancelled", "closed"]  # and the coroutine still finished its cleanup afterwards
+
+
+@pytest.mark.parametrize("in_a_notebook", [False, True], ids=["script", "notebook"])
+def test_interrupting_the_executor_keeps_the_async_replies_on_the_interrupt(in_a_notebook):
+    blocked = permanent()
+    first = ScriptedRunner("a", {0: retryable(), 1: retryable(), 2: blocked})
+    # (asyncio.run only sees interrupt_main() when its loop wakes up, hence the ticks.)
+    client = TimedAsyncClient({"t0": (0.001, None), "t1": (10.0, None)}, tick=0.01)
+    third = ScriptedRunner("sync")
+    executor = FallbackExecutor([first, AsyncRunner(client, max_concurrency=2), third])
+
+    def call():
+        return executor.run(make_requests(4), RecordingProgress(4), batch_size=10)
+
+    caught = interrupted_in_a_running_loop(call) if in_a_notebook else interrupted(call)
+    assert wait_until(lambda: client.closed == 1)
+    assert caught.value.results == {0: "<t0>", 3: "a:3"}  # the replies paid for so far
+    assert caught.value.failures == {2: blocked}
+    assert client.keys("cancelled") == {1}
+    assert third.calls == []
+    assert executor.broken == set()
 
 
 # --- build_executor --------------------------------------------------------------------------------------
@@ -1551,3 +1967,112 @@ def test_failed_batch_job_is_final_when_batch_is_the_only_strategy_the_client_su
     assert all(error.retryable and error.code == "batch" for error in failures.values())
     assert "quota exceeded" in str(failures[0])
     assert progress.failed == 3
+
+
+# --- FallbackExecutor and the Batch API's submission retries ----------------------------------------------
+
+
+def timed_out() -> LLMRequestError:
+    return LLMRequestError("Request timed out.", retryable=True, code="timeout")
+
+
+def script_create_batch(client: FakeClient, outcomes: list[Exception | None]) -> list[str]:
+    """Make ``client.create_batch`` raise ``outcomes[n]`` on its n-th call (None: create the job as usual).
+
+    Returns the input file ids it was called with."""
+    create = client.create_batch
+    calls: list[str] = []
+
+    def create_batch(input_file_id):
+        calls.append(input_file_id)
+        outcome = outcomes[len(calls) - 1] if len(calls) <= len(outcomes) else None
+        if outcome is not None:
+            raise outcome
+        return create(input_file_id)
+
+    client.create_batch = create_batch
+    return calls
+
+
+def test_a_passing_submission_error_is_retried_and_the_batch_api_answers_everything(clock):
+    client = FakeClient()
+    creates = script_create_batch(client, [timed_out(), None])
+    executor = build_executor(client, sleep=clock.sleep, clock=clock)
+    progress = RecordingProgress(3)
+    results, failures = executor.run(make_requests(3), progress, batch_size=10)
+    assert results == {key: f"<t{key}>" for key in range(3)}
+    assert failures == {}
+    assert len(creates) == 2
+    assert clock.sleeps[0] == 30.0  # backed off before trying again
+    assert progress.strategies == ["batch"]
+    assert executor.broken == set()
+    assert client.calls["async"] == []
+
+
+def test_a_submission_that_keeps_timing_out_before_any_job_breaks_the_batch_strategy(clock, caplog):
+    client = FakeClient(create_error=timed_out())
+    executor = build_executor(client, sleep=clock.sleep, clock=clock)
+    progress = RecordingProgress(4)
+    with caplog.at_level(logging.WARNING, logger="azure_mapreduce.runners"):
+        results, failures = executor.run(make_requests(4), progress, batch_size=2)
+    assert results == {key: f"<t{key}>" for key in range(4)}
+    assert failures == {}
+    assert clock.sleeps == [30.0, 60.0, 120.0]  # three retries, then the Batch API is given up on
+    assert len(client.files) == 4  # the first chunk's input was uploaded for each of the four attempts
+    assert client.jobs == {}
+    assert executor.broken == {"batch"}
+    assert progress.strategies == ["batch", "async"]
+    assert len(client.calls["async"]) == 4 and client.calls["sync"] == []
+    assert any("The batch strategy failed (LLMRequestError: Request timed out.)" in r.message for r in caplog.records)
+
+    progress = RecordingProgress(1)
+    executor.run(make_requests(1, start=4), progress, batch_size=2)
+    assert progress.strategies == ["async"]  # not tried again in the same run
+
+
+def test_a_submission_error_that_is_not_passing_is_not_retried(clock):
+    client = FakeClient(create_error=LLMRequestError("Invalid input file", retryable=False, code="invalid_request"))
+    executor = build_executor(client, sleep=clock.sleep, clock=clock)
+    results, failures = executor.run(make_requests(2), RecordingProgress(2), batch_size=10)
+    assert results == {0: "<t0>", 1: "<t1>"}
+    assert failures == {}
+    assert 30.0 not in clock.sleeps
+    assert len(client.files) == 1
+    assert executor.broken == {"batch"}
+
+
+def test_a_chunk_that_cannot_be_submitted_after_another_was_falls_back_alone(clock):
+    client = FakeClient()
+    creates = script_create_batch(client, [None, timed_out(), timed_out(), timed_out(), timed_out()])
+    executor = build_executor(client, sleep=clock.sleep, clock=clock)
+    progress = RecordingProgress(4)
+    results, failures = executor.run(make_requests(4), progress, batch_size=2)
+    assert results == {key: f"<t{key}>" for key in range(4)}
+    assert failures == {}
+    assert len(creates) == 5  # the second chunk: one try and three retries
+    assert [content_of(m) for m in client.calls["batch"]] == ["t0", "t1"]
+    assert [content_of(m) for m in client.calls["async"]] == ["t2", "t3"]  # only that chunk fell back
+    assert executor.broken == set()  # the Batch API works: it stays in use
+    assert progress.strategies == ["batch", "async"]
+    assert progress.advanced == 4
+
+
+def test_interrupting_the_batch_strategy_keeps_the_replies_of_finished_jobs_and_cancels_the_rest(clock):
+    client = FakeClient()
+
+    def sleep(seconds):
+        if len(client.calls["batch"]) == 2 and client.jobs.get("batch-2"):
+            raise KeyboardInterrupt  # Ctrl+C while the second job runs
+        clock.sleep(seconds)
+
+    executor = build_executor(client, max_concurrent_batch_jobs=1, sleep=sleep, clock=clock)
+    progress = RecordingProgress(4)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        executor.run(make_requests(4), progress, batch_size=2)
+    assert caught.value.results == {0: "<t0>", 1: "<t1>"}  # the first job's replies were paid for
+    assert caught.value.failures == {}
+    assert client.cancelled == ["batch-2"]
+    assert client.jobs["batch-2"].input_file_id in client.deleted
+    assert client.calls["async"] == [] and client.calls["sync"] == []
+    assert executor.broken == set()
+    assert progress.advanced == 2

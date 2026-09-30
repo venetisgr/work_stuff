@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import decimal
+import fractions
+import gc
 import inspect
 import io
 import json
@@ -19,12 +21,13 @@ import pandas as pd
 import pytest
 
 from azure_mapreduce import MapReduce, MapReduceResult, ReduceResult, reduce_levels
+from azure_mapreduce import mapreduce as mapreduce_module
 from azure_mapreduce import progress as progress_module
 from azure_mapreduce.errors import ConfigError, LLMRequestError, LLMSetupError, MapReduceError, StepFailedError
-from azure_mapreduce.frames import as_text
+from azure_mapreduce.frames import PandasFrame, as_text
 from azure_mapreduce.mapreduce import make_groups
 
-from .conftest import FakeClient, content_of
+from .conftest import FakeClient, FakeClock, content_of
 
 # --- helpers ---------------------------------------------------------------------------------------------
 
@@ -903,6 +906,11 @@ def test_every_group_failing_is_an_error(caplog):
     assert warnings_in(caplog) == [
         "2 of 2 groups failed in the reduce level 1: blocked (×2). The final text leaves out what those groups held."
     ]
+    # Like a StepFailedError, it carries the failing level and the levels before it.
+    assert info.value.outputs == [None, None]
+    assert sorted(info.value.failures) == [0, 1]
+    assert all(str(error) == "blocked" for error in info.value.failures.values())
+    assert info.value.levels == [["a", "b", "c"]]
 
 
 def test_the_last_group_failing_is_an_error():
@@ -1310,6 +1318,135 @@ def test_seconds_options_accept_positive_finite_numbers(name, value):
     make(FakeClient(), **{name: value})
 
 
+# --- numpy (and other numbers.*) option values -------------------------------------------------------------
+
+
+COUNT_OPTIONS = ["map_batch_size", "reduce_batch_size", "max_concurrency", "max_concurrent_batch_jobs"]
+
+
+@pytest.fixture
+def executor_options(monkeypatch):
+    """The keyword arguments every executor is built with (captured, then built as usual)."""
+    captured = []
+    real = mapreduce_module.build_executor
+
+    def capture(client, **options):
+        captured.append(options)
+        return real(client, **options)
+
+    monkeypatch.setattr(mapreduce_module, "build_executor", capture)
+    return captured
+
+
+@pytest.mark.parametrize("value", [np.int64(3), np.int32(3), np.uint8(3), np.int16(3)])
+@pytest.mark.parametrize("name", COUNT_OPTIONS)
+def test_count_options_accept_numpy_ints_and_store_plain_ints(executor_options, name, value):
+    mr = make(FakeClient(), **{name: value})
+    stored = {
+        "map_batch_size": mr.map_batch_size,
+        "reduce_batch_size": mr.reduce_batch_size,
+        "max_concurrency": executor_options[-1]["max_concurrency"],
+        "max_concurrent_batch_jobs": executor_options[-1]["max_concurrent_batch_jobs"],
+    }[name]
+    assert stored == 3 and type(stored) is int
+
+
+@pytest.mark.parametrize("value", [np.int64(2), np.int32(5), np.uint64(10)])
+def test_reduce_group_size_accepts_numpy_ints_and_stores_a_plain_int(value):
+    mr = make(FakeClient(), reduce_group_size=value)
+    assert mr.reduce_group_size == int(value) and type(mr.reduce_group_size) is int
+
+
+def test_numpy_batch_sizes_default_the_reduce_batch_size_to_a_plain_int():
+    mr = make(FakeClient(), map_batch_size=np.int64(7))
+    assert (mr.map_batch_size, mr.reduce_batch_size) == (7, 7)
+    assert type(mr.map_batch_size) is int and type(mr.reduce_batch_size) is int
+
+
+@pytest.mark.parametrize(
+    "value", [np.float64(2.5), np.float32(2.5), np.int64(3), np.uint16(3), fractions.Fraction(5, 2)]
+)
+@pytest.mark.parametrize("name", SECONDS_OPTIONS)
+def test_seconds_options_accept_numpy_numbers_and_store_plain_floats(executor_options, name, value):
+    make(FakeClient(), **{name: value})
+    stored = executor_options[-1][name]
+    assert stored == float(value) and type(stored) is float
+
+
+def test_batch_timeout_none_stays_none(executor_options):
+    make(FakeClient(), batch_timeout=None)
+    assert executor_options[-1]["batch_timeout"] is None
+
+
+@pytest.mark.parametrize(
+    "value", [np.int64(0), np.int64(-2), np.float64(2.0), np.float32(3.0), np.bool_(True), np.bool_(False)]
+)
+@pytest.mark.parametrize("name", ["map_batch_size", "max_concurrency", "max_concurrent_batch_jobs"])
+def test_numpy_counts_that_are_not_whole_numbers_of_at_least_one_are_rejected(name, value):
+    with pytest.raises(ConfigError, match=f"{name} must be a whole number of at least 1") as info:
+        make(FakeClient(), **{name: value})
+    assert repr(value) in str(info.value)
+
+
+@pytest.mark.parametrize("value", [np.int64(1), np.int64(0), np.float64(10.0), np.bool_(True)])
+def test_numpy_reduce_group_sizes_below_two_or_not_whole_are_rejected(value):
+    with pytest.raises(ConfigError, match="reduce_group_size must be 2 or more"):
+        make(FakeClient(), reduce_group_size=value)
+
+
+@pytest.mark.parametrize(
+    "value", [np.float64("nan"), np.float64("inf"), np.float32("-inf"), np.float64(-1.0), np.int64(-5), np.bool_(True)]
+)
+@pytest.mark.parametrize("name", SECONDS_OPTIONS)
+def test_numpy_seconds_that_are_not_finite_or_are_negative_are_rejected(name, value):
+    with pytest.raises(ConfigError) as info:
+        make(FakeClient(), **{name: value})
+    assert str(info.value) == seconds_message(name, value)
+
+
+@pytest.mark.parametrize("value", [np.float64(0.0), np.int64(0)])
+@pytest.mark.parametrize("name", ["batch_poll_interval", "batch_timeout"])
+def test_numpy_zero_poll_interval_or_timeout_is_rejected(name, value):
+    with pytest.raises(ConfigError, match=f"{name} must be a number of seconds greater than zero"):
+        make(FakeClient(), **{name: value})
+
+
+def test_numpy_sizes_group_and_batch_like_plain_ints(clock):
+    plain, numpy = FakeClient(responder=bracket), FakeClient(responder=bracket)
+    options = {"map_batch_size": 2, "reduce_batch_size": 1, "reduce_group_size": 2, "max_concurrent_batch_jobs": 2}
+    expected = make_batch(plain, clock, **options).run(frame("abcde"), "text", "summary")
+    result = make_batch(numpy, FakeClock(), **{k: np.int64(v) for k, v in options.items()}).run(
+        frame("abcde"), "text", "summary"
+    )
+    assert result.output == expected.output == "[[[[a]|[b]]|[[c]|[d]]]|[[[e]]]]"
+    assert result.levels == expected.levels
+    assert job_sizes(numpy) == job_sizes(plain) == [("M", 2), ("M", 2), ("M", 1)] + [("R", 1)] * 6
+
+
+def test_numpy_max_concurrency_reaches_the_async_strategy():
+    client = FakeClient(responder=bracket)
+    mr = make(client, strategies=("async",), max_concurrency=np.int64(2))
+    assert mr.map_texts(list("abc")) == ["[a]", "[b]", "[c]"]
+    assert client.async_sessions == 1 and client.calls["sync"] == []
+
+
+def test_numpy_seconds_reach_the_batch_runner_as_plain_floats():
+    clock = FakeClock()
+    client = FakeClient(responder=bracket, sync_responder=lambda messages: "sync", batch_statuses=("in_progress",))
+    mr = make_batch(
+        client,
+        clock,
+        strategies=("batch", "sync"),
+        batch_poll_interval=np.int64(2),
+        batch_timeout=np.float64(5.0),
+        batch_cancel_wait=np.int64(0),
+    )
+    assert mr.map_texts(["a", "b"]) == ["[a]", "sync"]  # cancelled: the fake answers the first half
+    assert client.cancelled == ["batch-1"]
+    assert clock.sleeps and all(type(seconds) is float and seconds == 2.0 for seconds in clock.sleeps)
+    assert clock.now == 8.0  # cancelled at the first poll past 5 s (t=6), the cancel shows on the next one
+
+
 # --- reduce_on_error ---------------------------------------------------------------------------------------
 
 
@@ -1440,17 +1577,39 @@ def test_result_failures_default_to_a_fresh_empty_dict():
     assert MapReduceResult(frame=None, output="x", levels=[], map_failures={0: LLMRequestError("e")}).complete is False
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: the 'Every group failed at reduce level N' error carries no .outputs/.levels, so the paid replies "
-    "of the earlier levels are lost with reduce_on_error='warn'",
-)
 def test_every_group_failing_keeps_the_levels_that_were_paid_for():
     client = FakeClient(responder=fail_on("R:[a|b]|[c|d]", "R:[e|f]"))
     with pytest.raises(MapReduceError, match="Every group failed at reduce level 2") as info:
         make(client, reduce_group_size=2, reduce_on_error="warn").reduce(list("abcdef"))
+    assert not isinstance(info.value, StepFailedError)
     assert info.value.outputs == [None, None]
     assert info.value.levels == [list("abcdef"), ["[a|b]", "[c|d]", "[e|f]"]]
+    assert sorted(info.value.failures) == [0, 1]  # the failing level's groups
+    assert all(isinstance(error, LLMRequestError) for error in info.value.failures.values())
+
+
+def test_every_group_failing_after_earlier_failures_carries_only_the_texts_that_made_it():
+    # Level 1 drops [c|d] (warned), level 2 then loses both of its groups.
+    client = FakeClient(responder=fail_on("R:c|d", "R:[a|b]|[e|f]", "R:[g]"))
+    with pytest.raises(MapReduceError, match="Every group failed at reduce level 2") as info:
+        make(client, reduce_group_size=2, reduce_on_error="warn").reduce(list("abcdefg"))
+    assert info.value.levels == [list("abcdefg"), ["[a|b]", "[e|f]", "[g]"]]
+    assert info.value.outputs == [None, None]
+    assert sorted(info.value.failures) == [0, 1]
+
+
+def test_every_group_failing_in_run_also_hands_back_the_mapped_frame():
+    client = FakeClient(responder=fail_on("bad", "R:"))
+    with pytest.raises(MapReduceError, match="Every group failed at reduce level 1") as info:
+        make(client, reduce_group_size=2, reduce_on_error="warn").run(
+            frame(["a", "bad", "b", "c"]), "text", "summary", error_column="error"
+        )
+    assert info.value.frame["summary"].tolist() == ["[a]", None, "[b]", "[c]"]
+    assert info.value.frame["error"].tolist() == [None, "blocked", None, None]
+    assert list(info.value.map_failures) == [1]
+    assert info.value.outputs == [None, None]
+    assert sorted(info.value.failures) == [0, 1]
+    assert info.value.levels == [["[a]", "[b]", "[c]"]]
 
 
 # --- make_groups and balance_groups ------------------------------------------------------------------------
@@ -1511,11 +1670,16 @@ def test_make_groups_of_nothing_fixed():
     assert make_groups([], 3) == []
 
 
-@pytest.mark.xfail(
-    strict=True, reason="BUG: make_groups([], size, balanced=True) raises ZeroDivisionError; the fixed mode returns []"
-)
 def test_make_groups_of_nothing_balanced():
     assert make_groups([], 3, balanced=True) == []
+
+
+@pytest.mark.parametrize("balanced", [False, True])
+@pytest.mark.parametrize("empty", [[], ()])
+@pytest.mark.parametrize("size", [1, 2, 10, np.int64(3)])
+def test_make_groups_of_nothing_is_no_groups_in_both_modes(balanced, empty, size):
+    groups = make_groups(empty, size, balanced=balanced)
+    assert groups == [] and isinstance(groups, list)
 
 
 def test_balance_groups_changes_the_grouping_but_not_the_levels():
@@ -1673,6 +1837,231 @@ def test_run_with_nothing_to_reduce_still_hands_back_the_mapped_frame():
     assert list(info.value.map_failures) == [0]
 
 
+# --- Ctrl+C keeps what was paid for ------------------------------------------------------------------------
+
+
+def interrupt_on(*needles: str, then=bracket):
+    """A responder that raises KeyboardInterrupt (as Ctrl+C would, mid-request) for prompts containing a needle."""
+
+    def responder(messages):
+        if any(needle in content_of(messages) for needle in needles):
+            raise KeyboardInterrupt
+        return then(messages)
+
+    return responder
+
+
+@pytest.fixture
+def collect_garbage():
+    """Run the garbage collector after the test, so asyncio reports a task an interrupt left behind here."""
+    yield
+    gc.collect()
+
+
+INTERRUPTIBLE = [("sync",), ("async",), ("async", "sync"), ("sync", "async")]
+
+
+@pytest.mark.parametrize("strategies", INTERRUPTIBLE)
+@pytest.mark.parametrize("method", ["map", "run"])
+def test_ctrl_c_in_the_map_carries_the_outputs_and_the_partial_frame(collect_garbage, method, strategies):
+    client = FakeClient(responder=interrupt_on("M:c", then=fail_on("bad")))
+    df = pd.DataFrame({"text": ["a", None, "bad", "b", "c", "d"], "n": range(6)}, index=list("uvwxyz"))
+    before = df.copy()
+    with pytest.raises(KeyboardInterrupt) as info:
+        getattr(make(client, strategies=strategies), method)(df, "text", "summary", error_column="error")
+    assert info.value.outputs == ["[a]", None, None, "[b]", None, None]
+    partial = info.value.frame
+    assert list(partial.columns) == ["text", "n", "summary", "error"]
+    assert partial.index.tolist() == list("uvwxyz")
+    assert partial["summary"].tolist() == ["[a]", None, None, "[b]", None, None]
+    pd.testing.assert_frame_equal(df, before)
+    first = strategies[0]
+    # Nothing falls back after an interrupt: the next strategy isn't tried, and nothing after "c" is sent.
+    assert [content_of(m) for m in client.calls[first]] == ["M:a", "M:bad", "M:b", "M:c"]
+    assert all(client.calls[other] == [] for other in ("sync", "async") if other != first)
+    assert not any(content.startswith("R:") for route in ("sync", "async") for content in contents(client, route))
+
+
+def test_ctrl_c_in_map_texts_carries_the_outputs(collect_garbage):
+    for strategies in INTERRUPTIBLE:
+        client = FakeClient(responder=interrupt_on("M:c"))
+        with pytest.raises(KeyboardInterrupt) as info:
+            make(client, strategies=strategies).map_texts(["a", "", "b", "c", "d"])
+        assert info.value.outputs == ["[a]", None, "[b]", None, None], strategies
+        assert not hasattr(info.value, "frame")
+
+
+def test_ctrl_c_before_any_reply_still_carries_an_empty_frame(collect_garbage):
+    client = FakeClient(responder=interrupt_on("M:"))
+    with pytest.raises(KeyboardInterrupt) as info:
+        make(client).map(frame(["a", "b"]), "text", "summary")
+    assert info.value.outputs == [None, None]
+    assert info.value.frame["summary"].tolist() == [None, None]
+
+
+class YieldingClient(FakeClient):
+    """Async requests that give the event loop a turn before answering, as real network calls do."""
+
+    @contextlib.asynccontextmanager
+    async def async_session(self):
+        async with super().async_session() as complete:
+
+            async def answer(messages):
+                await asyncio.sleep(0)
+                return await complete(messages)
+
+            yield answer
+
+
+@pytest.mark.skipif(not hasattr(signal, "raise_signal"), reason="needs signal.raise_signal")
+def test_a_real_sigint_during_the_async_map_keeps_the_replies_and_sends_nothing_more():
+    if signal.getsignal(signal.SIGINT) is not signal.default_int_handler:
+        pytest.skip("SIGINT is handled by something else here")
+
+    def ctrl_c_on_c(messages):
+        if content_of(messages) == "M:c":
+            signal.raise_signal(signal.SIGINT)  # asyncio.run turns it into a cancellation, then a KeyboardInterrupt
+        return bracket(messages)
+
+    client = YieldingClient(responder=ctrl_c_on_c)
+    df = frame(list("abcdef"))
+    with time_limit(10), pytest.raises(KeyboardInterrupt) as info:
+        make(client, strategies=("async", "sync"), max_concurrency=1).map(df, "text", "summary")
+    assert info.value.outputs == ["[a]", "[b]", "[c]", None, None, None]  # c's reply had arrived
+    assert info.value.frame["summary"].tolist() == ["[a]", "[b]", "[c]", None, None, None]
+    assert contents(client, "async") == ["M:a", "M:b", "M:c"]
+    assert client.calls["sync"] == []
+    assert signal.getsignal(signal.SIGINT) is signal.default_int_handler
+
+
+def test_ctrl_c_while_waiting_on_the_batch_api_keeps_the_finished_jobs(clock):
+    def sleep(seconds):
+        clock.sleep(seconds)
+        if len(clock.sleeps) == 5:  # job 1 finished on the 4th poll; job 2 is running
+            raise KeyboardInterrupt
+
+    client = FakeClient(responder=bracket)
+    mr = make_batch(
+        client, clock, strategies=("batch", "sync"), sleep=sleep, map_batch_size=2, max_concurrent_batch_jobs=1
+    )
+    with pytest.raises(KeyboardInterrupt) as info:
+        mr.map(frame(list("abcde")), "text", "summary")
+    assert info.value.outputs == ["[a]", "[b]", None, None, None]
+    assert info.value.frame["summary"].tolist() == ["[a]", "[b]", None, None, None]
+    assert list(client.jobs) == ["batch-1", "batch-2"]  # the third job was never submitted
+    assert client.cancelled == ["batch-2"]  # the running one doesn't go on billing
+    assert client.calls["sync"] == []
+
+
+@pytest.mark.parametrize("strategies", INTERRUPTIBLE)
+def test_ctrl_c_in_the_first_reduce_level_of_run_keeps_the_map_step(collect_garbage, strategies):
+    client = FakeClient(responder=interrupt_on("R:[c]|[d]", then=fail_on("bad")))
+    mr = make(client, strategies=strategies, reduce_group_size=2)
+    with pytest.raises(KeyboardInterrupt) as info:
+        mr.run(frame(["a", "bad", "b", "c", "d", "e"], n=range(6)), "text", "summary", error_column="error")
+    mapped = info.value.frame
+    assert mapped["summary"].tolist() == ["[a]", None, "[b]", "[c]", "[d]", "[e]"]
+    assert mapped["error"].tolist() == [None, "blocked", None, None, None, None]
+    assert mapped["n"].tolist() == list(range(6))
+    assert list(info.value.map_failures) == [1]
+    assert info.value.outputs == ["[[a]|[b]]", None, None]  # this level's replies so far
+    assert info.value.levels == [["[a]", "[b]", "[c]", "[d]", "[e]"]]
+    route = strategies[0]
+    assert contents(client, route)[-2:] == ["R:[a]|[b]", "R:[c]|[d]"]  # "[e]" was never sent
+    assert all(client.calls[other] == [] for other in ("sync", "async") if other != route)
+
+
+@pytest.mark.parametrize("strategies", [("sync",), ("async",)])
+def test_ctrl_c_in_a_later_reduce_level_of_run_keeps_the_levels_so_far(collect_garbage, strategies):
+    client = FakeClient(responder=interrupt_on("C:[[e]]"))  # level 2 of 3, the second group
+    mr = make(client, strategies=strategies, reduce_group_size=2, collapse_prompt="C:{text}")
+    with pytest.raises(KeyboardInterrupt) as info:
+        mr.run(frame("abcde"), "text", "summary")
+    assert info.value.frame["summary"].tolist() == ["[a]", "[b]", "[c]", "[d]", "[e]"]
+    assert info.value.map_failures == {}
+    assert info.value.levels == [["[a]", "[b]", "[c]", "[d]", "[e]"], ["[[a]|[b]]", "[[c]|[d]]", "[[e]]"]]
+    assert info.value.outputs == ["[[[a]|[b]]|[[c]|[d]]]", None]
+
+
+def test_ctrl_c_in_reduce_on_its_own_carries_the_levels_but_no_frame():
+    client = FakeClient(responder=interrupt_on("R:c|d"))
+    with pytest.raises(KeyboardInterrupt) as info:
+        make(client, reduce_group_size=2).reduce(list("abcdef"))
+    assert info.value.outputs == ["[a|b]", None, None]
+    assert info.value.levels == [list("abcdef")]
+    assert not hasattr(info.value, "frame") and not hasattr(info.value, "map_failures")
+
+
+def test_bars_and_console_handlers_are_restored_after_ctrl_c(bars, capsys):
+    handler = logging.StreamHandler(sys.stderr)
+    with root_handler(handler):
+        client = FakeClient(responder=interrupt_on("R:"))
+        with pytest.raises(KeyboardInterrupt):
+            make(client, reduce_group_size=2, show_progress=True).run(frame("abc"), "text", "summary")
+        assert handler.stream is sys.stderr
+    assert [bar.desc for bar in bars] == ["Map [sync]", "Reduce", "Level 1/2: 3 → 2 [sync]"]
+    assert not any(bar in progress_module.tqdm._instances for bar in bars)
+
+
+# --- adding the output column fails ------------------------------------------------------------------------
+
+
+def broken_with_outputs(monkeypatch, error: BaseException) -> list:
+    """Make PandasFrame.with_outputs raise ``error``; returns the outputs it was asked to add, call by call."""
+    calls = []
+
+    def with_outputs(self, output_column, outputs, *, error_column=None, failures=None):
+        calls.append(list(outputs))
+        raise error
+
+    monkeypatch.setattr(PandasFrame, "with_outputs", with_outputs)
+    return calls
+
+
+@pytest.mark.parametrize("method", ["map", "run"])
+def test_a_failure_adding_the_output_column_carries_the_outputs_and_failures(monkeypatch, caplog, method):
+    calls = broken_with_outputs(monkeypatch, MemoryError("no room for the column"))
+    client = FakeClient(responder=fail_on("bad"))
+    with pytest.raises(MemoryError, match="no room") as info:
+        getattr(make(client), method)(frame(["a", "bad", None, "b"]), "text", "summary", error_column="error")
+    assert info.value.outputs == ["[a]", None, None, "[b]"]
+    assert list(info.value.failures) == [1]
+    assert isinstance(info.value.failures[1], LLMRequestError) and str(info.value.failures[1]) == "blocked"
+    assert calls == [["[a]", None, None, "[b]"]]
+    assert not hasattr(info.value, "frame")
+    assert contents(client) == ["M:a", "M:bad", "M:b"]  # run() doesn't go on to the reduce
+    # The hint about id_column is for Spark; pandas gets no error log.
+    assert not [r for r in caplog.records if r.name.startswith("azure_mapreduce") and r.levelno >= logging.ERROR]
+
+
+def test_a_failure_adding_the_output_column_with_nothing_failed_has_empty_failures(monkeypatch):
+    broken_with_outputs(monkeypatch, ValueError("cannot set a frame with no defined index"))
+    with pytest.raises(ValueError) as info:
+        make(FakeClient(responder=bracket)).map(frame(["a"]), "text", "summary")
+    assert info.value.outputs == ["[a]"]
+    assert info.value.failures == {}
+
+
+def test_ctrl_c_while_adding_the_output_column_keeps_the_outputs(monkeypatch):
+    broken_with_outputs(monkeypatch, KeyboardInterrupt())
+    client = FakeClient(responder=bracket)
+    with pytest.raises(KeyboardInterrupt) as info:
+        make(client).run(frame(["a", "b"]), "text", "summary")
+    assert info.value.outputs == ["[a]", "[b]"]
+    assert info.value.failures == {}
+    assert not any(content.startswith("R:") for content in contents(client))
+
+
+def test_a_map_error_is_not_replaced_when_the_partial_frame_cannot_be_built(monkeypatch):
+    calls = broken_with_outputs(monkeypatch, RuntimeError("frame broken too"))
+    client = FakeClient(responder=setup_error_on("M:b"))
+    with pytest.raises(LLMSetupError, match="credentials") as info:
+        make(client).map(frame(["a", "b", "c"]), "text", "summary")
+    assert info.value.outputs == ["[a]", None, None]  # the replies still go with the original error
+    assert not hasattr(info.value, "frame")
+    assert calls == [["[a]", None, None]]  # the partial frame was attempted once
+
+
 # --- map_texts inputs --------------------------------------------------------------------------------------
 
 
@@ -1692,10 +2081,6 @@ def test_map_texts_rejects_a_dataframe():
     assert client.calls["sync"] == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: bytes are split like the old str bug: map_texts(b'...') and reduce(b'...') send one integer per byte",
-)
 @pytest.mark.parametrize("step", ["map_texts", "reduce"])
 def test_a_single_bytes_value_is_one_text(step):
     client = FakeClient(responder=bracket)
@@ -1706,6 +2091,50 @@ def test_a_single_bytes_value_is_one_text(step):
     else:
         assert mr.reduce(b"hello world").output == "[hello world]"
         assert contents(client) == ["R:hello world"]
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (bytearray(b"hello world"), "hello world"),
+        ("café au lait".encode(), "café au lait"),
+        (b"bad \xff byte", "bad \ufffd byte"),  # not UTF-8: replaced, not an error
+        (np.bytes_(b"numpy bytes"), "numpy bytes"),
+    ],
+)
+@pytest.mark.parametrize("step", ["map_texts", "reduce"])
+def test_a_single_bytes_like_value_is_decoded_as_one_text(step, value, text):
+    client = FakeClient(responder=bracket)
+    mr = make(client, collapse_prompt="C:{text}", reduce_group_size=2)
+    if step == "map_texts":
+        assert mr.map_texts(value) == [f"[{text}]"]
+        assert contents(client) == [f"M:{text}"]
+    else:
+        result = mr.reduce(value)
+        assert result.levels == [[text], [f"[{text}]"]]
+        assert contents(client) == [f"R:{text}"]  # one text: one call, straight to the reduce prompt
+
+
+@pytest.mark.parametrize("value", [b"", b"   ", bytearray(b"\n\t")])
+def test_a_single_blank_bytes_value_sends_nothing(value):
+    client = FakeClient()
+    assert make(client).map_texts(value) == [None]
+    with pytest.raises(MapReduceError, match="Nothing to reduce"):
+        make(client).reduce(value)
+    assert client.calls["sync"] == []
+
+
+def test_a_list_of_bytes_is_still_one_text_per_item():
+    client = FakeClient(responder=bracket)
+    assert make(client).map_texts([b"a", bytearray(b"b"), b""]) == ["[a]", "[b]", None]
+    assert make(client, reduce_group_size=2).reduce([b"x", b"y", b"z"]).levels[0] == ["x", "y", "z"]
+
+
+def test_reduce_column_with_a_single_bytes_value_is_rejected_too():
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="column only applies"):
+        make(client).reduce(b"one text", "summary")
+    assert client.calls["sync"] == []
 
 
 # --- cells that aren't plain strings -----------------------------------------------------------------------
@@ -1846,11 +2275,6 @@ def test_pyarrow_scalars_and_arrow_backed_list_columns():
     assert out["summary"].tolist() == ["[[1, 2]]", None, None]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: numpy datetime64[ns]/timedelta64[ns] arrays become nanosecond integers in the JSON "
-    "(ndarray.tolist() of ns units gives ints), so the model sees 1704103200000000000 instead of a date",
-)
 @pytest.mark.parametrize(
     "value",
     [
@@ -1863,6 +2287,99 @@ def test_numpy_datetimes_in_containers_stay_readable(value):
     text = as_text(value)
     assert text is not None
     assert not re.search(r"\d{12,}", text), text
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        (np.array(["2024-01-01T10:00"], dtype="datetime64[ns]"), '["2024-01-01T10:00:00.000000000"]'),
+        ([np.datetime64("2024-01-01T10:00", "ns")], '["2024-01-01T10:00:00.000000000"]'),
+        ({"when": np.datetime64("2024-01-01T10:00:00.123456789", "ns")}, '{"when": "2024-01-01T10:00:00.123456789"}'),
+        ({"day": np.datetime64("2024-03-01", "D")}, '{"day": "2024-03-01"}'),
+        ((np.datetime64("2024-03-01T10:30", "m"),), '["2024-03-01T10:30"]'),
+        (np.array(["2024-01-01", "NaT"], dtype="datetime64[D]"), '["2024-01-01", "NaT"]'),
+        (
+            np.array([["2024-01-01"], ["2024-01-02"]], dtype="datetime64[s]"),
+            '[["2024-01-01T00:00:00"], ["2024-01-02T00:00:00"]]',
+        ),
+        ([np.array(np.datetime64("2024-01-01T10:00", "ns"))], '["2024-01-01T10:00:00.000000000"]'),  # 0-d array
+        (np.array([np.datetime64("2024-01-01", "D")], dtype=object), '["2024-01-01"]'),
+        (
+            {"nested": [{"at": np.datetime64("2024-01-01T10:00", "ns")}]},
+            '{"nested": [{"at": "2024-01-01T10:00:00.000000000"}]}',
+        ),
+        ([np.datetime64("NaT")], '["NaT"]'),
+        ({"took": np.timedelta64(90, "s")}, '{"took": "0:01:30"}'),
+        (np.array([1, 2], dtype="timedelta64[h]"), '["1:00:00", "2:00:00"]'),
+        ([np.timedelta64("NaT")], '["NaT"]'),
+    ],
+)
+def test_numpy_datetimes_and_durations_in_containers_become_strings(value, text):
+    assert as_text(value) == text
+
+
+def test_numpy_datetimes_in_a_cell_reach_the_prompt_as_strings():
+    client = FakeClient(responder=bracket)
+    cells = [
+        {"at": np.datetime64("2024-01-01T10:00", "ns"), "took": np.timedelta64(5, "m")},
+        np.array(["2024-01-01T10:00", "2024-01-02T11:30"], dtype="datetime64[ns]"),
+    ]
+    make(client).map(frame(cells), "text", "summary")
+    assert contents(client) == [
+        'M:{"at": "2024-01-01T10:00:00.000000000", "took": "0:05:00"}',
+        'M:["2024-01-01T10:00:00.000000000", "2024-01-02T11:30:00.000000000"]',
+    ]
+
+
+def duration_list(array: np.ndarray) -> list:
+    """The same durations as a (nested) list of numpy scalars, which _plain formats one by one."""
+    return [duration_list(row) for row in array] if array.ndim > 1 else [array[i] for i in range(len(array))]
+
+
+@pytest.mark.parametrize(
+    "array",
+    [
+        np.array([1, 2], dtype="timedelta64[s]"),
+        np.array([90, 7], dtype="timedelta64[m]"),
+        np.array([[1, 2], [3, 4]], dtype="timedelta64[D]"),
+        np.array([10**6], dtype="timedelta64[ns]"),
+        np.array([3600 * 10**9], dtype="timedelta64[ns]"),
+        np.array([10**12], dtype="timedelta64[us]"),
+        np.array([[5 * 10**12, 7]], dtype="timedelta64[ns]"),
+    ],
+)
+def test_numpy_duration_arrays_read_like_the_same_durations_in_a_list(array):
+    assert as_text(array) == as_text(duration_list(array))  # an array says what the same scalars in a list say
+
+
+@pytest.mark.parametrize(
+    ("value", "text"),
+    [
+        ([b"abc", bytearray(b"def")], '["abc", "def"]'),
+        ((b"x", "y", 1), '["x", "y", 1]'),
+        ({"name": b"caf\xc3\xa9"}, '{"name": "café"}'),  # UTF-8, and no \\u escapes
+        ({"bad": b"\xff\xfe ok"}, '{"bad": "\ufffd\ufffd ok"}'),  # not UTF-8: replaced, not an error
+        ([[b"deep", {"deeper": [bytearray(b"still")]}]], '[["deep", {"deeper": ["still"]}]]'),
+        ([np.bytes_(b"numpy")], '["numpy"]'),
+        (np.array([b"s1", b"s2"]), '["s1", "s2"]'),  # a numpy bytes ("S") array
+        (np.array([b"obj"], dtype=object), '["obj"]'),
+        ({"empty": b""}, '{"empty": ""}'),
+        (frozenset({b"only"}), '["only"]'),
+    ],
+)
+def test_bytes_inside_containers_are_decoded(value, text):
+    assert as_text(value) == text
+    assert "b'" not in as_text(value)
+
+
+def test_bytes_inside_a_cell_reach_the_prompt_decoded():
+    client = FakeClient(responder=bracket)
+    make(client).map(frame([[b"one", b"two"], {"k": "é".encode()}]), "text", "summary")
+    assert contents(client) == ['M:["one", "two"]', 'M:{"k": "é"}']
+
+
+def test_bytes_dict_keys_are_decoded_too():
+    assert as_text({b"name": b"value", "caf\xe9".encode(): 1}) == '{"name": "value", "café": 1}'
 
 
 # --- building the pandas result ----------------------------------------------------------------------------

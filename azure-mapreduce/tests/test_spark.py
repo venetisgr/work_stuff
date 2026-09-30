@@ -57,6 +57,10 @@ from .conftest import FakeClient, content_of, echo  # noqa: E402
 # --- helpers ---------------------------------------------------------------------------------------------
 
 
+SESSION_ZONE = "spark.sql.session.timeZone"
+ORIGINAL_SETTINGS: dict[str, str] = {}  # the session's settings when the module started
+
+
 @pytest.fixture(scope="module")
 def spark():
     try:
@@ -70,6 +74,7 @@ def spark():
     except Exception as exc:  # pragma: no cover - no Java on this machine
         pytest.skip(f"A local Spark session can't start here: {exc}")
     session.sparkContext.setLogLevel("ERROR")
+    ORIGINAL_SETTINGS[SESSION_ZONE] = session.conf.get(SESSION_ZONE)
     yield session
     session.stop()
 
@@ -335,6 +340,16 @@ def new_york_time(monkeypatch):
     time.tzset()
 
 
+@pytest.fixture
+def session_time_zone(spark):
+    """Call it with a zone to set spark.sql.session.timeZone for one test; the setting is put back afterwards."""
+    previous = spark.conf.get(SESSION_ZONE)
+    try:
+        yield lambda zone: spark.conf.set(SESSION_ZONE, zone)
+    finally:
+        spark.conf.set(SESSION_ZONE, previous)
+
+
 @pytest.mark.parametrize("id_column", [None, "id"])
 def test_map_keeps_timestamps_in_the_repeated_daylight_saving_hour(spark, clock, new_york_time, id_column):
     """2024-11-03 01:30 happens twice in New York (05:30 and 06:30 UTC); both instants must survive."""
@@ -542,10 +557,25 @@ def test_nan_ids_are_rejected(spark, clock):
     assert no_calls(client)
 
 
-def test_ids_that_are_not_simple_values_are_rejected(spark, clock):
-    df = spark.createDataFrame([([1], "a"), ([2], "b")], "id array<int>, text string")
+def test_array_ids_join_the_replies_back(spark, clock):
+    """Array ids are frozen into tuples for the uniqueness check, and Spark joins on them fine."""
+    df = spark.createDataFrame([([1], "a"), ([2, None], "b"), ([], "c"), ([1, 2], None)], "id array<int>, text string")
     client = FakeClient()
-    with pytest.raises(ConfigError, match="simple values"):
+    out = make(client, clock).map(df, "text", "summary", id_column="id")
+    assert out.count() == 4
+    assert {tuple(row["id"]): row["summary"] for row in out.collect()} == {
+        (1,): "<Summarize: a>",
+        (2, None): "<Summarize: b>",
+        (): "<Summarize: c>",
+        (1, 2): None,
+    }
+    assert len(client.calls["sync"]) == 3
+
+
+def test_repeated_array_ids_are_rejected_before_any_request(spark, clock):
+    df = spark.createDataFrame([([1, 2], "a"), ([2, 1], "b"), ([1, 2], "c")], "id array<int>, text string")
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='id_column "id" has repeated values'):
         make(client, clock).map(df, "text", "summary", id_column="id")
     assert no_calls(client)
 
@@ -897,14 +927,36 @@ def to_arrow_calls(spark, monkeypatch) -> list:
 
 
 @pytest.fixture
-def no_arrow(spark, monkeypatch):
-    """DataFrame.toArrow fails (an old pyarrow, a type Arrow can't carry...), so Rows are collected instead."""
+def collect_calls(spark, monkeypatch) -> list:
+    """Records every DataFrame.collect call (and still collects)."""
     cls = type(spark.range(1))
+    original = cls.collect
+    calls = []
 
-    def unavailable(self, *args, **kwargs):
-        raise RuntimeError("Arrow isn't available here")
+    def spy(self, *args, **kwargs):
+        calls.append(self)
+        return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(cls, "toArrow", unavailable)
+    monkeypatch.setattr(cls, "collect", spy)
+    return calls
+
+
+def arrow_failing_with(spark, monkeypatch, error: BaseException) -> list:
+    """Makes DataFrame.toArrow raise ``error``; returns the DataFrames it was called on."""
+    calls = []
+
+    def failing(self, *args, **kwargs):
+        calls.append(self)
+        raise error
+
+    monkeypatch.setattr(type(spark.range(1)), "toArrow", failing)
+    return calls
+
+
+@pytest.fixture
+def no_arrow(spark, monkeypatch):
+    """DataFrame.toArrow fails with a conversion error (a type Arrow can't carry...), so Rows are collected."""
+    arrow_failing_with(spark, monkeypatch, TypeError("Arrow isn't available here"))
 
 
 def test_map_rebuilds_through_arrow_keeping_every_type_value_and_the_row_order(wide_df, clock, to_arrow_calls):
@@ -978,11 +1030,104 @@ def test_map_falls_back_to_rows_on_an_empty_dataframe(spark, clock, no_arrow):
     assert out.columns == ["id", "text", "summary", "error"]
 
 
-def test_map_with_id_column_does_not_collect_the_whole_dataframe_through_arrow(spark, clock, to_arrow_calls):
-    df = simple_df(spark, [(1, "a"), (2, "b")])
+def test_map_with_id_column_collects_only_the_ids_and_texts_through_arrow(spark, clock, to_arrow_calls):
+    df = spark.createDataFrame([(0.5, 1, "a"), (1.5, 2, "b")], "score double, id long, text string")
     out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert by_id(out, "score", "summary") == {1: (0.5, "<Summarize: a>"), 2: (1.5, "<Summarize: b>")}
+    assert len(to_arrow_calls) == 1  # once, and only the two columns
+    assert to_arrow_calls[0].columns == ["id", "text"]
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_arrow_fallback_collects_the_rows_once(spark, clock, no_arrow, collect_calls, id_column):
+    df = spark.createDataFrame([(1, "a", 0.5), (2, None, 1.5)], "id long, text string, score double")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column=id_column)
+    assert len(collect_calls) == 1
+    assert collect_calls[0].columns == (["id", "text"] if id_column else ["id", "text", "score"])
+    assert by_id(out, "score", "summary") == {1: (0.5, "<Summarize: a>"), 2: (1.5, None)}
+
+
+def _conversion_errors() -> list:
+    """Errors toArrow raises when it can't convert (pyarrow missing, a type it can't carry...)."""
+    from pyspark.errors import PySparkNotImplementedError, PySparkTypeError, PySparkValueError
+
+    errors = [
+        ImportError("No module named 'pyarrow'"),
+        TypeError("unsupported type"),
+        ValueError("bad value"),
+        NotImplementedError("not yet"),
+        PySparkTypeError("UNSUPPORTED_DATA_TYPE_FOR_ARROW_CONVERSION"),
+        PySparkValueError("bad value"),
+        PySparkNotImplementedError("not yet"),
+    ]
+    try:
+        import pyarrow as pa
+    except ImportError:  # pragma: no cover - pyarrow comes with the spark extra
+        pass
+    else:
+        errors += [pa.ArrowInvalid("invalid"), pa.ArrowTypeError("wrong type"), pa.ArrowNotImplementedError("no")]
+    return [pytest.param(error, id=type(error).__name__) for error in errors]
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+@pytest.mark.parametrize("error", _conversion_errors())
+def test_conversion_errors_from_to_arrow_fall_back_to_rows(
+    spark, clock, monkeypatch, collect_calls, caplog, id_column, error
+):
+    caplog.set_level(logging.DEBUG, logger="azure_mapreduce.frames")
+    df = simple_df(spark, [(1, "a"), (2, "b")])
+    arrow_calls = arrow_failing_with(spark, monkeypatch, error)
+    client = FakeClient()
+    out = make(client, clock).map(df, "text", "summary", id_column=id_column)
+    assert len(arrow_calls) == 1 and len(collect_calls) == 1
+    assert f"Collecting through Arrow failed ({error}); collecting rows instead." in caplog.text
     assert by_id(out, "summary") == {1: ("<Summarize: a>",), 2: ("<Summarize: b>",)}
-    assert to_arrow_calls == []
+
+
+class NotAConversionError(Exception):
+    pass
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("the executor was lost"),
+        KeyError("x"),
+        ConnectionResetError("the driver went away"),
+        NotAConversionError("the query failed"),
+        KeyboardInterrupt(),
+    ],
+    ids=lambda error: type(error).__name__,
+)
+def test_other_errors_from_to_arrow_propagate_without_running_the_query_again(
+    spark, clock, monkeypatch, collect_calls, id_column, error
+):
+    df = simple_df(spark, [(1, "a"), (2, "b")])
+    arrow_calls = arrow_failing_with(spark, monkeypatch, error)
+    client = FakeClient()
+    with pytest.raises(type(error)) as caught:
+        make(client, clock).map(df, "text", "summary", id_column=id_column)
+    assert caught.value is error
+    assert len(arrow_calls) == 1
+    assert collect_calls == []  # not run a second time as Rows
+    assert no_calls(client)
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_a_query_that_fails_through_arrow_is_not_run_again_as_rows(
+    spark, clock, to_arrow_calls, collect_calls, id_column
+):
+    df = simple_df(spark, [(1, "a"), (2, "b")]).withColumn(
+        "text", F.when(F.col("id") > 0, F.raise_error(F.lit("the query blew up"))).cast("string")
+    )
+    client = FakeClient()
+    with pytest.raises(Exception, match="the query blew up") as caught:
+        make(client, clock).map(df, "text", "summary", id_column=id_column)
+    assert not isinstance(caught.value, ImportError | TypeError | ValueError | NotImplementedError)
+    assert len(to_arrow_calls) == 1
+    assert collect_calls == []
+    assert no_calls(client)
 
 
 # --- time zones: timestamps stay exact -----------------------------------------------------------------
@@ -998,27 +1143,18 @@ def test_map_keeps_timestamps_in_the_repeated_daylight_saving_hour_inside_struct
     assert [tuple(row) for row in rows] == [(1730611800,) * 3, (1730615400,) * 3]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: with a timestamp id_column the ids are collected as Rows (naive local datetimes), so the two "
-    "instants of a repeated DST hour look like the same id and are rejected as repeated values",
-)
-def test_timestamp_ids_in_the_repeated_daylight_saving_hour_are_told_apart(spark, clock, new_york_time):
+def test_timestamp_ids_in_the_repeated_daylight_saving_hour_are_told_apart(spark, clock, new_york_time, to_arrow_calls):
     df = spark.sql(
         "SELECT timestamp_seconds(s) AS id, CAST(s AS STRING) AS text FROM VALUES (1730611800L), (1730615400L) AS t(s)"
     )
     out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert len(to_arrow_calls) == 1  # the ids were collected exactly, through Arrow
     assert sorted(tuple(row) for row in out.select(F.unix_seconds("id"), "summary").collect()) == [
         (1730611800, "<Summarize: 1730611800>"),
         (1730615400, "<Summarize: 1730615400>"),
     ]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a timestamp id in the second occurrence of a repeated DST hour comes back from the Python side "
-    "as the first occurrence, so the join misses it and its (paid-for) reply is silently dropped",
-)
 def test_a_timestamp_id_in_the_second_repeated_daylight_saving_hour_gets_its_reply(spark, clock, new_york_time):
     df = spark.sql(
         "SELECT timestamp_seconds(s) AS id, CAST(s AS STRING) AS text FROM VALUES (1730615400L), (1730619000L) AS t(s)"
@@ -1028,6 +1164,168 @@ def test_a_timestamp_id_in_the_second_repeated_daylight_saving_hour_gets_its_rep
         (1730615400, "<Summarize: 1730615400>"),  # 01:30 EST, after the clocks went back
         (1730619000, "<Summarize: 1730619000>"),
     ]
+
+
+DST_SECONDS = (1730611800, 1730615400)  # 01:30 EDT and 01:30 EST on 2024-11-03 in New York
+
+
+def dst_frame(spark, id_sql: str, text_sql: str = "CAST(s AS STRING)"):
+    values = ", ".join(f"({s}L)" for s in DST_SECONDS)
+    return spark.sql(f"SELECT {id_sql} AS id, {text_sql} AS text, s FROM VALUES {values} AS t(s)")
+
+
+@pytest.mark.parametrize("zone", ["America/New_York", "UTC"])
+def test_dst_timestamp_ids_work_whatever_the_session_time_zone(spark, clock, new_york_time, session_time_zone, zone):
+    session_time_zone(zone)
+    df = dst_frame(spark, "timestamp_seconds(s)")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert out.count() == 2
+    assert sorted(tuple(row) for row in out.select(F.unix_seconds("id"), "s", "summary").collect()) == [
+        (s, s, f"<Summarize: {s}>") for s in DST_SECONDS
+    ]
+
+
+def test_struct_ids_holding_dst_timestamps_are_told_apart(spark, clock, new_york_time):
+    df = dst_frame(spark, "named_struct('at', timestamp_seconds(s), 'tags', array('x'))")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert sorted(tuple(row) for row in out.select(F.unix_seconds("id.at"), "s", "summary").collect()) == [
+        (s, s, f"<Summarize: {s}>") for s in DST_SECONDS
+    ]
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="Known limitation: when the text column can't go through Arrow (a VARIANT here), the (id, text) pairs "
+    "are collected as Rows, so timestamp ids in the repeated DST hour become equal naive datetimes and are rejected "
+    "as repeated values (a string text column, or a string id, works)",
+)
+def test_dst_timestamp_ids_work_when_the_text_column_cannot_go_through_arrow(spark, clock, new_york_time):
+    if not hasattr(T, "VariantType"):  # pragma: no cover - PySpark < 4
+        pytest.skip("needs the VARIANT type")
+    df = dst_frame(spark, "timestamp_seconds(s)", "parse_json(CAST(s AS STRING))")
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert sorted(tuple(row) for row in out.select(F.unix_seconds("id"), "summary").collect()) == [
+        (s, f"<Summarize: {s}>") for s in DST_SECONDS
+    ]
+
+
+# --- timestamps are sent as the wall-clock time in spark.sql.session.timeZone ----------------------------
+
+TS_SECONDS = 1704164645  # 2024-01-02 03:04:05 UTC
+
+
+def timestamp_frame(spark):
+    ts = f"timestamp_seconds({TS_SECONDS}L)"
+    return spark.sql(
+        f"SELECT 1L AS id, {ts} AS ts, named_struct('at', {ts}, 'n', 1) AS info, array({ts}, NULL) AS times, "
+        f"map('k', {ts}) AS by_key, array(named_struct('at', {ts})) AS deep, timestamp_micros(-1L) AS early"
+    )
+
+
+def wall_clock(spark, seconds: int) -> str:
+    """How Spark itself shows the instant in the session time zone (what df.show() prints)."""
+    return spark.sql(f"SELECT date_format(timestamp_seconds({seconds}L), 'yyyy-MM-dd HH:mm:ss')").first()[0]
+
+
+def timestamp_prompts(spark, clock, df, id_column) -> dict:
+    client = FakeClient()
+    for column in ("ts", "info", "times", "by_key", "deep"):
+        make(client, clock).map(df, column, "summary", id_column=id_column)
+    return dict(zip(("ts", "info", "times", "by_key", "deep"), map(content_of, client.calls["sync"]), strict=True))
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+@pytest.mark.parametrize("zone", ["Asia/Tokyo", "America/New_York", "UTC", "Australia/Lord_Howe"])
+def test_timestamp_cells_are_sent_in_the_session_time_zone(spark, clock, session_time_zone, id_column, zone):
+    session_time_zone(zone)
+    wall = wall_clock(spark, TS_SECONDS)
+    prompts = timestamp_prompts(spark, clock, timestamp_frame(spark), id_column)
+    assert prompts == {
+        "ts": f"Summarize: {wall}",
+        "info": f'Summarize: {{"at": "{wall}", "n": 1}}',
+        "times": f'Summarize: ["{wall}", null]',
+        "by_key": f'Summarize: {{"k": "{wall}"}}',
+        "deep": f'Summarize: [{{"at": "{wall}"}}]',
+    }
+
+
+def test_timestamp_cells_follow_a_session_time_zone_other_than_the_drivers(
+    spark, clock, new_york_time, session_time_zone
+):
+    session_time_zone("Asia/Kolkata")
+    df = timestamp_frame(spark)
+    assert timestamp_prompts(spark, clock, df, None) == timestamp_prompts(spark, clock, df, "id")
+    client = FakeClient()
+    make(client, clock).map(df, "ts", "summary")
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: 2024-01-02 08:34:05"]  # UTC+05:30
+
+
+def test_microseconds_and_early_timestamps_are_sent_in_the_session_time_zone(spark, clock, session_time_zone):
+    session_time_zone("Asia/Tokyo")
+    df = spark.sql("SELECT 1L AS id, timestamp_micros(-1L) AS early, timestamp_micros(1704164645000001L) AS late")
+    for id_column in (None, "id"):
+        client = FakeClient()
+        make(client, clock).map(df, "early", "summary", id_column=id_column)
+        make(client, clock).map(df, "late", "summary", id_column=id_column)
+        assert [content_of(m) for m in client.calls["sync"]] == [
+            "Summarize: 1970-01-01 08:59:59.999999",
+            "Summarize: 2024-01-02 12:04:05.000001",
+        ]
+
+
+@pytest.mark.parametrize("zone", ["Asia/Tokyo", "America/New_York"])
+def test_the_rebuilt_dataframe_keeps_the_exact_instants_in_any_session_time_zone(
+    spark, clock, session_time_zone, to_arrow_calls, zone
+):
+    session_time_zone(zone)
+    df = timestamp_frame(spark)
+    out = make(FakeClient(), clock).map(df, "ts", "summary")
+    assert len(to_arrow_calls) == 1
+    assert out.schema.fields[:-1] == df.schema.fields
+    instants = [F.unix_micros(name) for name in ("ts", "info.at", "by_key.k", "early")]
+    assert tuple(out.select(*instants, F.unix_micros(F.col("times")[0])).first()) == (
+        TS_SECONDS * 1_000_000,
+        TS_SECONDS * 1_000_000,
+        TS_SECONDS * 1_000_000,
+        -1,
+        TS_SECONDS * 1_000_000,
+    )
+
+
+@pytest.mark.parametrize("zone", ["+09:00", "GMT+09:00"])
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_timestamp_cells_are_sent_in_an_offset_session_time_zone(spark, clock, session_time_zone, zone, id_column):
+    session_time_zone(zone)
+    assert wall_clock(spark, TS_SECONDS) == "2024-01-02 12:04:05"
+    client = FakeClient()
+    make(client, clock).map(timestamp_frame(spark), "ts", "summary", id_column=id_column)
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: 2024-01-02 12:04:05"]
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_timestamp_map_keys_are_sent_in_the_session_time_zone(spark, clock, session_time_zone, id_column):
+    session_time_zone("Asia/Tokyo")
+    df = spark.sql(f"SELECT 1L AS id, map(timestamp_seconds({TS_SECONDS}L), 'x') AS m")
+    client = FakeClient()
+    make(client, clock).map(df, "m", "summary", id_column=id_column)
+    assert [content_of(m) for m in client.calls["sync"]] == ['Summarize: {"2024-01-02 12:04:05": "x"}']
+
+
+def test_timestamp_cells_are_sent_in_the_session_time_zone_when_arrow_is_skipped(
+    spark, clock, new_york_time, session_time_zone, to_arrow_calls
+):
+    if not hasattr(T, "VariantType"):  # pragma: no cover - PySpark < 4
+        pytest.skip("needs the VARIANT type")
+    session_time_zone("Asia/Tokyo")
+    df = timestamp_frame(spark).withColumn("v", F.parse_json(F.lit('{"a": 1}')))
+    client = FakeClient()
+    make(client, clock).map(df, "ts", "summary")
+    assert to_arrow_calls == []
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: 2024-01-02 12:04:05"]
+
+
+def test_session_time_zone_fixture_restored_the_setting(spark):
+    assert spark.conf.get(SESSION_ZONE) == ORIGINAL_SETTINGS[SESSION_ZONE]
 
 
 # --- nested cells in the text column are sent as JSON --------------------------------------------------
@@ -1049,13 +1347,13 @@ NESTED_PROMPTS = {
 }
 
 
-@pytest.fixture(params=["arrow", "rows", "id_column"])
+@pytest.fixture(params=["arrow", "rows", "id_column", "id_column_rows"])
 def collect_path(request):
-    """How the text column is read: through Arrow, as Rows (Arrow unavailable), or with an id_column. Gives the
-    id_column to pass."""
-    if request.param == "rows":
+    """How the text column is read: through Arrow, as Rows (Arrow unavailable), or with an id_column (through
+    Arrow or as Rows). Gives the id_column to pass."""
+    if request.param.endswith("rows"):
         request.getfixturevalue("no_arrow")
-    return "id" if request.param == "id_column" else None
+    return "id" if request.param.startswith("id_column") else None
 
 
 @pytest.mark.parametrize("column", list(NESTED_PROMPTS))
@@ -1069,16 +1367,6 @@ def test_arrays_and_structs_in_the_text_column_are_sent_as_json(spark, clock, co
     assert out.schema[column] == df.schema[column]  # the input column itself is untouched
 
 
-MAP_ARROW_BUG = pytest.mark.xfail(
-    strict=True,
-    reason="BUG: through Arrow a MapType cell comes back from to_pylist() as a list of (key, value) pairs, so it "
-    'is sent as [["k", 1]] instead of the JSON object sent with an id_column (or when Rows are collected)',
-)
-
-
-@pytest.mark.parametrize(
-    "collect_path", [pytest.param("arrow", marks=MAP_ARROW_BUG), "rows", "id_column"], indirect=True
-)
 def test_maps_in_the_text_column_are_sent_as_json_objects(spark, clock, collect_path):
     df = spark.sql(
         "SELECT 1L AS id, map('k', 1, 'j', 2) AS m, named_struct('attrs', map('a', array(1))) AS s, "
@@ -1092,6 +1380,38 @@ def test_maps_in_the_text_column_are_sent_as_json_objects(spark, clock, collect_
     assert [json.loads(prompt) for prompt in prompts] == [{"k": 1, "j": 2}, {"attrs": {"a": [1]}}, [{"x": "y"}]]
 
 
+def test_maps_with_other_keys_and_nested_maps_are_sent_as_json_objects(spark, clock, collect_path):
+    df = spark.sql(
+        "SELECT 1L AS id, map(2, 'b', 1, NULL) AS by_number, map('outer', map('inner', array(map('x', 1.5D)))) AS "
+        "nested, map('p', named_struct('m', map(true, 'yes'))) AS in_struct, map(DATE'2024-01-02', 1) AS by_day"
+    )
+    client = FakeClient()
+    for column in ("by_number", "nested", "in_struct", "by_day"):
+        make(client, clock).map(df, column, "summary", id_column=collect_path)
+    prompts = [content_of(m).removeprefix("Summarize: ") for m in client.calls["sync"]]
+    assert [json.loads(prompt) for prompt in prompts] == [  # keys as text (Rows may reorder them)
+        {"2": "b", "1": None},
+        {"outer": {"inner": [{"x": 1.5}]}},
+        {"p": {"m": {"True": "yes"}}},
+        {"2024-01-02": 1},
+    ]
+
+
+def test_binary_values_inside_arrays_structs_and_maps_are_sent_as_text(spark, clock, collect_path):
+    df = spark.sql(
+        "SELECT 1L AS id, array(X'6869', NULL, X'FF') AS a, named_struct('b', X'636166C3A9') AS s, "
+        "map('k', X'6F6B') AS m"
+    )
+    client = FakeClient()
+    for column in ("a", "s", "m"):
+        make(client, clock).map(df, column, "summary", id_column=collect_path)
+    assert [content_of(m).removeprefix("Summarize: ") for m in client.calls["sync"]] == [
+        '["hi", null, "�"]',
+        '{"b": "café"}',
+        '{"k": "ok"}',
+    ]
+
+
 def test_empty_arrays_and_maps_in_the_text_column_are_skipped(spark, clock, collect_path):
     df = spark.sql("SELECT 1L AS id, array() AS a, map() AS m UNION ALL SELECT 2L, NULL, NULL")
     client = FakeClient()
@@ -1101,16 +1421,6 @@ def test_empty_arrays_and_maps_in_the_text_column_are_skipped(spark, clock, coll
     assert no_calls(client)
 
 
-VARIANT_ARROW_BUG = pytest.mark.xfail(
-    strict=True,
-    reason="BUG: through Arrow a VARIANT cell comes back as {'value': bytes, 'metadata': bytes}, so the model is "
-    "sent the variant's binary encoding instead of its JSON (sent correctly with an id_column or as Rows)",
-)
-
-
-@pytest.mark.parametrize(
-    "collect_path", [pytest.param("arrow", marks=VARIANT_ARROW_BUG), "rows", "id_column"], indirect=True
-)
 def test_variant_cells_in_the_text_column_are_sent_as_their_json(spark, clock, collect_path):
     if not hasattr(T, "VariantType"):  # pragma: no cover - PySpark < 4
         pytest.skip("needs the VARIANT type")
@@ -1121,13 +1431,10 @@ def test_variant_cells_in_the_text_column_are_sent_as_their_json(spark, clock, c
     assert isinstance(out.schema["v"].dataType, T.VariantType)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG (inconsistency): a timestamp cell is sent as '2024-01-02 03:04:05+00:00' through Arrow (session "
-    "time zone, with offset) but as '2024-01-02 03:04:05' with an id_column (driver-local, naive), so the prompt "
-    "depends on whether id_column was given",
-)
-def test_a_timestamp_cell_is_sent_the_same_way_with_or_without_id_column(spark, clock):
+@pytest.mark.parametrize("zone", [None, "Asia/Tokyo", "America/New_York"])
+def test_a_timestamp_cell_is_sent_the_same_way_with_or_without_id_column(spark, clock, session_time_zone, zone):
+    if zone:
+        session_time_zone(zone)
     df = spark.sql(
         "SELECT 1L AS id, timestamp_seconds(1704164645L) AS ts, "
         "named_struct('at', timestamp_seconds(1704164645L)) AS info"
@@ -1139,6 +1446,142 @@ def test_a_timestamp_cell_is_sent_the_same_way_with_or_without_id_column(spark, 
         make(client, clock).map(df, "info", "summary", id_column=id_column)
         prompts[id_column] = [content_of(m) for m in client.calls["sync"]]
     assert prompts[None] == prompts["id"]
+
+
+# --- frames holding a type Arrow can't carry are collected as Rows -------------------------------------
+
+ARROW_UNSAFE_SQL = {
+    "variant": ("VariantType", """parse_json('{"a": [1, null]}')"""),
+    "variant_in_struct": ("VariantType", "named_struct('v', parse_json('[1, 2]'), 'n', 1)"),
+    "variant_in_array": ("VariantType", "array(parse_json('true'), NULL)"),
+    "variant_as_map_value": ("VariantType", "map('k', parse_json('2.5'))"),
+    "time": ("TimeType", "TIME'12:34:56'"),
+    "time_in_struct": ("TimeType", "named_struct('t', TIME'01:02:03')"),
+    "void": ("NullType", "NULL"),
+    "void_in_array": ("NullType", "array(NULL)"),
+    "void_as_map_value": ("NullType", "map('k', NULL)"),
+    "geometry": ("GeometryType", "st_geomfromwkb(X'0101000000000000000000F03F0000000000000040')"),
+    "geography": ("GeographyType", "st_geogfromwkb(X'0101000000000000000000F03F0000000000000040')"),
+}
+ARROW_UNSAFE = [*ARROW_UNSAFE_SQL, "vector", "vector_in_array", "vector_in_struct", "vector_as_map_value"]
+
+
+def arrow_unsafe_frame(spark, case: str):
+    """id, text and an ``extra`` column of a type that doesn't go through Arrow (possibly nested)."""
+    rows = [(1, "first"), (2, None), (3, "third")]
+    if case.startswith("vector"):
+        linalg = pytest.importorskip("pyspark.ml.linalg")  # needs numpy
+        udt, dense = linalg.VectorUDT(), linalg.Vectors.dense([1.0, 2.0])
+        value, data_type = {
+            "vector": (dense, udt),
+            "vector_in_array": ([dense, linalg.Vectors.sparse(3, [1], [2.0])], ArrayType(udt)),
+            "vector_in_struct": (Row(v=dense), StructType([StructField("v", udt)])),
+            "vector_as_map_value": ({"k": dense}, MapType(StringType(), udt)),
+        }[case]
+        schema = StructType(
+            [StructField("id", LongType()), StructField("extra", data_type), StructField("text", StringType())]
+        )
+        return spark.createDataFrame([(n, value, text) for n, text in rows], schema)
+    type_name, expression = ARROW_UNSAFE_SQL[case]
+    if not hasattr(T, type_name):  # pragma: no cover - an older PySpark
+        pytest.skip(f"needs {type_name}")
+    values = ", ".join(f"({n}L, {'NULL' if text is None else repr(text)})" for n, text in rows)
+    return spark.sql(f"SELECT id, {expression} AS extra, text FROM VALUES {values} AS t(id, text)")
+
+
+@pytest.mark.parametrize("case", ARROW_UNSAFE)
+def test_frames_holding_a_type_arrow_cannot_carry_are_collected_as_rows(
+    spark, clock, to_arrow_calls, collect_calls, case
+):
+    df = arrow_unsafe_frame(spark, case)
+    client = FakeClient()
+    out = make(client, clock).map(df, "text", "summary", error_column="error")
+
+    assert to_arrow_calls == []  # not even tried
+    assert len(collect_calls) == 1
+    assert out.schema.fields == [*df.schema.fields, STRING, StructField("error", StringType(), True)]
+    rows = out.collect()
+    assert [repr(tuple(row)[:-2]) for row in rows] == [repr(tuple(row)) for row in df.collect()]
+    assert [row["summary"] for row in rows] == ["<Summarize: first>", None, "<Summarize: third>"]
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: first", "Summarize: third"]
+
+
+@pytest.mark.parametrize("case", ARROW_UNSAFE)
+def test_prompts_match_the_id_column_path_when_arrow_is_skipped(spark, clock, to_arrow_calls, case):
+    df = arrow_unsafe_frame(spark, case)
+    prompts, summaries = {}, {}
+    for id_column in (None, "id"):
+        client = FakeClient()
+        for column in ("text", "extra"):
+            out = make(client, clock).map(df, column, "summary", id_column=id_column)
+            summaries[id_column, column] = by_id(out, "summary")
+        prompts[id_column] = [content_of(m) for m in client.calls["sync"]]
+    assert prompts[None] == prompts["id"]
+    assert prompts[None][:2] == ["Summarize: first", "Summarize: third"]
+    assert summaries[None, "text"] == summaries["id", "text"]
+    assert summaries[None, "extra"] == summaries["id", "extra"]
+    # with an id_column only the (id, text) pairs are collected: through Arrow when they can be
+    assert [frame.columns for frame in to_arrow_calls] == [["id", "text"]]
+
+
+@pytest.mark.parametrize(
+    ("case", "prompt"),
+    [
+        ("variant", 'Summarize: {"a":[1,null]}'),
+        ("variant_in_array", 'Summarize: ["true", null]'),
+        ("time", "Summarize: 12:34:56"),
+        ("time_in_struct", 'Summarize: {"t": "01:02:03"}'),
+        ("void_in_array", "Summarize: [null]"),
+        ("vector", "Summarize: [1.0, 2.0]"),
+    ],
+)
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_a_column_arrow_cannot_carry_is_sent_as_text(spark, clock, case, prompt, id_column):
+    client = FakeClient()
+    make(client, clock).map(arrow_unsafe_frame(spark, case), "extra", "summary", id_column=id_column)
+    assert [content_of(m) for m in client.calls["sync"]] == [prompt] * 3
+
+
+def test_a_void_column_is_skipped_on_both_paths(spark, clock):
+    df = arrow_unsafe_frame(spark, "void")
+    client = FakeClient()
+    for id_column in (None, "id"):
+        out = make(client, clock).map(df, "extra", "summary", id_column=id_column)
+        assert by_id(out, "summary") == {1: (None,), 2: (None,), 3: (None,)}
+    assert no_calls(client)
+
+
+def test_a_day_time_interval_column_still_goes_through_arrow(spark, clock, to_arrow_calls):
+    df = spark.sql("SELECT 1L AS id, INTERVAL '1 02:03:04' DAY TO SECOND AS gap, 'a' AS text")
+    client = FakeClient()
+    out = make(client, clock).map(df, "gap", "summary")
+    assert len(to_arrow_calls) == 1
+    assert [content_of(m) for m in client.calls["sync"]] == ["Summarize: 1 day, 2:03:04"]
+    assert out.schema.fields[:-1] == df.schema.fields
+    assert out.first()["gap"] == timedelta(days=1, hours=2, minutes=3, seconds=4)
+
+
+@pytest.mark.parametrize(
+    "interval", ["INTERVAL '1-2' YEAR TO MONTH", "make_ym_interval(3, 4)", "make_interval(1, 2, 0, 3)"]
+)
+def test_a_frame_with_an_interval_column_python_cannot_hold_maps_with_an_id_column(
+    spark, clock, to_arrow_calls, interval
+):
+    df = spark.sql(f"SELECT id, {interval} AS gap, text FROM VALUES (1L, 'a'), (2L, NULL) AS t(id, text)")
+    client = FakeClient()
+    # PySpark can't bring year-month or calendar intervals to Python at all (as Rows or through Arrow), so the
+    # DataFrame can't be collected and rebuilt; that fails before any request is sent, pointing at id_column
+    with pytest.raises(ConfigError, match="pass id_column") as caught:
+        make(client, clock).map(df, "text", "summary")
+    assert isinstance(caught.value.__cause__, NotImplementedError)
+    assert to_arrow_calls == []  # Arrow wasn't tried
+    assert no_calls(client)
+
+    out = make(client, clock).map(df, "text", "summary", id_column="id")
+    assert out.schema.fields[:-1] == df.schema.fields
+    assert out.select("id", "summary").orderBy("id").collect() == [(1, "<Summarize: a>"), (2, None)]
+    assert out.select(F.col("gap").cast("string")).collect() == df.select(F.col("gap").cast("string")).collect()
+    assert [frame.columns for frame in to_arrow_calls] == [["id", "text"]]
 
 
 def test_reduce_an_array_column_sends_each_cell_as_json(spark, clock):
@@ -1388,11 +1831,6 @@ def test_nan_ids_are_rejected_in_a_dotted_id_column(spark, clock):
         make(FakeClient(), clock).map(df, "text", "summary", id_column="row.id")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="BUG: a NaN inside a struct id passes the Python checks (nan != nan) but Spark's join matches NaN to "
-    "NaN, so the rows are duplicated and get each other's replies",
-)
 def test_struct_ids_holding_nan_are_rejected_before_any_request(spark, clock):
     df = spark.createDataFrame(
         [(Row(a=1.0, b=float("nan")), "x"), (Row(a=1.0, b=float("nan")), "y")],
@@ -1413,6 +1851,185 @@ def test_struct_ids_with_null_fields_still_join(spark, clock):
         (1, "<Summarize: x>"),
         (2, "<Summarize: y>"),
     ]
+
+
+@pytest.fixture(params=["arrow", "rows"])
+def id_path(request, spark) -> str:
+    """How the (id, text) pairs are collected: through Arrow, or as Rows (Arrow unavailable)."""
+    if request.param == "rows":
+        request.getfixturevalue("no_arrow")
+    return request.param
+
+
+@pytest.mark.parametrize(
+    "id_sql",
+    [
+        "named_struct('a', 1, 'inner', named_struct('x', double('NaN')))",
+        "named_struct('a', 1, 'f', CAST('NaN' AS FLOAT))",
+        "named_struct('a', 1, 'xs', array(1D, double('NaN')))",
+        "array(named_struct('x', double('NaN')))",
+        "array(1D, double('NaN'))",
+        "named_struct('a', named_struct('b', named_struct('c', array(CAST('NaN' AS FLOAT)))))",
+    ],
+    ids=["struct_in_struct", "float_field", "array_in_struct", "struct_in_array", "array", "deep"],
+)
+def test_ids_holding_nan_anywhere_are_rejected_before_any_request(spark, clock, id_path, id_sql):
+    df = spark.sql(f"SELECT {id_sql} AS id, 'x' AS text")
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='id_column "id" has empty or NaN values'):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+def test_struct_ids_holding_nan_are_rejected_when_collected_as_rows(spark, clock, no_arrow):
+    df = spark.createDataFrame(
+        [(Row(a=1.0, b=float("nan")), "x"), (Row(a=2.0, b=1.0), "y")], "id struct<a:double,b:double>, text string"
+    )
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="NaN"):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+def test_struct_ids_join_the_replies_back(spark, clock, id_path):
+    df = spark.sql(
+        "SELECT named_struct('k', n, 'tag', tag, 'inner', named_struct('day', day)) AS id, text FROM VALUES "
+        "(1, 'a', DATE'2024-01-01', 'one'), (1, 'b', DATE'2024-01-01', 'two'), (2, NULL, NULL, 'three'), "
+        "(2, 'a', DATE'1999-12-31', NULL), (3, 'a', DATE'2024-01-01', 'five') AS t(n, tag, day, text)"
+    ).repartition(2)
+    client = FakeClient()
+    out = make(client, clock).map(df, "text", "summary", id_column="id")
+    assert out.count() == 5
+    assert {(row["id"]["k"], row["id"]["tag"], row["id"]["inner"]["day"]): row["summary"] for row in out.collect()} == {
+        (1, "a", date(2024, 1, 1)): "<Summarize: one>",
+        (1, "b", date(2024, 1, 1)): "<Summarize: two>",
+        (2, None, None): "<Summarize: three>",
+        (2, "a", date(1999, 12, 31)): None,
+        (3, "a", date(2024, 1, 1)): "<Summarize: five>",
+    }
+
+
+def test_repeated_struct_ids_are_rejected(spark, clock, id_path):
+    df = spark.sql(
+        "SELECT named_struct('k', 1, 'inner', named_struct('tag', 'x')) AS id, 'a' AS text UNION ALL "
+        "SELECT named_struct('k', 1, 'inner', named_struct('tag', 'x')), 'b'"
+    )
+    client = FakeClient()
+    with pytest.raises(ConfigError, match="repeated values"):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+@pytest.mark.parametrize("path", ["arrow", "rows"])
+def test_struct_ids_holding_arrays_join_the_replies_back(spark, clock, request, path):
+    if path == "rows":
+        request.getfixturevalue("no_arrow")
+    df = spark.sql(
+        "SELECT named_struct('k', n, 'tags', tags) AS id, text FROM VALUES "
+        "(1, array('x'), 'one'), (1, array('x', 'y'), 'two'), (2, array(), 'three') AS t(n, tags, text)"
+    )
+    out = make(FakeClient(), clock).map(df, "text", "summary", id_column="id")
+    assert {(row["id"]["k"], tuple(row["id"]["tags"])): row["summary"] for row in out.collect()} == {
+        (1, ("x",)): "<Summarize: one>",
+        (1, ("x", "y")): "<Summarize: two>",
+        (2, ()): "<Summarize: three>",
+    }
+
+
+@pytest.mark.parametrize(
+    ("type_name", "id_sql"),
+    [("MapType", "map('k', n)"), ("MapType", "named_struct('m', map('k', n))"), ("VariantType", "parse_json(n)")],
+    ids=["map", "map_in_struct", "variant"],
+)
+def test_ids_spark_cannot_join_on_are_rejected_before_any_request(spark, clock, type_name, id_sql):
+    if not hasattr(T, type_name):  # pragma: no cover - PySpark < 4
+        pytest.skip(f"needs {type_name}")
+    df = spark.sql(f"SELECT {id_sql} AS id, n AS text FROM VALUES ('1'), ('2') AS t(n)")
+    client = FakeClient()
+    with pytest.raises(ConfigError, match='id_column "id"'):
+        make(client, clock).map(df, "text", "summary", id_column="id")
+    assert no_calls(client)
+
+
+# --- a failing rebuild of the DataFrame still hands back the replies ------------------------------------
+
+
+@pytest.fixture
+def broken_create_data_frame(spark, monkeypatch):
+    """SparkSession.createDataFrame fails (from now on), as rebuilding a big DataFrame on the driver might."""
+
+    def fail(error: BaseException) -> list:
+        calls = []
+
+        def create(self, *args, **kwargs):
+            calls.append(args)
+            raise error
+
+        monkeypatch.setattr(type(spark), "createDataFrame", create)
+        return calls
+
+    return fail
+
+
+def test_a_failing_rebuild_hands_back_the_replies(spark, clock, collect_path, broken_create_data_frame, caplog):
+    df = simple_df(spark, [(1, "good"), (2, "bad"), (3, None), (4, "fine")])
+    error = RuntimeError("the driver ran out of memory")
+    calls = broken_create_data_frame(error)
+    client = FakeClient(responder=failing_on("bad"))
+    with pytest.raises(RuntimeError, match="ran out of memory") as caught:
+        make(client, clock).map(df, "text", "summary", error_column="error", id_column=collect_path)
+    assert caught.value is error and len(calls) == 1
+    assert caught.value.outputs == ["<Summarize: good>", None, None, "<Summarize: fine>"]
+    assert list(caught.value.failures) == [1]
+    assert str(caught.value.failures[1]) == "content filtered"
+    assert len(client.calls["sync"]) == 3  # nothing was sent again
+    hint = (
+        "in row order; id_column avoids the rebuild."
+        if collect_path is None
+        else "in the order the ids were collected."
+    )
+    assert (
+        "Couldn't add the replies to the Spark DataFrame (the driver ran out of memory). They're kept on the "
+        f"exception as .outputs, {hint}" in caplog.text
+    )
+    assert [record.levelname for record in caplog.records if "Couldn't add the replies" in record.message] == ["ERROR"]
+
+
+def test_a_failing_rebuild_in_run_hands_back_the_replies_and_skips_the_reduce(spark, clock, broken_create_data_frame):
+    df = simple_df(spark, [(i, f"r{i}") for i in range(3)])
+    broken_create_data_frame(ValueError("can't infer the schema"))
+    client = FakeClient()
+    with pytest.raises(ValueError, match="infer the schema") as caught:
+        make(client, clock).run(df, "text", "summary")
+    assert caught.value.outputs == [f"<Summarize: r{i}>" for i in range(3)]
+    assert caught.value.failures == {}
+    assert [content_of(m) for m in client.calls["sync"]] == [f"Summarize: r{i}" for i in range(3)]  # no reduce
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_an_interrupt_while_rebuilding_keeps_the_replies(spark, clock, broken_create_data_frame, caplog, id_column):
+    df = simple_df(spark, [(1, "a"), (2, "b")])
+    broken_create_data_frame(KeyboardInterrupt())
+    with pytest.raises(KeyboardInterrupt) as caught:
+        make(FakeClient(), clock).map(df, "text", "summary", id_column=id_column)
+    assert caught.value.outputs == ["<Summarize: a>", "<Summarize: b>"]
+    assert caught.value.failures == {}
+    assert "Couldn't add the replies" not in caplog.text  # an interrupt isn't an error to explain
+
+
+@pytest.mark.parametrize("id_column", [None, "id"])
+def test_a_failing_rebuild_of_the_partial_frame_does_not_hide_the_step_failure(
+    spark, clock, broken_create_data_frame, id_column
+):
+    df = simple_df(spark, [(1, "good"), (2, "bad")])
+    broken_create_data_frame(RuntimeError("no memory left"))
+    with pytest.raises(StepFailedError) as caught:
+        make(FakeClient(responder=failing_on("bad")), clock, on_error="raise").map(
+            df, "text", "summary", id_column=id_column
+        )
+    assert caught.value.outputs == ["<Summarize: good>", None]
+    assert list(caught.value.failures) == [1]
+    assert not hasattr(caught.value, "frame")  # the partial DataFrame couldn't be built; the replies are still here
 
 
 # --- a step that stops still hands back what was paid for ----------------------------------------------
