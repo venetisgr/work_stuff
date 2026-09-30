@@ -8,13 +8,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
 import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 from urllib.parse import unquote, urlparse
 
 import openai
@@ -27,20 +28,27 @@ Messages = list[dict[str, str]]
 AsyncComplete = Callable[[Messages], Awaitable[str]]
 
 FOUNDRY_SCOPE = "https://ai.azure.com/.default"
-BATCH_ENDPOINT = "/chat/completions"
+# The Batch API endpoint, used both as each input line's "url" and as the job's endpoint (as in the v1 API spec).
+BATCH_ENDPOINT = "/v1/chat/completions"
+# Uploaded input files and generated output files expire after this long (14 days, Azure's minimum), so files
+# left behind by an interrupted run don't pile up against the resource's file limit.
+BATCH_FILE_EXPIRY_SECONDS = 14 * 24 * 3600
 _AZURE_HOST_SUFFIXES = (".openai.azure.com", ".services.ai.azure.com", ".cognitiveservices.azure.com")
 _DEPLOYMENT_IN_URL = re.compile(r"/openai/deployments/([^/?#]+)")
 # The request itself is the problem, so sending it again (by any route) fails the same way.
 _PERMANENT_CODES = {"content_filter", "ResponsibleAIPolicyViolation", "context_length_exceeded"}
 # The deployment rejects the request settings, so every request fails the same way.
 _SETUP_CODES = {"unsupported_parameter", "unsupported_value", "OperationNotSupported"}
+QUOTA_CODE = "token_limit_exceeded"  # the Batch API's enqueued-token quota is full for now
 
 
 def foundry_base_url(endpoint: str) -> str:
     """Turn a resource name or an endpoint URL from the Azure portal into the OpenAI v1 base URL."""
     endpoint = endpoint.strip()
-    if "://" not in endpoint:  # just the resource name
-        return f"https://{endpoint}.openai.azure.com/openai/v1/"
+    if "://" not in endpoint:
+        if "." not in endpoint and "/" not in endpoint:  # just the resource name
+            return f"https://{endpoint}.openai.azure.com/openai/v1/"
+        endpoint = f"https://{endpoint}"  # a host name pasted without https://
     parsed = urlparse(endpoint)
     path = parsed.path.rstrip("/")
     if path.endswith("/openai/v1"):
@@ -68,7 +76,8 @@ class BatchJob:
     total: int = 0
     output_file_id: str | None = None
     error_file_id: str | None = None
-    errors: tuple[str, ...] = ()
+    errors: tuple[str, ...] = ()  # why the job failed validation, as "code: message"
+    error_codes: tuple[str, ...] = ()
 
     @classmethod
     def from_sdk(cls, batch: Any) -> BatchJob:
@@ -83,6 +92,7 @@ class BatchJob:
             output_file_id=getattr(batch, "output_file_id", None),
             error_file_id=getattr(batch, "error_file_id", None),
             errors=tuple(_describe_batch_error(error) for error in errors),
+            error_codes=tuple(code for error in errors if (code := getattr(error, "code", None))),
         )
 
 
@@ -106,6 +116,10 @@ class AzureChatClient:
     Instead of ``endpoint`` and ``api_key`` you can pass a ready-made ``client`` (``openai.OpenAI`` or
     ``openai.AzureOpenAI``) and an ``async_client_factory`` that returns a *new* ``openai.AsyncOpenAI`` or
     ``openai.AsyncAzureOpenAI`` each time it's called (each async run opens and closes its own).
+
+    ``batch_endpoint`` is the path written into Batch API input files and jobs (the v1 API's
+    ``/v1/chat/completions``). ``batch_file_expiry`` is how many seconds uploaded and generated batch files are
+    kept (None: until deleted).
     """
 
     def __init__(
@@ -121,6 +135,8 @@ class AzureChatClient:
         token_scope: str = FOUNDRY_SCOPE,
         client: openai.OpenAI | None = None,
         async_client_factory: Callable[[], openai.AsyncOpenAI] | None = None,
+        batch_endpoint: str = BATCH_ENDPOINT,
+        batch_file_expiry: int | None = BATCH_FILE_EXPIRY_SECONDS,
     ):
         if client is None and not endpoint:
             raise ConfigError("Pass the Azure OpenAI endpoint (or resource name), or a ready-made openai client.")
@@ -132,6 +148,8 @@ class AzureChatClient:
         for reserved in ("model", "messages", "stream"):
             if reserved in self.completion_options:
                 raise ConfigError(f"completion_options can't set {reserved!r}; the framework fills it in.")
+        self.batch_endpoint = batch_endpoint
+        self.batch_file_expiry = batch_file_expiry
         self._api_key = api_key
         self._max_retries = max_retries
         self._timeout = timeout
@@ -145,6 +163,7 @@ class AzureChatClient:
             max_retries=max_retries,  # the SDK backs off on 429s and honours retry-after
             timeout=timeout,
         )
+        self._chat_parameters = _parameter_names(self._client.chat.completions.create)
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None, **overrides: Any) -> AzureChatClient:
@@ -191,10 +210,11 @@ class AzureChatClient:
         """Send one chat completion request and return the reply text."""
         if not self.deployment:
             raise LLMSetupError("No standard deployment is set, so only the Batch API can be used.")
+        arguments = _split_arguments(self.request_body(messages), self._chat_parameters)
         try:
-            response = self._client.chat.completions.create(**self.request_body(messages))
-        except openai.OpenAIError as exc:
-            raise translate_error(exc, self.deployment) from exc
+            response = self._client.chat.completions.create(**arguments)
+        except Exception as exc:
+            _raise_translated(exc, self.deployment)
         return completion_text(response.model_dump())
 
     @contextlib.asynccontextmanager
@@ -207,12 +227,14 @@ class AzureChatClient:
             raise LLMSetupError("No async client is available; pass async_client_factory along with client.")
         client = self._new_async_client()
         deployment = self.deployment
+        parameters = _parameter_names(client.chat.completions.create)
 
         async def complete(messages: Messages) -> str:
+            arguments = _split_arguments(self.request_body(messages), parameters)
             try:
-                response = await client.chat.completions.create(**self.request_body(messages))
-            except openai.OpenAIError as exc:
-                raise translate_error(exc, deployment) from exc
+                response = await client.chat.completions.create(**arguments)
+            except Exception as exc:
+                _raise_translated(exc, deployment)
             return completion_text(response.model_dump())
 
         try:
@@ -227,39 +249,58 @@ class AzureChatClient:
         line = {
             "custom_id": custom_id,
             "method": "POST",
-            "url": BATCH_ENDPOINT,
+            "url": self.batch_endpoint,
             "body": self.request_body(messages, batch=True),
         }
         return json.dumps(line, ensure_ascii=False)
 
     def upload_batch_file(self, content: bytes) -> str:
-        file = self._client.files.create(file=("requests.jsonl", content, "application/jsonl"), purpose="batch")
+        options: dict[str, Any] = {}
+        if self.batch_file_expiry:
+            options["expires_after"] = {"anchor": "created_at", "seconds": self.batch_file_expiry}
+        file = self._batch_api(
+            self._client.files.create,
+            file=("requests.jsonl", content, "application/jsonl"),
+            purpose="batch",
+            **options,
+        )
         return file.id
 
     def file_status(self, file_id: str) -> tuple[str | None, str | None]:
         """An uploaded file's processing status (pending, processed, error...) and any details."""
-        file = self._client.files.retrieve(file_id)
+        file = self._batch_api(self._client.files.retrieve, file_id)
         return getattr(file, "status", None), getattr(file, "status_details", None)
 
     def create_batch(self, input_file_id: str) -> BatchJob:
-        batch = self._client.batches.create(
+        options: dict[str, Any] = {}
+        if self.batch_file_expiry:
+            options["output_expires_after"] = {"anchor": "created_at", "seconds": self.batch_file_expiry}
+        batch = self._batch_api(
+            self._client.batches.create,
             input_file_id=input_file_id,
-            endpoint=BATCH_ENDPOINT,  # type: ignore[arg-type]  # Azure takes the path without /v1
+            endpoint=self.batch_endpoint,
             completion_window="24h",
+            **options,
         )
         return BatchJob.from_sdk(batch)
 
     def get_batch(self, batch_id: str) -> BatchJob:
-        return BatchJob.from_sdk(self._client.batches.retrieve(batch_id))
+        return BatchJob.from_sdk(self._batch_api(self._client.batches.retrieve, batch_id))
 
     def cancel_batch(self, batch_id: str) -> BatchJob:
-        return BatchJob.from_sdk(self._client.batches.cancel(batch_id))
+        return BatchJob.from_sdk(self._batch_api(self._client.batches.cancel, batch_id))
 
     def read_file(self, file_id: str) -> str:
-        return self._client.files.content(file_id).text
+        return self._batch_api(self._client.files.content, file_id).text
 
     def delete_file(self, file_id: str) -> None:
-        self._client.files.delete(file_id)
+        self._batch_api(self._client.files.delete, file_id)
+
+    def _batch_api(self, call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        try:
+            return call(*args, **kwargs)
+        except Exception as exc:
+            _raise_translated(exc, self.batch_deployment, batch=True)
 
     # --- authentication ----------------------------------------------------------------------------------
 
@@ -314,16 +355,34 @@ def completion_text(body: Mapping[str, Any]) -> str:
     return text
 
 
-def translate_error(exc: openai.OpenAIError, deployment: str | None) -> LLMRequestError | LLMSetupError:
-    """Map an SDK exception to "this request failed" or "every request will fail"."""
+def translate_error(
+    exc: BaseException, deployment: str | None, *, batch: bool = False
+) -> LLMRequestError | LLMSetupError | None:
+    """Map an SDK or sign-in exception to "this request failed" or "every request will fail".
+
+    Returns None for exceptions it doesn't know, which the caller re-raises as they are.
+    """
+    if not isinstance(exc, openai.OpenAIError):
+        return _translate_credential_error(exc)
     code = getattr(exc, "code", None)
     message = getattr(exc, "message", None) or str(exc)
     if isinstance(exc, openai.AuthenticationError | openai.PermissionDeniedError):
+        role = (
+            "Cognitive Services OpenAI Contributor role (the Batch API uploads files and creates jobs, which the "
+            "OpenAI User role can't)"
+            if batch
+            else "Cognitive Services OpenAI User role"
+        )
         return LLMSetupError(
-            f"Azure rejected the credentials ({exc.status_code}). Check the API key, or for Entra ID that your "
-            "identity has the Cognitive Services OpenAI User role on the resource."
+            f"Azure rejected the credentials ({exc.status_code}: {message}). Check the API key, or for Entra ID "
+            f"that your identity has the {role} on the resource."
         )
     if isinstance(exc, openai.NotFoundError):
+        if batch:
+            return LLMSetupError(
+                f"The Batch API call was answered with 404 ({message}). Check that the endpoint's resource offers "
+                "the Batch API and that the batch deployment exists."
+            )
         return LLMSetupError(
             f'No deployment named "{deployment}" at this endpoint ({message}). Use the deployment name, '
             "not the model name, and check the endpoint."
@@ -331,7 +390,12 @@ def translate_error(exc: openai.OpenAIError, deployment: str | None) -> LLMReque
     if isinstance(exc, openai.APITimeoutError):  # a subclass of APIConnectionError, so check it first
         return LLMRequestError("The request timed out.", retryable=True, code="timeout")
     if isinstance(exc, openai.APIConnectionError):
-        return LLMSetupError(f"Couldn't connect to Azure OpenAI ({message}). Check the endpoint and network.")
+        # Only a failure on request after request means the endpoint is wrong; the runners count them.
+        return LLMRequestError(
+            f"Couldn't connect to Azure OpenAI ({message}). Check the endpoint and the network.",
+            retryable=True,
+            code="connection",
+        )
     if isinstance(exc, openai.RateLimitError):
         return LLMRequestError(
             "Azure kept throttling requests (429); lower max_concurrency or raise the deployment's quota.",
@@ -339,6 +403,10 @@ def translate_error(exc: openai.OpenAIError, deployment: str | None) -> LLMReque
             code="rate_limit",
         )
     if isinstance(exc, openai.BadRequestError):
+        if code == QUOTA_CODE or QUOTA_CODE in message:
+            return LLMRequestError(
+                f"The Batch API's enqueued-token quota is full: {message}", retryable=True, code=QUOTA_CODE
+            )
         if code in _SETUP_CODES:
             return LLMSetupError(f"The deployment rejected the request settings: {message}")
         if code in _PERMANENT_CODES:
@@ -349,25 +417,75 @@ def translate_error(exc: openai.OpenAIError, deployment: str | None) -> LLMReque
     return LLMRequestError(f"The request failed: {message}", retryable=True, code=code)
 
 
-def batch_line_result(line: Mapping[str, Any]) -> str | LLMRequestError:
+def _translate_credential_error(exc: BaseException) -> LLMRequestError | LLMSetupError | None:
+    """Entra ID sign-in failures raised by azure-identity while the SDK fetches a token."""
+    try:
+        from azure.core.exceptions import ClientAuthenticationError
+        from azure.identity import CredentialUnavailableError
+    except ImportError:  # pragma: no cover - azure-identity is a dependency
+        return None
+    if isinstance(exc, CredentialUnavailableError):
+        return LLMSetupError(
+            f"No Entra ID credential is available ({exc}). Pass an API key, run `az login`, or set "
+            "AZURE_TENANT_ID, AZURE_CLIENT_ID and AZURE_CLIENT_SECRET."
+        )
+    if isinstance(exc, ClientAuthenticationError):
+        # Can be a passing hiccup (a managed identity endpoint timing out); the runners stop on a run of them.
+        return LLMRequestError(f"Couldn't get an Entra ID token: {exc}", retryable=True, code="credential")
+    return None
+
+
+def _raise_translated(exc: Exception, deployment: str | None, *, batch: bool = False) -> NoReturn:
+    translated = translate_error(exc, deployment, batch=batch)
+    if translated is None:
+        raise exc
+    raise translated from exc
+
+
+def _parameter_names(method: Callable[..., Any]) -> frozenset[str] | None:
+    """The keyword arguments an SDK method takes by name (None if it can't be inspected)."""
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return None
+    if any(parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()):
+        return None  # takes anything (a wrapper or a test double), so pass everything by name
+    return frozenset(parameters)
+
+
+def _split_arguments(body: Mapping[str, Any], parameters: frozenset[str] | None) -> dict[str, Any]:
+    """Keyword arguments for chat.completions.create: settings the SDK doesn't name go in extra_body."""
+    if parameters is None:
+        return dict(body)
+    arguments = {key: value for key, value in body.items() if key in parameters}
+    extra = {key: value for key, value in body.items() if key not in parameters}
+    if extra:
+        arguments["extra_body"] = extra
+    return arguments
+
+
+def batch_line_result(line: object) -> str | LLMRequestError:
     """The reply text, or the error, for one line of a batch output or error file."""
+    if not isinstance(line, Mapping):
+        return LLMRequestError("The batch result line isn't a JSON object.", retryable=True, code="unreadable")
     error = line.get("error")
     if error:
-        code = error.get("code")
-        message = error.get("message") or "no details"
+        code, message = _error_details(error)
         return LLMRequestError(_permanent_message(code, message), retryable=code not in _PERMANENT_CODES, code=code)
     response = line.get("response") or {}
+    if not isinstance(response, Mapping):
+        return LLMRequestError("The batch result line has no readable response.", retryable=True, code="unreadable")
     body = response.get("body") or {}
     if isinstance(body, str):  # some gateways return the body as a JSON string
         try:
             body = json.loads(body)
         except ValueError:
             body = {}
+    if not isinstance(body, Mapping):
+        body = {}
     status = response.get("status_code")
     if status != 200:
-        detail = body.get("error") or {} if isinstance(body, dict) else {}
-        code = detail.get("code")
-        message = detail.get("message") or f"status {status}"
+        code, message = _error_details(body.get("error") or f"status {status}")
         # A batch deployment can fail where the standard deployment works (and vice versa), so only errors
         # about the request's own content are final.
         return LLMRequestError(_permanent_message(code, message), retryable=code not in _PERMANENT_CODES, code=code)
@@ -375,6 +493,14 @@ def batch_line_result(line: Mapping[str, Any]) -> str | LLMRequestError:
         return completion_text(body)
     except LLMRequestError as exc:
         return exc
+    except (AttributeError, TypeError, IndexError, KeyError):
+        return LLMRequestError("The batch reply isn't a chat completion.", retryable=True, code="unreadable")
+
+
+def _error_details(error: object) -> tuple[str | None, str]:
+    if isinstance(error, Mapping):
+        return error.get("code"), str(error.get("message") or "no details")
+    return None, str(error)
 
 
 def _permanent_message(code: str | None, message: str) -> str:

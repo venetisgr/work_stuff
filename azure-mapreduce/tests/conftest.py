@@ -67,6 +67,7 @@ class FakeClient:
     # "expired" or "cancelled" get output/error files; "failed" ones don't.
     batch_statuses: tuple[str, ...] = ("validating", "in_progress", "finalizing", "completed")
     batch_errors: tuple[str, ...] = ()
+    batch_error_codes: tuple[str, ...] = ()  # reported with batch_errors when a job ends "failed"
     file_statuses: tuple[str | None, ...] = ("processed",)
     upload_error: Exception | None = None
     create_error: Exception | None = None
@@ -213,6 +214,7 @@ class FakeClient:
             output_file_id=job.output_file_id if done else None,
             error_file_id=job.error_file_id if done else None,
             errors=self.batch_errors if status == "failed" else (),
+            error_codes=self.batch_error_codes if status == "failed" else (),
         )
 
 
