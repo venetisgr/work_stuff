@@ -29,22 +29,28 @@ Install the app on a subreddit, then use the subreddit menu **Create Zeus: Trial
 
 ## Levels
 
-Five hand-made trials, then an **endless ramp**: every level after 5 is generated (bigger arena up to a 44-unit radius,
-longer timer up to 120 s, denser/faster hordes, more heavy creatures) so there is no last level. Clearing a level (surviving
-its timer) unlocks the next; pick any unlocked level from the level strip on the menu.
+**100 levels** across **12 maps** (cycling, with a numeral on repeats: "Troy II"). Each map has its own palette and its own
+solid scenery that blocks Zeus and ground creatures (harpies fly over it): marble pillars, stone blocks, coral and obsidian
+spikes, statues, boulders. Obstacle layouts are deterministic per level.
 
-| # | Trial | Arena radius | Time | New threats | Wine cups |
-|---|---|---|---|---|---|
-| 1 | Foothills of Olympus | 15 | 60 s | Satyrs, Harpies | – |
-| 2 | Temple of Athena | 18 | 70 s | Spartoi (skeleton hoplites) | – |
-| 3 | The Labyrinth | 21 | 75 s | Minotaur (charges) | 6 % |
-| 4 | Poseidon's Wrath | 24 | 80 s | Cyclops | 8 % |
-| 5 | Gates of Hades | 27 | 90 s | everything | 10 % |
-| 6+ | generated (Elysian Fields, Mount Ida, …) | 29 → 44 | 93 → 120 s | heavier mixes | 10 % |
+| Maps | |
+|---|---|
+| 1 Foothills of Olympus (open) · 2 Temple of Athena (pillars) · 3 The Labyrinth (blocks) · 4 Poseidon's Wrath (coral) · 5 Gates of Hades (obsidian) · 6 Elysian Fields (statues) · 7 Mount Ida (boulders) · 8 Tartarus (violet spikes) · 9 Delphi (pillars) · 10 Isles of the Blessed (rocks) · 11 Troy (blocks) · 12 Mycenae (pillars) | |
 
-Higher levels also multiply score (×1 … ×2+). On levels 3+ creatures can drop a **wine cup** (kylix) that restores one health —
-only while Zeus is hurt, one on the floor at a time, and heavy creatures drop it far more often.
-Tuning lives in `LEVELS` / `levelById` in `game/config.ts`. The Daily Trial always runs on one of the first three arenas.
+Levels 1–5 are hand-tuned (radius 15 → 27, 60 → 90 s, new creatures at levels 2–4, wine cups from level 3). Levels 6–100 ease toward
+the caps at level 100: arena radius 44, 120 s, ~3.5× spawn density, 1.6× creature speed, up to 14 heavies at once,
+rosters shifting to Minotaurs and Cyclopes, and score multipliers growing (×2 → ×11). **Every 10th level is a Champion Trial**
+(👑): heavier roster, +4 heavy cap, ×1.5 score.
+
+Clearing a level unlocks the next; pick any unlocked level on the menu (‹ › ± 1, « » ± 10). Clearing level 100 ends the campaign.
+Tuning lives in `MAPS`, `EARLY` and `levelById` in `game/config.ts`.
+
+**Wine cups** (kylix) restore one health. They drop from level 3 on, only while Zeus is hurt, one at a time, and far more often from heavy creatures.
+
+## Daily Trials
+
+Three per day, each with its own seed, arena and leaderboard: **Easy** (levels 1–10), **Normal** (11–35), **Hard** (36–70). The arena for
+each tier is picked from the date, everyone gets the same spawn pattern, and all three are open regardless of unlocked levels.
 
 ## The run
 
@@ -102,12 +108,9 @@ Posts show a branded splash card (`splash.html`, big PLAY button) that opens the
 Server (`src/server/index.ts`): `GET /api/init`, `POST /api/score`, plus the post-creation menu/trigger.
 Redis keys: `zeus:best:<user>` (personal best), `zeus:lb:<YYYY-MM-DD>` (daily sorted set, 14-day TTL).
 
-## Daily Trial
+## Persistence
 
-`DailyChallenge` derives a seed from the UTC date; the spawn director uses a seeded PRNG (separate from
-cosmetic randomness) so everyone gets the same spawn angles and enemy mix that day. Daily scores go to the
-daily leaderboard; free play scores only update personal best. Every network call is best-effort with a
-timeout and a `localStorage` fallback — the game never depends on the backend.
+Personal bests, per-level bests and unlocked level are stored per user in Devvit Redis (`zeus:best:<user>`); daily boards are sorted sets (`zeus:lb:<YYYY-MM-DD>:<tier>`, 14-day TTL). Every network call is best-effort with a timeout and a `localStorage` fallback, so the game never depends on the backend.
 
 ## Audio
 

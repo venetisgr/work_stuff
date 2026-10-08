@@ -43,7 +43,8 @@ export class Game {
   private runTime = 0;
   private endTimer = 0;
   private victory = false;
-  private dailyMode = false;
+  /** 0 = free play, 1..3 = Daily Trial Easy / Normal / Hard. */
+  private tier = 0;
   private lastPhase: Phase = 'warmup';
   private timeScale = 1;
   private camPos = new THREE.Vector3();
@@ -79,7 +80,7 @@ export class Game {
     this.arena = new Arena(this.scene, this.fx, this.isMobile ? 1024 : 2048, this.isMobile ? 1024 : 2048, this.level);
     this.pickups = new Pickups(this.scene, this.fx);
     this.player = new Player(this.scene, this.fx, { onCast: (d) => this.combat.cast(d) });
-    this.enemies = new EnemyManager(this.scene, this.fx, this.player, this.daily.seed, this.level);
+    this.enemies = new EnemyManager(this.scene, this.fx, this.player, this.daily.tiers[0].seed, this.level);
     this.combat = new CombatSystem(this.player, this.enemies, this.pickups, this.fx, this.arena, this.audio, {
       popup: (x, y, z, text, kind) => this.popup(x, y, z, text, kind),
       comboTier: (m) => this.ui.banner(m >= 8 ? 'x8 — GODLIKE' : `COMBO x${m}`),
@@ -132,12 +133,12 @@ export class Game {
     this.state = 'menu';
     this.ui.setTouchVisible(false);
     this.ui.hideResults();
-    this.resetWorld(false, this.level.id);
-    this.ui.showMenu(this.daily.profile, this.daily.dayKey, this.daily.level, this.selectedLevel, (lvl, d) => this.start(d, lvl));
+    this.resetWorld(0, this.level.id);
+    this.ui.showMenu(this.daily.profile, this.daily.dayKey, this.daily.tiers, this.selectedLevel, (lvl, tier) => this.start(tier, lvl));
     this.ui.setTouch(this.input.isTouch || document.body.classList.contains('is-touch'));
   }
 
-  private resetWorld(daily: boolean, levelId: number): void {
+  private resetWorld(tier: number, levelId: number): void {
     if (levelId !== this.level.id) {
       this.level = levelById(levelId);
       this.arena.buildWorld(this.level);
@@ -151,7 +152,7 @@ export class Game {
     this.survivePts = 0;
     this.lastPhase = 'warmup';
     this.player.reset();
-    const seed = daily ? this.daily.seed : (Math.random() * 0xffffffff) >>> 0;
+    const seed = tier ? this.daily.tiers[tier - 1].seed : (Math.random() * 0xffffffff) >>> 0;
     this.enemies.reset(seed, this.level);
     this.pickups.reset();
     this.combat.reset(this.level);
@@ -160,19 +161,19 @@ export class Game {
   }
 
   /** Starts a run immediately — no reload, no re-init. */
-  start(daily: boolean, levelId?: number): void {
-    const lvl = daily ? this.daily.level : Math.min(levelId ?? this.selectedLevel, this.daily.profile.unlocked);
-    if (!daily) this.selectedLevel = lvl;
+  start(tier: number, levelId?: number): void {
+    const lvl = tier ? this.daily.tiers[tier - 1].level : Math.min(levelId ?? this.selectedLevel, this.daily.profile.unlocked);
+    if (!tier) this.selectedLevel = lvl;
     this.audio.unlock();
     this.audio.startMusic();
-    this.dailyMode = daily;
-    this.resetWorld(daily, lvl);
+    this.tier = tier;
+    this.resetWorld(tier, lvl);
     this.input.clearQueued();
     this.ui.setLevelLabel(`LEVEL ${this.level.id} · ${this.level.name}`.toUpperCase());
     this.ui.hideMenu();
     this.ui.hideResults();
     this.ui.showHud();
-    this.ui.banner(daily ? 'DAILY TRIAL' : this.level.name.toUpperCase());
+    this.ui.banner(tier ? `DAILY TRIAL · ${this.daily.tiers[tier - 1].label}` : this.level.boss ? 'CHAMPION TRIAL' : this.level.name.toUpperCase());
     this.ui.setTouchVisible(true);
     this.state = 'playing';
   }
@@ -356,7 +357,7 @@ export class Game {
     const score = Math.floor(s.score);
     const prevBest = this.daily.profile.levelBest[this.level.id] ?? 0;
     // Local record is saved synchronously inside submit(); the server call is best-effort.
-    const submit = this.daily.submit(score, s.kills, s.maxCombo, this.dailyMode, this.level.id, this.victory);
+    const submit = this.daily.submit(score, s.kills, s.maxCombo, this.tier, this.level.id, this.victory);
     const show = (rank: number | null, newBest: boolean) =>
       this.ui.showResults(
         {
@@ -366,18 +367,19 @@ export class Game {
           maxCombo: s.maxCombo,
           newBest: newBest && score > 0,
           victory: this.victory,
-          daily: this.dailyMode,
+          tier: this.tier,
+          tierLabel: this.tier ? this.daily.tiers[this.tier - 1].label : '',
           dayKey: this.daily.dayKey,
           rank,
-          leaderboard: this.daily.profile.leaderboard,
+          leaderboard: this.tier ? this.daily.profile.leaderboards[this.tier - 1] : [],
           username: this.daily.profile.username,
           level: this.level.id,
           levelName: this.level.name,
           cleared: this.victory,
         },
-        () => this.start(this.dailyMode, this.level.id),
+        () => this.start(this.tier, this.level.id),
         () => this.toMenu(),
-        () => this.start(false, this.level.id + 1),
+        () => this.start(0, this.level.id + 1),
       );
     show(null, score > prevBest);
     const res = await submit;
@@ -409,6 +411,15 @@ export class Game {
       this.camPos.z + (Math.random() - 0.5) * s * 1.1,
     );
     this.camera.lookAt(this.camFocus.x, 0.8, this.camFocus.z - 1.5);
+  }
+
+  obstacleList() {
+    return world.obstacles;
+  }
+
+  /** Debug helper: number of solid obstacles in the current arena. */
+  obstacleCount(): number {
+    return world.obstacles.length;
   }
 
   /** Test/debug helper: jump the run clock forward. */

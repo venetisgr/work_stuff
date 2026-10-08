@@ -1,5 +1,6 @@
 import * as THREE from 'three';
-import { world, type Level, type LevelTheme } from './config';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
+import { buildObstacles, world, type Level, type LevelTheme, type ObstacleStyle } from './config';
 import type { Effects } from './Effects';
 
 const GOLD = 0xe8b84a;
@@ -126,6 +127,49 @@ function cloudTexture(): THREE.CanvasTexture {
   });
 }
 
+function obstacleGeometry(style: ObstacleStyle): THREE.BufferGeometry {
+  const parts: THREE.BufferGeometry[] = [];
+  const add = (g: THREE.BufferGeometry, x = 0, y = 0, z = 0, sx = 1, sy = 1, sz = 1) => {
+    g.scale(sx, sy, sz);
+    g.translate(x, y, z);
+    const ni = g.index ? g.toNonIndexed() : g;
+    if (!ni.attributes.uv) ni.setAttribute('uv', new THREE.BufferAttribute(new Float32Array(ni.attributes.position.count * 2), 2));
+    parts.push(ni);
+  };
+  switch (style) {
+    case 'pillar':
+      add(new THREE.BoxGeometry(2.1, 0.3, 2.1), 0, 0.15, 0);
+      add(new THREE.CylinderGeometry(0.85, 1, 2.2, 12), 0, 1.4, 0);
+      add(new THREE.BoxGeometry(2.1, 0.3, 2.1), 0, 2.65, 0);
+      break;
+    case 'block':
+      add(new THREE.BoxGeometry(2, 1.9, 2), 0, 0.95, 0);
+      add(new THREE.BoxGeometry(2.2, 0.25, 2.2), 0, 2.0, 0);
+      break;
+    case 'rock':
+      add(new THREE.DodecahedronGeometry(1, 0), 0, 0.85, 0, 1, 0.9, 1);
+      add(new THREE.DodecahedronGeometry(0.55, 0), 0.8, 0.4, 0.3);
+      break;
+    case 'spike':
+      add(new THREE.ConeGeometry(0.55, 3, 6), 0, 1.5, 0);
+      add(new THREE.ConeGeometry(0.38, 2, 6), 0.65, 1, 0.2);
+      add(new THREE.ConeGeometry(0.34, 1.7, 6), -0.55, 0.85, -0.3);
+      break;
+    case 'statue':
+      add(new THREE.BoxGeometry(1.5, 0.8, 1.5), 0, 0.4, 0);
+      add(new THREE.CylinderGeometry(0.34, 0.5, 1.4, 8), 0, 1.5, 0);
+      add(new THREE.SphereGeometry(0.3, 8, 6), 0, 2.4, 0);
+      add(new THREE.BoxGeometry(1.0, 0.18, 0.2), 0, 1.9, 0);
+      break;
+    default:
+      add(new THREE.BoxGeometry(0.1, 0.1, 0.1));
+  }
+  const g = mergeGeometries(parts, false)!;
+  g.computeVertexNormals();
+  parts.forEach((p) => p.dispose());
+  return g;
+}
+
 const lerpC = (out: THREE.Color, a: THREE.Color, b: THREE.Color, t: number) => out.copy(a).lerp(b, t);
 
 export class Arena {
@@ -201,8 +245,9 @@ export class Arena {
   buildWorld(level: Level): void {
     this.clearWorld();
     world.radius = level.radius;
-    this.theme = level.theme;
-    const t = level.theme;
+    this.theme = level.map.theme;
+    const t = level.map.theme;
+    world.obstacles = buildObstacles(level);
     t.skyDay.forEach((h, i) => this.skyDay[i].setHex(h));
     t.skyStorm.forEach((h, i) => this.skyStorm[i].setHex(h));
     t.skyWrath.forEach((h, i) => this.skyWrath[i].setHex(h));
@@ -210,6 +255,7 @@ export class Arena {
     this.buildPlatform();
     this.buildColumns();
     this.buildBraziers(level.braziers);
+    this.buildObstacleMeshes(level);
     this.lastStorm = -1;
     this.setStorm(0, 0);
   }
@@ -369,6 +415,26 @@ export class Arena {
       this.flames.push(flame);
       this.halos.push(halo);
     }
+  }
+
+  /** Solid scenery (pillars, statues, rocks, spikes, blocks): Zeus and ground creatures collide with these. */
+  private buildObstacleMeshes(level: Level): void {
+    const obs = world.obstacles;
+    if (!obs.length) return;
+    const geo = obstacleGeometry(obs[0].style);
+    const mat = new THREE.MeshStandardMaterial({ color: level.map.obstacleColor, roughness: 0.75, metalness: 0.05, flatShading: true });
+    const mesh = new THREE.InstancedMesh(geo, mat, obs.length);
+    const m = new THREE.Matrix4();
+    const q = new THREE.Quaternion();
+    const e = new THREE.Euler();
+    obs.forEach((o, i) => {
+      q.setFromEuler(e.set(0, (o.x * 7.31 + o.z * 3.17) % (Math.PI * 2), 0));
+      m.compose(new THREE.Vector3(o.x, 0, o.z), q, new THREE.Vector3(o.r, o.r * (0.9 + ((i * 37) % 10) / 40), o.r));
+      mesh.setMatrixAt(i, m);
+    });
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+    this.worldGroup.add(mesh);
   }
 
   private buildClouds(): void {

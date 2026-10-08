@@ -1,6 +1,11 @@
 import type { LeaderboardEntry } from '../../shared/api';
-import { CFG, levelById } from './config';
+import { CFG, MAX_LEVEL, levelById } from './config';
 import type { Profile } from './DailyChallenge';
+
+interface DailyTier {
+  label: string;
+  level: number;
+}
 
 export interface ResultData {
   score: number;
@@ -9,7 +14,8 @@ export interface ResultData {
   maxCombo: number;
   newBest: boolean;
   victory: boolean;
-  daily: boolean;
+  tier: number;
+  tierLabel: string;
   dayKey: string;
   rank: number | null;
   leaderboard: LeaderboardEntry[];
@@ -94,42 +100,58 @@ export class UI {
     this.el.mute.textContent = muted ? '🔇' : '🔊';
   }
 
-  /** Level carousel: unlocked levels, one preview of what's next, and endless scrolling via the arrows. */
-  showMenu(profile: Profile, dayKey: string, dailyLevel: number, selected: number, onPlay: (level: number, daily: boolean) => void): void {
+  /** Level carousel (levels 1–100) plus the three Daily Trials. */
+  showMenu(profile: Profile, dayKey: string, tiers: DailyTier[], selected: number, onPlay: (level: number, tier: number) => void): void {
     this.selected = Math.min(selected, profile.unlocked);
-    $('daily-date').textContent = `${dayKey} · ${levelById(dailyLevel).name}`;
+    $('daily-date').textContent = dayKey;
+    $('daily-row').innerHTML = tiers
+      .map((t, i) => {
+        const best = profile.dailyBest[i];
+        return `<button class="daily-btn d${i + 1} ui-btn" data-t="${i + 1}"><b>${t.label}</b><span>${levelById(t.level).name}</span><small>${best ? `BEST ${fmt(best)}` : `LEVEL ${t.level}`}</small></button>`;
+      })
+      .join('');
+    $('daily-row').onclick = (e) => {
+      const btn = (e.target as HTMLElement).closest<HTMLElement>('.daily-btn');
+      if (btn) onPlay(0, Number(btn.dataset.t));
+    };
     $('menu').classList.remove('hidden');
     $('results').classList.add('hidden');
     this.hud.classList.add('hidden');
     const strip = $('lv-strip');
     const free = $('play-free');
-    const render = () => {
-      const last = profile.unlocked + 1; // one locked preview
+    const render = (center = true) => {
+      const last = Math.min(MAX_LEVEL, profile.unlocked + 1); // one locked preview
       let html = '';
       for (let n = 1; n <= last; n++) {
         const L = levelById(n);
         const locked = n > profile.unlocked;
         const best = profile.levelBest[n];
         const stars = Array.from({ length: 5 }, (_, i) => `<span class="${i < L.difficulty ? '' : 'off'}">⚡</span>`).join('');
-        html += `<button class="lv-card ${n === this.selected ? 'sel' : ''} ${locked ? 'locked' : ''}" data-n="${n}">
-          <div class="n">${locked ? '🔒 ' : ''}LEVEL ${n}</div><div class="nm">${L.name}</div><div class="st">${stars}</div>
+        html += `<button class="lv-card ${n === this.selected ? 'sel' : ''} ${locked ? 'locked' : ''} ${L.boss ? 'boss' : ''}" data-n="${n}">
+          <div class="n">${locked ? '🔒 ' : L.boss ? '👑 ' : ''}LEVEL ${n}</div><div class="nm">${L.name}</div><div class="st">${stars}</div>
           <div class="sub">${locked ? `Clear level ${n - 1}` : best ? `BEST ${fmt(best)}` : `${L.radius * 2}m · ${L.time}s`}</div></button>`;
       }
       strip.innerHTML = html;
-      free.innerHTML = `PLAY LEVEL ${this.selected}<small>BEST ${fmt(profile.levelBest[this.selected] ?? 0)}</small>`;
-      strip.querySelector('.sel')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+      const L = levelById(this.selected);
+      free.innerHTML = `PLAY LEVEL ${this.selected}<small>${L.boss ? '👑 CHAMPION TRIAL · ' : ''}BEST ${fmt(profile.levelBest[this.selected] ?? 0)}</small>`;
+      if (center) strip.querySelector('.sel')?.scrollIntoView({ inline: 'center', block: 'nearest' });
     };
     render();
+    const step = (d: number) => {
+      this.selected = Math.min(profile.unlocked, Math.max(1, this.selected + d));
+      render();
+    };
     strip.onclick = (e) => {
       const card = (e.target as HTMLElement).closest<HTMLElement>('.lv-card');
       if (!card || card.classList.contains('locked')) return;
       this.selected = Number(card.dataset.n);
-      render();
+      render(false);
     };
-    $('lv-prev').onclick = () => strip.scrollBy({ left: -260, behavior: 'smooth' });
-    $('lv-next').onclick = () => strip.scrollBy({ left: 260, behavior: 'smooth' });
-    free.onclick = () => onPlay(this.selected, false);
-    $('play-daily').onclick = () => onPlay(dailyLevel, true);
+    $('lv-prev').onclick = () => step(-1);
+    $('lv-next').onclick = () => step(1);
+    $('lv-prev10').onclick = () => step(-10);
+    $('lv-next10').onclick = () => step(10);
+    free.onclick = () => onPlay(this.selected, 0);
   }
 
   setLevelLabel(text: string): void {
@@ -233,7 +255,7 @@ export class UI {
 
   showResults(r: ResultData, onAgain: () => void, onMenu: () => void, onNext: () => void): void {
     this.hideHud();
-    $('res-title').textContent = r.victory ? `LEVEL ${r.level} CLEARED` : 'ZEUS HAS FALLEN';
+    $('res-title').textContent = r.victory ? (r.tier ? `DAILY TRIAL ${r.tierLabel} CLEARED` : r.level >= MAX_LEVEL ? 'ALL 100 TRIALS CONQUERED' : `LEVEL ${r.level} CLEARED`) : 'ZEUS HAS FALLEN';
     $('res-score').textContent = fmt(r.score);
     $('res-new').classList.toggle('hidden', !r.newBest);
     $('res-best').textContent = fmt(r.best);
@@ -241,7 +263,7 @@ export class UI {
     $('res-combo').textContent = `x${r.maxCombo}`;
     const board = $('res-board');
     if (r.leaderboard.length) {
-      let h = `<h4>DAILY TRIAL · ${r.dayKey}${r.daily && r.rank ? ` · YOU #${r.rank}` : ''}</h4>`;
+      let h = `<h4>DAILY ${r.tierLabel} · ${r.dayKey}${r.rank ? ` · YOU #${r.rank}` : ''}</h4>`;
       r.leaderboard.slice(0, 5).forEach((e, i) => {
         h += `<div class="row ${e.username === r.username ? 'me' : ''}"><span>${i + 1}. ${e.username.replace(/[<>&]/g, '')}</span><span>${fmt(e.score)}</span></div>`;
       });
@@ -251,7 +273,7 @@ export class UI {
     }
     $('results').classList.remove('hidden');
     const next = $('next-level');
-    next.classList.toggle('hidden', !(r.cleared && !r.daily));
+    next.classList.toggle('hidden', !(r.cleared && !r.tier && r.level < MAX_LEVEL));
     next.onclick = () => onNext();
     const again = $('play-again');
     again.onclick = onAgain;

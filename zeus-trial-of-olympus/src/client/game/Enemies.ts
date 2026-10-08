@@ -326,6 +326,16 @@ export class EnemyManager {
         z *= R / r;
       }
     }
+    for (const o of world.obstacles) {
+      const ox = x - o.x;
+      const oz = z - o.z;
+      const min = o.r + 1.5;
+      if (ox * ox + oz * oz < min * min) {
+        const d = Math.hypot(ox, oz) || 1;
+        x = o.x + (ox / d) * min;
+        z = o.z + (oz / d) * min;
+      }
+    }
     e.kind = kind;
     e.state = 'rising';
     e.x = x;
@@ -465,6 +475,25 @@ export class EnemyManager {
       if (er > R) {
         e.x *= R / er;
         e.z *= R / er;
+      }
+      // ground creatures are blocked by scenery (harpies fly over it); a charging minotaur is stopped dead
+      if (def.hover === 0) {
+        for (const o of world.obstacles) {
+          const ox = e.x - o.x;
+          const oz = e.z - o.z;
+          const min = o.r + e.radius * 0.7;
+          const d2 = ox * ox + oz * oz;
+          if (d2 < min * min) {
+            const d = Math.sqrt(d2) || 0.001;
+            e.x = o.x + (ox / d) * min;
+            e.z = o.z + (oz / d) * min;
+            if (e.dash > 0) {
+              e.dash = 0;
+              e.attackCd = Math.max(e.attackCd, 0.8);
+              this.fx.burst(e.x, 1, e.z, 14, 0xd8c8a8, 5, 0.6, 0.5);
+            }
+          }
+        }
       }
 
       // contact with Zeus

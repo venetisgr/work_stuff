@@ -1,6 +1,7 @@
 import { createServer, getServerPort, context, redis, reddit } from '@devvit/web/server';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
+  DAILY_TIERS,
   MAX_LEVEL,
   maxPlausibleScore,
   type InitResponse,
@@ -11,7 +12,7 @@ import {
 
 const TOP_N = 10;
 const dayKeyNow = () => new Date().toISOString().slice(0, 10);
-const boardKey = (day: string) => `zeus:lb:${day}`;
+const boardKey = (day: string, tier: number) => `zeus:lb:${day}:${tier}`;
 const bestKey = (user: string) => `zeus:best:${user}`;
 const clampLevel = (n: unknown) => Math.min(MAX_LEVEL, Math.max(1, Math.floor(Number(n)) || 1));
 
@@ -34,8 +35,8 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(payload);
 }
 
-async function topBoard(day: string): Promise<LeaderboardEntry[]> {
-  const rows = await redis.zRange(boardKey(day), 0, TOP_N - 1, { by: 'rank', reverse: true });
+async function topBoard(day: string, tier: number): Promise<LeaderboardEntry[]> {
+  const rows = await redis.zRange(boardKey(day, tier), 0, TOP_N - 1, { by: 'rank', reverse: true });
   return rows.map((r) => ({ username: r.member, score: r.score }));
 }
 
@@ -51,7 +52,7 @@ async function handleInit(res: ServerResponse): Promise<void> {
   const day = dayKeyNow();
   const username = await getUser();
   let best = 0;
-  let dailyBest = 0;
+  const dailyBest: number[] = [0, 0, 0];
   let unlocked = 1;
   const levelBest: Record<string, number> = {};
   if (username) {
@@ -59,9 +60,11 @@ async function handleInit(res: ServerResponse): Promise<void> {
     best = Number(h.all ?? 0);
     unlocked = clampLevel(h.unlocked ?? 1);
     for (const [k, v] of Object.entries(h)) if (k.startsWith('L')) levelBest[k.slice(1)] = Number(v) || 0;
-    dailyBest = (await redis.zScore(boardKey(day), username)) ?? 0;
+    for (let t = 1; t <= DAILY_TIERS; t++) dailyBest[t - 1] = (await redis.zScore(boardKey(day, t), username)) ?? 0;
   }
-  const body: InitResponse = { username, dayKey: day, best, dailyBest, unlocked, levelBest, leaderboard: await topBoard(day) };
+  const leaderboards: LeaderboardEntry[][] = [];
+  for (let t = 1; t <= DAILY_TIERS; t++) leaderboards.push(await topBoard(day, t));
+  const body: InitResponse = { username, dayKey: day, best, dailyBest, unlocked, levelBest, leaderboards };
   send(res, 200, body);
 }
 
@@ -69,6 +72,7 @@ async function handleScore(req: IncomingMessage, res: ServerResponse): Promise<v
   const data = (await readBody(req)) as Partial<ScoreRequest>;
   const score = Math.floor(Number(data.score));
   const level = clampLevel(data.level);
+  const tier = Math.min(DAILY_TIERS, Math.max(0, Math.floor(Number(data.tier)) || 0));
   if (!Number.isFinite(score) || score < 0 || score > maxPlausibleScore(level)) {
     return send(res, 400, { error: 'invalid score' });
   }
@@ -76,7 +80,7 @@ async function handleScore(req: IncomingMessage, res: ServerResponse): Promise<v
   const username = await getUser();
   if (!username) {
     // Logged-out players can play, they just don't get stored.
-    const empty: ScoreResponse = { best: 0, dailyBest: 0, levelBest: 0, unlocked: 1, newBest: false, rank: null, leaderboard: await topBoard(day) };
+    const empty: ScoreResponse = { best: 0, dailyBest: 0, levelBest: 0, unlocked: 1, newBest: false, rank: null, leaderboard: tier ? await topBoard(day, tier) : [] };
     return send(res, 200, empty);
   }
   const h = await redis.hGetAll(bestKey(username));
@@ -94,17 +98,17 @@ async function handleScore(req: IncomingMessage, res: ServerResponse): Promise<v
   }
   if (Object.keys(update).length) await redis.hSet(bestKey(username), update);
 
-  let dailyBest = (await redis.zScore(boardKey(day), username)) ?? 0;
-  if (data.daily && score > dailyBest) {
+  let dailyBest = tier ? ((await redis.zScore(boardKey(day, tier), username)) ?? 0) : 0;
+  if (tier && score > dailyBest) {
     dailyBest = score;
-    await redis.zAdd(boardKey(day), { member: username, score });
-    await redis.expire(boardKey(day), 60 * 60 * 24 * 14);
+    await redis.zAdd(boardKey(day, tier), { member: username, score });
+    await redis.expire(boardKey(day, tier), 60 * 60 * 24 * 14);
   }
   let rank: number | null = null;
-  if (data.daily) {
-    const r = await redis.zRank(boardKey(day), username);
+  if (tier) {
+    const r = await redis.zRank(boardKey(day, tier), username);
     if (r !== undefined) {
-      const total = await redis.zCard(boardKey(day));
+      const total = await redis.zCard(boardKey(day, tier));
       rank = total - r;
     }
   }
@@ -115,7 +119,7 @@ async function handleScore(req: IncomingMessage, res: ServerResponse): Promise<v
     unlocked,
     newBest: score > prevLevelBest,
     rank,
-    leaderboard: await topBoard(day),
+    leaderboard: tier ? await topBoard(day, tier) : [],
   };
   send(res, 200, out);
 }

@@ -1,14 +1,16 @@
 import type { InitResponse, LeaderboardEntry, ScoreResponse } from '../../shared/api';
+import { MAX_LEVEL } from '../../shared/api';
 import { hashString } from './rng';
 
 export interface Profile {
   username: string | null;
   best: number;
-  dailyBest: number;
+  /** Best score today per Daily Trial tier (Easy, Normal, Hard). */
+  dailyBest: number[];
   /** Highest level that may be started. */
   unlocked: number;
   levelBest: Record<number, number>;
-  leaderboard: LeaderboardEntry[];
+  leaderboards: LeaderboardEntry[][];
   online: boolean;
 }
 
@@ -47,16 +49,23 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
  */
 export class DailyChallenge {
   readonly dayKey = new Date().toISOString().slice(0, 10);
-  readonly seed = hashString(`zeus-trial-of-olympus:${this.dayKey}`);
-  /** The Daily Trial always runs on one of the first three arenas so it is open to everyone. */
-  readonly level = 1 + (this.seed % 3);
+  /** Three Daily Trials per day: a seed and an arena each, open to everyone regardless of unlocked levels. */
+  readonly tiers = [
+    { label: 'EASY', min: 1, max: 10 },
+    { label: 'NORMAL', min: 11, max: 35 },
+    { label: 'HARD', min: 36, max: 70 },
+  ].map((t, i) => ({
+    ...t,
+    seed: hashString(`zeus-trial-of-olympus:${this.dayKey}:${i + 1}`),
+    level: t.min + (hashString(`zeus-daily-level:${this.dayKey}:${i + 1}`) % (t.max - t.min + 1)),
+  }));
   profile: Profile = {
     username: null,
     best: Number(lsGet(LS_BEST) ?? 0) || 0,
-    dailyBest: Number(lsGet(`zeus.daily.${this.dayKey}`) ?? 0) || 0,
+    dailyBest: [1, 2, 3].map((t) => Number(lsGet(`zeus.daily.${this.dayKey}.${t}`) ?? 0) || 0),
     unlocked: Math.max(1, Number(lsGet(LS_UNLOCKED) ?? 1) || 1),
     levelBest: {},
-    leaderboard: [],
+    leaderboards: [[], [], []],
     online: false,
   };
 
@@ -73,10 +82,10 @@ export class DailyChallenge {
       const p = this.profile;
       p.username = r.username;
       p.best = Math.max(r.best, p.best);
-      p.dailyBest = Math.max(r.dailyBest, p.dailyBest);
+      p.dailyBest = p.dailyBest.map((v, i) => Math.max(r.dailyBest[i] ?? 0, v));
       p.unlocked = Math.max(r.unlocked, p.unlocked);
       for (const [k, v] of Object.entries(r.levelBest)) p.levelBest[Number(k)] = Math.max(v, p.levelBest[Number(k)] ?? 0);
-      p.leaderboard = r.leaderboard;
+      p.leaderboards = r.leaderboards;
       p.online = true;
       this.saveLocal();
     } catch {
@@ -93,15 +102,15 @@ export class DailyChallenge {
   }
 
   /** Records a finished run locally right away, then tries the server. */
-  async submit(score: number, kills: number, maxCombo: number, daily: boolean, level: number, cleared: boolean): Promise<{ newBest: boolean; rank: number | null }> {
+  async submit(score: number, kills: number, maxCombo: number, tier: number, level: number, cleared: boolean): Promise<{ newBest: boolean; rank: number | null }> {
     const p = this.profile;
     const newBest = score > (p.levelBest[level] ?? 0);
     p.best = Math.max(p.best, score);
     p.levelBest[level] = Math.max(p.levelBest[level] ?? 0, score);
-    if (cleared && level >= p.unlocked) p.unlocked = level + 1;
-    if (daily) {
-      p.dailyBest = Math.max(p.dailyBest, score);
-      lsSet(`zeus.daily.${this.dayKey}`, String(p.dailyBest));
+    if (cleared && level >= p.unlocked) p.unlocked = Math.min(MAX_LEVEL, level + 1);
+    if (tier) {
+      p.dailyBest[tier - 1] = Math.max(p.dailyBest[tier - 1], score);
+      lsSet(`zeus.daily.${this.dayKey}.${tier}`, String(p.dailyBest[tier - 1]));
     }
     this.saveLocal();
     let rank: number | null = null;
@@ -109,13 +118,13 @@ export class DailyChallenge {
       const r = await api<ScoreResponse>('/api/score', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ score, kills, maxCombo, daily, level, cleared }),
+        body: JSON.stringify({ score, kills, maxCombo, tier, level, cleared }),
       });
       p.best = Math.max(p.best, r.best);
-      p.dailyBest = Math.max(p.dailyBest, r.dailyBest);
+      if (tier) p.dailyBest[tier - 1] = Math.max(p.dailyBest[tier - 1], r.dailyBest);
       p.unlocked = Math.max(p.unlocked, r.unlocked);
       p.levelBest[level] = Math.max(p.levelBest[level] ?? 0, r.levelBest);
-      p.leaderboard = r.leaderboard;
+      if (tier) p.leaderboards[tier - 1] = r.leaderboard;
       p.online = true;
       rank = r.rank;
       this.saveLocal();

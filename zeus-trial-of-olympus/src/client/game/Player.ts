@@ -312,6 +312,24 @@ export class Player {
       }
     }
 
+    // solid obstacles: slide around them
+    for (const o of world.obstacles) {
+      const ox = this.pos.x - o.x;
+      const oz = this.pos.z - o.z;
+      const min = o.r + CFG.PLAYER_RADIUS;
+      const d2 = ox * ox + oz * oz;
+      if (d2 < min * min) {
+        const d = Math.sqrt(d2) || 0.001;
+        this.pos.x = o.x + (ox / d) * min;
+        this.pos.z = o.z + (oz / d) * min;
+        const inward = this.vel.x * (ox / d) + this.vel.z * (oz / d);
+        if (inward < 0) {
+          this.vel.x -= (ox / d) * inward;
+          this.vel.z -= (oz / d) * inward;
+        }
+      }
+    }
+
     // --- state / facing ---
     const speed01 = Math.min(1, Math.hypot(this.vel.x, this.vel.z) / CFG.PLAYER_SPEED);
     if (this.state === 'attack' && this.lockTimer <= 0) this.state = 'idle';

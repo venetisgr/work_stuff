@@ -138,3 +138,16 @@ body.is-touch #health, body.is-touch #charge { height: 18px; }
 .pop.wine { color: #ff8a98; font-size: 24px; text-shadow: 0 0 14px #ff2a3a, 0 2px 4px #000; animation-duration: 1.3s; }
 #next-level { margin-top: 2px; }
 @media (max-height: 560px) { #lv-strip .lv-card .sub { display: none; } .lv-arrow { height: 52px; } }
+
+.lv-arrow.small { width: 26px; font-size: 20px; opacity: 0.8; }
+.lv-card.boss { border-color: #ffd36a; background: linear-gradient(rgba(70, 40, 10, 0.85), rgba(14, 10, 24, 0.92)); }
+.daily-head { font-size: 11px; letter-spacing: 0.26em; color: var(--gold); margin-top: 2px; }
+.daily-head small { color: #fff; margin-left: 6px; letter-spacing: 0.1em; }
+#daily-row { display: flex; gap: 8px; width: min(560px, 96vw); }
+.daily-btn { flex: 1; min-width: 0; display: flex; flex-direction: column; align-items: center; gap: 1px; padding: 8px 4px; border-radius: 10px; border: 2px solid #9fd2ff; color: #fff; font-family: var(--font); cursor: pointer; pointer-events: auto; background: linear-gradient(#3b86e0, #1c4ea0 60%, #123a7c); touch-action: manipulation; }
+.daily-btn.d2 { border-color: #ffd36a; background: linear-gradient(#b8792a, #7a4a14 60%, #4a2a0a); }
+.daily-btn.d3 { border-color: #ff8a7a; background: linear-gradient(#b02a2a, #6a1414 60%, #3a0808); }
+.daily-btn b { font-size: 14px; letter-spacing: 0.16em; }
+.daily-btn span { font-size: 11px; opacity: 0.9; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+.daily-btn small { font-size: 9px; letter-spacing: 0.12em; opacity: 0.8; }
+.daily-btn:active { transform: scale(0.97); }
