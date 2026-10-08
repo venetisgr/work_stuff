@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { AnimationController, ProceduralAnimator, type Animator } from './AnimationController';
-import { CFG } from './config';
+import { CFG, world } from './config';
 import type { Effects } from './Effects';
 
 export type PlayerState = 'idle' | 'move' | 'attack' | 'dodge' | 'hit' | 'ult' | 'victory' | 'dead';
@@ -297,7 +297,7 @@ export class Player {
     }
     this.pos.x += this.vel.x * dt;
     this.pos.z += this.vel.z * dt;
-    const maxR = CFG.ARENA_RADIUS - 0.7;
+    const maxR = world.radius - 0.7;
     const r = Math.hypot(this.pos.x, this.pos.z);
     if (r > maxR) {
       this.pos.x *= maxR / r;

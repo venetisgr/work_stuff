@@ -1,5 +1,6 @@
 import type { LeaderboardEntry } from '../../shared/api';
-import { CFG } from './config';
+import { CFG, levelById } from './config';
+import type { Profile } from './DailyChallenge';
 
 export interface ResultData {
   score: number;
@@ -13,6 +14,9 @@ export interface ResultData {
   rank: number | null;
   leaderboard: LeaderboardEntry[];
   username: string | null;
+  level: number;
+  levelName: string;
+  cleared: boolean;
 }
 
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
@@ -49,6 +53,7 @@ export class UI {
   private lastCharge = -1;
   private lastReady = false;
   private cleanup: Array<() => void> = [];
+  private selected = 1;
 
   constructor() {
     for (let i = 0; i < 16; i++) {
@@ -89,16 +94,46 @@ export class UI {
     this.el.mute.textContent = muted ? '🔇' : '🔊';
   }
 
-  showMenu(best: number, dayKey: string, onPlay: (daily: boolean) => void): void {
-    $('menu-best').textContent = fmt(best);
-    $('daily-date').textContent = dayKey;
+  /** Level carousel: unlocked levels, one preview of what's next, and endless scrolling via the arrows. */
+  showMenu(profile: Profile, dayKey: string, dailyLevel: number, selected: number, onPlay: (level: number, daily: boolean) => void): void {
+    this.selected = Math.min(selected, profile.unlocked);
+    $('daily-date').textContent = `${dayKey} · ${levelById(dailyLevel).name}`;
     $('menu').classList.remove('hidden');
     $('results').classList.add('hidden');
     this.hud.classList.add('hidden');
+    const strip = $('lv-strip');
     const free = $('play-free');
-    const daily = $('play-daily');
-    free.onclick = () => onPlay(false);
-    daily.onclick = () => onPlay(true);
+    const render = () => {
+      const last = profile.unlocked + 1; // one locked preview
+      let html = '';
+      for (let n = 1; n <= last; n++) {
+        const L = levelById(n);
+        const locked = n > profile.unlocked;
+        const best = profile.levelBest[n];
+        const stars = Array.from({ length: 5 }, (_, i) => `<span class="${i < L.difficulty ? '' : 'off'}">⚡</span>`).join('');
+        html += `<button class="lv-card ${n === this.selected ? 'sel' : ''} ${locked ? 'locked' : ''}" data-n="${n}">
+          <div class="n">${locked ? '🔒 ' : ''}LEVEL ${n}</div><div class="nm">${L.name}</div><div class="st">${stars}</div>
+          <div class="sub">${locked ? `Clear level ${n - 1}` : best ? `BEST ${fmt(best)}` : `${L.radius * 2}m · ${L.time}s`}</div></button>`;
+      }
+      strip.innerHTML = html;
+      free.innerHTML = `PLAY LEVEL ${this.selected}<small>BEST ${fmt(profile.levelBest[this.selected] ?? 0)}</small>`;
+      strip.querySelector('.sel')?.scrollIntoView({ inline: 'center', block: 'nearest' });
+    };
+    render();
+    strip.onclick = (e) => {
+      const card = (e.target as HTMLElement).closest<HTMLElement>('.lv-card');
+      if (!card || card.classList.contains('locked')) return;
+      this.selected = Number(card.dataset.n);
+      render();
+    };
+    $('lv-prev').onclick = () => strip.scrollBy({ left: -260, behavior: 'smooth' });
+    $('lv-next').onclick = () => strip.scrollBy({ left: 260, behavior: 'smooth' });
+    free.onclick = () => onPlay(this.selected, false);
+    $('play-daily').onclick = () => onPlay(dailyLevel, true);
+  }
+
+  setLevelLabel(text: string): void {
+    $('hud-level').textContent = text;
   }
 
   setTouchVisible(on: boolean): void {
@@ -196,9 +231,9 @@ export class UI {
     (d as unknown as { _t?: number })._t = window.setTimeout(() => (d.style.display = 'none'), kind === 'multi' ? 1300 : 900);
   }
 
-  showResults(r: ResultData, onAgain: () => void, onMenu: () => void): void {
+  showResults(r: ResultData, onAgain: () => void, onMenu: () => void, onNext: () => void): void {
     this.hideHud();
-    $('res-title').textContent = r.victory ? 'OLYMPUS IS SAVED' : 'ZEUS HAS FALLEN';
+    $('res-title').textContent = r.victory ? `LEVEL ${r.level} CLEARED` : 'ZEUS HAS FALLEN';
     $('res-score').textContent = fmt(r.score);
     $('res-new').classList.toggle('hidden', !r.newBest);
     $('res-best').textContent = fmt(r.best);
@@ -215,6 +250,9 @@ export class UI {
       board.innerHTML = '';
     }
     $('results').classList.remove('hidden');
+    const next = $('next-level');
+    next.classList.toggle('hidden', !(r.cleared && !r.daily));
+    next.onclick = () => onNext();
     const again = $('play-again');
     again.onclick = onAgain;
     $('to-menu').onclick = onMenu;

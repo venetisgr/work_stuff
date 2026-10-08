@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { Arena } from './Arena';
 import { GameAudio } from './Audio';
-import { CFG, phaseAt, stormAt, type Phase } from './config';
+import { CFG, levelById, phaseAt, stormAt, world, wrathAt, type Level, type Phase } from './config';
 import { CombatSystem } from './CombatSystem';
 import { DailyChallenge } from './DailyChallenge';
 import { Effects } from './Effects';
@@ -34,6 +34,8 @@ export class Game {
   private pickups: Pickups;
   private combat: CombatSystem;
   private reticle: THREE.Mesh;
+  private level: Level = levelById(1);
+  private selectedLevel = 1;
 
   private state: State = 'loading';
   private rafId = 0;
@@ -74,16 +76,17 @@ export class Game {
     host.appendChild(renderer.domElement);
 
     this.fx = new Effects(this.scene, this.ui.flash, 800);
-    this.arena = new Arena(this.scene, this.fx, this.isMobile ? 1024 : 2048);
-    this.pickups = new Pickups(this.scene);
+    this.arena = new Arena(this.scene, this.fx, this.isMobile ? 1024 : 2048, this.isMobile ? 1024 : 2048, this.level);
+    this.pickups = new Pickups(this.scene, this.fx);
     this.player = new Player(this.scene, this.fx, { onCast: (d) => this.combat.cast(d) });
-    this.enemies = new EnemyManager(this.scene, this.fx, this.player, this.daily.seed);
+    this.enemies = new EnemyManager(this.scene, this.fx, this.player, this.daily.seed, this.level);
     this.combat = new CombatSystem(this.player, this.enemies, this.pickups, this.fx, this.arena, this.audio, {
       popup: (x, y, z, text, kind) => this.popup(x, y, z, text, kind),
       comboTier: (m) => this.ui.banner(m >= 8 ? 'x8 — GODLIKE' : `COMBO x${m}`),
       ultReady: () => this.ui.banner('ULTIMATE READY'),
       playerHit: () => {},
-    });
+      wine: () => this.ui.banner('+1 HEALTH'),
+    }, this.level);
     this.input = new Input(renderer.domElement, this.ui.touchRoot);
 
     // aim reticle on the floor (desktop)
@@ -129,12 +132,16 @@ export class Game {
     this.state = 'menu';
     this.ui.setTouchVisible(false);
     this.ui.hideResults();
-    this.resetWorld(false);
-    this.ui.showMenu(this.daily.profile.best, this.daily.dayKey, (d) => this.start(d));
+    this.resetWorld(false, this.level.id);
+    this.ui.showMenu(this.daily.profile, this.daily.dayKey, this.daily.level, this.selectedLevel, (lvl, d) => this.start(d, lvl));
     this.ui.setTouch(this.input.isTouch || document.body.classList.contains('is-touch'));
   }
 
-  private resetWorld(daily: boolean): void {
+  private resetWorld(daily: boolean, levelId: number): void {
+    if (levelId !== this.level.id) {
+      this.level = levelById(levelId);
+      this.arena.buildWorld(this.level);
+    }
     this.runTime = 0;
     this.endTimer = 0;
     this.victory = false;
@@ -145,29 +152,32 @@ export class Game {
     this.lastPhase = 'warmup';
     this.player.reset();
     const seed = daily ? this.daily.seed : (Math.random() * 0xffffffff) >>> 0;
-    this.enemies.reset(seed);
+    this.enemies.reset(seed, this.level);
     this.pickups.reset();
-    this.combat.reset();
+    this.combat.reset(this.level);
     this.fx.reset();
     this.arena.setStorm(0, 0);
   }
 
   /** Starts a run immediately — no reload, no re-init. */
-  start(daily: boolean): void {
+  start(daily: boolean, levelId?: number): void {
+    const lvl = daily ? this.daily.level : Math.min(levelId ?? this.selectedLevel, this.daily.profile.unlocked);
+    if (!daily) this.selectedLevel = lvl;
     this.audio.unlock();
     this.audio.startMusic();
     this.dailyMode = daily;
-    this.resetWorld(daily);
+    this.resetWorld(daily, lvl);
     this.input.clearQueued();
+    this.ui.setLevelLabel(`LEVEL ${this.level.id} · ${this.level.name}`.toUpperCase());
     this.ui.hideMenu();
     this.ui.hideResults();
     this.ui.showHud();
-    this.ui.banner(daily ? 'DAILY TRIAL' : 'SMITE THE SHADES');
+    this.ui.banner(daily ? 'DAILY TRIAL' : this.level.name.toUpperCase());
     this.ui.setTouchVisible(true);
     this.state = 'playing';
   }
 
-  private popup(x: number, y: number, z: number, text: string, kind: 'score' | 'spark' | 'multi'): void {
+  private popup(x: number, y: number, z: number, text: string, kind: 'score' | 'spark' | 'multi' | 'wine'): void {
     this.tmpV.set(x, y, z).project(this.camera);
     const r = this.renderer.domElement.getBoundingClientRect();
     this.ui.popup(((this.tmpV.x + 1) / 2) * r.width, ((1 - this.tmpV.y) / 2) * r.height, text, kind);
@@ -213,7 +223,7 @@ export class Game {
         this.combat.stats.score += whole;
         this.survivePts -= whole;
       }
-      const ph = phaseAt(this.runTime);
+      const ph = phaseAt(this.runTime, this.level.time);
       if (ph !== this.lastPhase) {
         this.lastPhase = ph;
         const b = BANNERS[ph];
@@ -224,7 +234,7 @@ export class Game {
         }
       }
       if (!p.alive) this.beginEnding(false);
-      else if (this.runTime >= CFG.RUN_TIME) this.beginEnding(true);
+      else if (this.runTime >= this.level.time) this.beginEnding(true);
     } else if (this.state === 'ending') {
       this.endTimer += rawDt;
       p.update(dt, this.move.set(0, 0, 0));
@@ -244,15 +254,15 @@ export class Game {
       this.enemies.update(rawDt, this.runTime, false);
     }
 
-    const storm = this.state === 'menu' ? 0.15 : this.state === 'results' ? 0.5 : stormAt(this.runTime);
-    const wrath = this.state === 'playing' || this.state === 'ending' ? Math.min(1, Math.max(0, (this.runTime - CFG.PHASES.chaos) / (CFG.RUN_TIME - CFG.PHASES.chaos))) : 0;
+    const storm = this.state === 'menu' ? 0.15 : this.state === 'results' ? 0.5 : stormAt(this.runTime, this.level.time);
+    const wrath = this.state === 'playing' || this.state === 'ending' ? wrathAt(this.runTime, this.level.time) : 0;
     this.arena.setStorm(storm, wrath);
     this.renderer.toneMappingExposure = 1.05 - storm * 0.3;
     this.arena.update(rawDt, performance.now() / 1000, storm, p.pos);
     // wrath: random strikes around the arena
-    if (this.state === 'playing' && wrath > 0 && Math.random() < dt * (3 + wrath * 6)) {
+    if (this.state === 'playing' && wrath > 0 && Math.random() < dt * (3 + wrath * 6) * (world.radius / 15)) {
       const a = Math.random() * Math.PI * 2;
-      const r = 4 + Math.random() * 11;
+      const r = 4 + Math.random() * (world.radius - 5);
       this.fx.strike(Math.cos(a) * r, Math.sin(a) * r, 0.35 + wrath * 0.3, 0xdfeaff);
       this.arena.flash(0.2);
       this.fx.addShake(0.04);
@@ -263,7 +273,7 @@ export class Game {
     this.updateCamera(rawDt);
 
     if (this.state === 'playing' || this.state === 'ending') {
-      this.ui.update(this.combat.stats.score, CFG.RUN_TIME - this.runTime, this.combat.multiplier, this.combat.tier, p.charge, p.hp);
+      this.ui.update(this.combat.stats.score, this.level.time - this.runTime, this.combat.multiplier, this.combat.tier, p.charge, p.hp);
     }
   }
 
@@ -326,8 +336,8 @@ export class Game {
     this.enemies.spawning = false;
     this.timeScale = 0.35;
     if (victory) {
-      this.combat.stats.score += CFG.COMPLETION_BONUS;
-      this.ui.banner('OLYMPUS IS SAVED');
+      this.combat.stats.score += CFG.COMPLETION_BONUS * this.level.id;
+      this.ui.banner(`LEVEL ${this.level.id} CLEARED`);
       this.combat.finale();
       this.player.celebrate();
     } else {
@@ -344,14 +354,14 @@ export class Game {
     this.ui.setTouchVisible(false);
     const s = this.combat.stats;
     const score = Math.floor(s.score);
-    const prevBest = this.daily.profile.best;
+    const prevBest = this.daily.profile.levelBest[this.level.id] ?? 0;
     // Local record is saved synchronously inside submit(); the server call is best-effort.
-    const submit = this.daily.submit(score, s.kills, s.maxCombo, this.dailyMode);
+    const submit = this.daily.submit(score, s.kills, s.maxCombo, this.dailyMode, this.level.id, this.victory);
     const show = (rank: number | null, newBest: boolean) =>
       this.ui.showResults(
         {
           score,
-          best: this.daily.profile.best,
+          best: this.daily.profile.levelBest[this.level.id] ?? score,
           kills: s.kills,
           maxCombo: s.maxCombo,
           newBest: newBest && score > 0,
@@ -361,9 +371,13 @@ export class Game {
           rank,
           leaderboard: this.daily.profile.leaderboard,
           username: this.daily.profile.username,
+          level: this.level.id,
+          levelName: this.level.name,
+          cleared: this.victory,
         },
-        () => this.start(this.dailyMode),
+        () => this.start(this.dailyMode, this.level.id),
         () => this.toMenu(),
+        () => this.start(false, this.level.id + 1),
       );
     show(null, score > prevBest);
     const res = await submit;
@@ -382,7 +396,7 @@ export class Game {
     const hero = this.state === 'menu' || this.state === 'results' ? 0.62 : 1;
     this.heroK += (hero - this.heroK) * (1 - Math.exp(-4 * dt));
     const tanH = Math.tan((fov * Math.PI) / 360) * aspect;
-    const dist = Math.min(34, Math.max(15, 8.5 / tanH)) * this.zoom * this.heroK;
+    const dist = Math.min(40, Math.max(15, 8.5 / tanH)) * this.zoom * this.heroK * (1 + Math.min(0.35, 0.04 * (this.level.id - 1)));
     const elev = this.state === 'menu' ? 0.6 : 0.78;
     const target = this.tmpV.set(p.x * 0.8, 0, p.z * 0.8);
     this.camFocus.lerp(target, 1 - Math.exp(-6 * dt));
@@ -403,7 +417,7 @@ export class Game {
   }
 
   get debugState() {
-    return { state: this.state, runTime: this.runTime, stats: this.combat.stats, hp: this.player.hp, charge: this.player.charge, enemies: this.enemies.active.length, mapping: this.player.clipMapping, fallback: this.player.usingFallback };
+    return { level: this.level.id, radius: world.radius, state: this.state, runTime: this.runTime, stats: this.combat.stats, hp: this.player.hp, charge: this.player.charge, enemies: this.enemies.active.length, mapping: this.player.clipMapping, fallback: this.player.usingFallback };
   }
 
   dispose(): void {

@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CFG } from './config';
+import { world, type Level, type LevelTheme } from './config';
 import type { Effects } from './Effects';
 
 const GOLD = 0xe8b84a;
@@ -32,10 +32,10 @@ function marbleVeins(ctx: CanvasRenderingContext2D, s: number, n: number): void 
   }
 }
 
-function floorTexture(): THREE.CanvasTexture {
-  return canvasTex(1024, (ctx, s) => {
+function floorTexture(theme: LevelTheme, size: number): THREE.CanvasTexture {
+  return canvasTex(size, (ctx, s) => {
     const c = s / 2;
-    ctx.fillStyle = '#ece6d8';
+    ctx.fillStyle = theme.floor;
     ctx.fillRect(0, 0, s, s);
     marbleVeins(ctx, s, 140);
     // rings
@@ -46,16 +46,16 @@ function floorTexture(): THREE.CanvasTexture {
       ctx.arc(c, c, r * c, 0, Math.PI * 2);
       ctx.stroke();
     };
-    ring(0.985, 14, '#c99a3a');
+    ring(0.985, 14, theme.floorRing);
     ring(0.93, 4, '#e8c46a');
     ring(0.78, 4, '#e8c46a');
     ring(0.4, 3, '#d8b050');
     ring(0.18, 3, '#d8b050');
     // meander band between r=0.80..0.92
-    const N = 56;
+    const N = Math.round(56 * Math.max(1, (world.radius / 15) * 0.8));
     ctx.save();
     ctx.translate(c, c);
-    ctx.strokeStyle = '#2e5f9e';
+    ctx.strokeStyle = theme.floorAccent;
     ctx.lineWidth = 3;
     ctx.lineJoin = 'miter';
     const r0 = 0.805 * c;
@@ -139,6 +139,8 @@ export class Arena {
   private skyTex: THREE.CanvasTexture;
   private clouds = new THREE.Group();
   private cloudMat: THREE.SpriteMaterial;
+  private worldGroup = new THREE.Group();
+  private theme!: LevelTheme;
   private flames: THREE.Mesh[] = [];
   private halos: THREE.Sprite[] = [];
   private mountains: THREE.MeshLambertMaterial;
@@ -149,12 +151,13 @@ export class Arena {
   private cTop = new THREE.Color();
   private cBot = new THREE.Color();
   private tmp = new THREE.Color();
-  private skyDay = [new THREE.Color(0x2f78c8), new THREE.Color(0xbfe0ff)];
-  private skyStorm = [new THREE.Color(0x0d1226), new THREE.Color(0x3a4468)];
-  private skyWrath = [new THREE.Color(0x1a0f2e), new THREE.Color(0x55406e)];
+  private skyDay = [new THREE.Color(), new THREE.Color()];
+  private skyStorm = [new THREE.Color(), new THREE.Color()];
+  private skyWrath = [new THREE.Color(), new THREE.Color()];
 
-  constructor(private scene: THREE.Scene, private fx: Effects, shadowSize: number) {
+  constructor(private scene: THREE.Scene, private fx: Effects, shadowSize: number, private texSize: number, level: Level) {
     scene.add(this.group);
+    this.group.add(this.worldGroup);
     scene.fog = new THREE.Fog(0xbfe0ff, 45, 150);
 
     // Sky dome
@@ -187,31 +190,62 @@ export class Arena {
     this.strikeLight.position.set(0, 5, 0);
     this.group.add(this.strikeLight);
 
-    this.buildPlatform();
-    this.buildColumns();
-    this.buildBraziers();
-
     this.cloudMat = new THREE.SpriteMaterial({ map: cloudTexture(), transparent: true, depthWrite: false, opacity: 0.9, fog: false });
     this.buildClouds();
     this.mountains = new THREE.MeshLambertMaterial({ color: 0x7d93b8, flatShading: true });
     this.buildBackdrop();
+    this.buildWorld(level);
+  }
+
+  /** (Re)builds everything that depends on the level: platform, columns, braziers, palette. */
+  buildWorld(level: Level): void {
+    this.clearWorld();
+    world.radius = level.radius;
+    this.theme = level.theme;
+    const t = level.theme;
+    t.skyDay.forEach((h, i) => this.skyDay[i].setHex(h));
+    t.skyStorm.forEach((h, i) => this.skyStorm[i].setHex(h));
+    t.skyWrath.forEach((h, i) => this.skyWrath[i].setHex(h));
+    this.mountains.color.setHex(t.mountains);
+    this.buildPlatform();
+    this.buildColumns();
+    this.buildBraziers(level.braziers);
+    this.lastStorm = -1;
     this.setStorm(0, 0);
   }
 
+  private clearWorld(): void {
+    this.flames = [];
+    this.halos = [];
+    const seen = new Set<THREE.Material>();
+    this.worldGroup.traverse((o) => {
+      const m = o as THREE.Mesh;
+      m.geometry?.dispose();
+      const mats = Array.isArray(m.material) ? m.material : m.material ? [m.material] : [];
+      for (const mat of mats) {
+        if (seen.has(mat)) continue;
+        seen.add(mat);
+        (mat as THREE.MeshStandardMaterial).map?.dispose();
+        mat.dispose();
+      }
+    });
+    this.worldGroup.clear();
+  }
+
   private buildPlatform(): void {
-    const R = CFG.ARENA_RADIUS + 0.8;
-    const floor = new THREE.MeshStandardMaterial({ map: floorTexture(), roughness: 0.45, metalness: 0.05 });
+    const R = world.radius + 0.8;
+    const floor = new THREE.MeshStandardMaterial({ map: floorTexture(this.theme, this.texSize), roughness: 0.45, metalness: 0.05 });
     const side = new THREE.MeshStandardMaterial({ color: 0xe4ddcc, roughness: 0.6 });
     const slab = new THREE.Mesh(new THREE.CylinderGeometry(R, R, 1.4, 64), [side, floor, side]);
     slab.position.y = -0.7;
     slab.receiveShadow = true;
-    this.group.add(slab);
+    this.worldGroup.add(slab);
 
     // gold rim
     const rim = new THREE.Mesh(new THREE.TorusGeometry(R, 0.14, 8, 64), new THREE.MeshStandardMaterial({ color: GOLD, metalness: 0.9, roughness: 0.3 }));
     rim.rotation.x = Math.PI / 2;
     rim.position.y = 0.02;
-    this.group.add(rim);
+    this.worldGroup.add(rim);
 
     // floating rock underneath
     const rockMat = new THREE.MeshLambertMaterial({ color: 0x5a5a68, flatShading: true });
@@ -224,12 +258,12 @@ export class Arena {
       pos.setZ(i, pos.getZ(i) + (Math.cos(i * 7.7) * 0.5) * 1.2);
     }
     rock.geometry.computeVertexNormals();
-    this.group.add(rock);
+    this.worldGroup.add(rock);
   }
 
   private buildColumns(): void {
-    const N = 14;
-    const R = CFG.ARENA_RADIUS + 0.2;
+    const N = Math.round(14 * (world.radius / 15));
+    const R = world.radius + 0.2;
     const marble = new THREE.MeshStandardMaterial({ color: 0xf1ece0, roughness: 0.55 });
     const shaftGeo = new THREE.CylinderGeometry(0.55, 0.65, 1, 14, 1);
     const baseGeo = new THREE.BoxGeometry(1.7, 0.4, 1.7);
@@ -267,7 +301,7 @@ export class Arena {
       }
     }
     caps.count = nCaps;
-    this.group.add(shafts, bases, caps);
+    this.worldGroup.add(shafts, bases, caps);
 
     // architrave beams between neighbouring intact columns
     const beams: THREE.Matrix4[] = [];
@@ -293,7 +327,7 @@ export class Arena {
     beams.forEach((mm, i) => beamMesh.setMatrixAt(i, mm));
     beamMesh.count = beams.length;
     beamMesh.castShadow = true;
-    this.group.add(beamMesh);
+    this.worldGroup.add(beamMesh);
 
     // rubble
     const rubbleMesh = new THREE.InstancedMesh(new THREE.DodecahedronGeometry(0.5, 0), marble, rubble.length * 3);
@@ -310,17 +344,17 @@ export class Arena {
       }
     }
     rubbleMesh.castShadow = true;
-    this.group.add(rubbleMesh);
+    this.worldGroup.add(rubbleMesh);
   }
 
-  private buildBraziers(): void {
+  private buildBraziers(count: number): void {
     const bronze = new THREE.MeshStandardMaterial({ color: 0x9a6b2a, metalness: 0.8, roughness: 0.4 });
     const flameMat = new THREE.MeshBasicMaterial({ color: 0xffa83a, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false });
     const haloMat = new THREE.SpriteMaterial({ map: cloudTexture(), color: 0xff9a30, transparent: true, blending: THREE.AdditiveBlending, depthWrite: false, opacity: 0.8 });
-    for (let i = 0; i < 4; i++) {
-      const a = Math.PI / 4 + (i * Math.PI) / 2;
-      const x = Math.cos(a) * 11.5;
-      const z = Math.sin(a) * 11.5;
+    for (let i = 0; i < count; i++) {
+      const a = Math.PI / 4 + (i * Math.PI * 2) / count;
+      const x = Math.cos(a) * world.radius * 0.77;
+      const z = Math.sin(a) * world.radius * 0.77;
       const stand = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.3, 1.5, 8), bronze);
       stand.position.set(x, 0.75, z);
       const bowl = new THREE.Mesh(new THREE.CylinderGeometry(0.75, 0.35, 0.45, 12), bronze);
@@ -331,7 +365,7 @@ export class Arena {
       const halo = new THREE.Sprite(haloMat);
       halo.scale.set(4, 4, 1);
       halo.position.set(x, 2.3, z);
-      this.group.add(stand, bowl, flame, halo);
+      this.worldGroup.add(stand, bowl, flame, halo);
       this.flames.push(flame);
       this.halos.push(halo);
     }
@@ -417,7 +451,7 @@ export class Arena {
     this.hemi.color.setHex(0xcfe6ff).lerp(new THREE.Color(0x6a7aa8), storm);
     this.sun.intensity = 2.1 - storm * 1.6;
     this.cloudMat.color.setRGB(1 - storm * 0.72, 1 - storm * 0.7, 1 - storm * 0.6);
-    this.mountains.color.setHex(0x7d93b8).lerp(new THREE.Color(0x2d3550), storm);
+    this.mountains.color.setHex(this.theme.mountains).lerp(new THREE.Color(0x2d3550), storm);
   }
 
   /** Brief global brightening used when lightning strikes anywhere. */

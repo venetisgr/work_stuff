@@ -1,5 +1,5 @@
 import * as THREE from 'three';
-import { CFG, ENEMY_DEFS } from './config';
+import { CFG, ENEMY_DEFS, world, type Level } from './config';
 import type { Arena } from './Arena';
 import type { GameAudio } from './Audio';
 import type { Effects } from './Effects';
@@ -17,10 +17,11 @@ export interface RunStats {
 }
 
 export interface CombatEvents {
-  popup(x: number, y: number, z: number, text: string, kind: 'score' | 'spark' | 'multi'): void;
+  popup(x: number, y: number, z: number, text: string, kind: 'score' | 'spark' | 'multi' | 'wine'): void;
   comboTier(mult: number): void;
   ultReady(): void;
   playerHit(): void;
+  wine(): void;
 }
 
 const TIER_COLORS = [0xcfe9ff, 0xcfe9ff, 0xa8d0ff, 0xfff0a8, 0xffd36a, 0xffffff];
@@ -29,6 +30,7 @@ const TIER_COLORS = [0xcfe9ff, 0xcfe9ff, 0xa8d0ff, 0xfff0a8, 0xffd36a, 0xffffff]
 export class CombatSystem {
   stats: RunStats = { score: 0, kills: 0, streak: 0, maxCombo: 1, multiKillBest: 0, sparks: 0 };
   ultActive = false;
+  level: Level;
   /** True while the end-of-run barrage is clearing the arena (flat score, no combo bonuses). */
   private finaleMode = false;
 
@@ -51,12 +53,15 @@ export class CombatSystem {
     private arena: Arena,
     private audio: GameAudio,
     private events: CombatEvents,
+    level: Level,
   ) {
+    this.level = level;
     enemies.onKill = (e) => this.handleKill(e);
     enemies.onPlayerHit = () => this.handlePlayerHit();
   }
 
-  reset(): void {
+  reset(level: Level): void {
+    this.level = level;
     this.stats = { score: 0, kills: 0, streak: 0, maxCombo: 1, multiKillBest: 0, sparks: 0 };
     this.ultActive = false;
     this.ultT = 0;
@@ -79,7 +84,7 @@ export class CombatSystem {
   }
 
   private addScore(base: number): number {
-    const pts = Math.round(base * this.multiplier);
+    const pts = Math.round(base * this.multiplier * this.level.scoreMul);
     this.stats.score += pts;
     return pts;
   }
@@ -97,7 +102,7 @@ export class CombatSystem {
     const def = ENEMY_DEFS[e.kind];
     if (this.finaleMode) {
       this.stats.kills++;
-      this.stats.score += def.score;
+      this.stats.score += Math.round(def.score * this.level.scoreMul);
       return;
     }
     const prevMult = this.multiplier;
@@ -124,8 +129,13 @@ export class CombatSystem {
       this.stats.multiKillBest = Math.max(this.stats.multiKillBest, this.multiCount);
       this.events.popup(e.x, 2.8, e.z, `x${this.multiCount} MULTI +${bonus}`, 'multi');
     }
-    const drops = e.kind === 'brute' ? 3 : Math.random() < CFG.SPARK_CHANCE ? 1 : 0;
+    const drops = def.heavy ? 3 : Math.random() < CFG.SPARK_CHANCE ? 1 : 0;
     for (let i = 0; i < drops; i++) this.pickups.drop(e.x, e.z);
+    // Harder trials: creatures may drop a wine cup, but only while Zeus is hurt (one on the floor at a time).
+    if (this.level.wine > 0 && this.player.hp < CFG.MAX_HP && this.pickups.wineCount === 0) {
+      const chance = this.level.wine * (def.heavy ? 4 : 1) * (this.player.hp <= 2 ? 1.6 : 1);
+      if (Math.random() < chance) this.pickups.dropWine(e.x, e.z);
+    }
   }
 
   private gainCharge(amount: number): void {
@@ -176,7 +186,7 @@ export class CombatSystem {
       tx = origin.x + dir.x * reach;
       tz = origin.z + dir.z * reach;
       const r = Math.hypot(tx, tz);
-      const maxR = CFG.ARENA_RADIUS - 0.5;
+      const maxR = world.radius - 0.5;
       if (r > maxR) {
         tx *= maxR / r;
         tz *= maxR / r;
@@ -305,7 +315,7 @@ export class CombatSystem {
   finale(): void {
     for (let i = 0; i < 12; i++) {
       const a = Math.random() * Math.PI * 2;
-      const r = Math.random() * 13;
+      const r = Math.random() * (world.radius - 2);
       this.fx.strike(Math.cos(a) * r, Math.sin(a) * r, 0.8, i % 3 === 0 ? 0xfff0a8 : 0xcfe9ff);
     }
     this.fx.addShake(1);
@@ -343,14 +353,24 @@ export class CombatSystem {
       }
       if (this.ultT >= CFG.ULT_DURATION) this.ultActive = false;
     }
-    const collected = this.pickups.update(dt, this.player.pos.x, this.player.pos.z, running && this.player.alive, (x, z) => {
+    this.pickups.update(dt, this.player.pos.x, this.player.pos.z, running && this.player.alive, (kind, x, z) => {
+      if (kind === 'wine') {
+        if (this.player.hp >= CFG.MAX_HP) return false;
+        this.player.hp++;
+        this.fx.burst(x, 1, z, 18, 0xff5a6a, 4, 0.6, 0.7);
+        this.fx.ring(this.player.pos.x, this.player.pos.z, 3, 0.5, 0xff8090);
+        this.audio.play('spark');
+        this.events.wine();
+        this.events.popup(x, 2, z, '+1 HEALTH', 'wine');
+        return true;
+      }
       this.stats.sparks++;
       this.stats.score += CFG.SPARK_SCORE;
       this.events.popup(x, 1.6, z, `+${CFG.SPARK_SCORE}`, 'spark');
       this.fx.burst(x, 1, z, 8, 0xffe08a, 3, 0.4, 0.4);
       this.audio.play('spark');
       if (!this.ultActive) this.gainCharge(CFG.SPARK_CHARGE);
+      return true;
     });
-    void collected;
   }
 }

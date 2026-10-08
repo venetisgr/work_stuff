@@ -27,6 +27,25 @@ Install the app on a subreddit, then use the subreddit menu **Create Zeus: Trial
 | Dodge (i-frames) | Shift | DODGE |
 | Ultimate (full Divine Charge) | E / Q / right click | ULT |
 
+## Levels
+
+Five hand-made trials, then an **endless ramp**: every level after 5 is generated (bigger arena up to a 44-unit radius,
+longer timer up to 120 s, denser/faster hordes, more heavy creatures) so there is no last level. Clearing a level (surviving
+its timer) unlocks the next; pick any unlocked level from the level strip on the menu.
+
+| # | Trial | Arena radius | Time | New threats | Wine cups |
+|---|---|---|---|---|---|
+| 1 | Foothills of Olympus | 15 | 60 s | Satyrs, Harpies | – |
+| 2 | Temple of Athena | 18 | 70 s | Spartoi (skeleton hoplites) | – |
+| 3 | The Labyrinth | 21 | 75 s | Minotaur (charges) | 6 % |
+| 4 | Poseidon's Wrath | 24 | 80 s | Cyclops | 8 % |
+| 5 | Gates of Hades | 27 | 90 s | everything | 10 % |
+| 6+ | generated (Elysian Fields, Mount Ida, …) | 29 → 44 | 93 → 120 s | heavier mixes | 10 % |
+
+Higher levels also multiply score (×1 … ×2+). On levels 3+ creatures can drop a **wine cup** (kylix) that restores one health —
+only while Zeus is hurt, one on the floor at a time, and heavy creatures drop it far more often.
+Tuning lives in `LEVELS` / `levelById` in `game/config.ts`. The Daily Trial always runs on one of the first three arenas.
+
 ## The run
 
 | Time | Phase | |
@@ -43,7 +62,7 @@ Ends with a slow-mo lightning barrage that clears the arena and a victory pose. 
   change their colour and add chain lightning (+1 arc per tier).
 * **Divine Charge**: smiting costs 3 %, kills and sparks refill it. At 100 % the ultimate calls a 2.4 s storm
   around Zeus (and heals one pip).
-* **Enemies**: Shade (normal), Runner (fast, weak, zig-zags), Brute (slow, big, 3 hits, hits for 2).
+* **Creatures**: Satyr (basic), Harpy (flies, fast, zig-zags), Spartoi (2 hits, shield and spear), Minotaur (4 hits, telegraphed charge), Cyclops (8 hits, slow, hits hard).
 
 ## Zeus model & animations
 
