@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Mythic Conquest</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div id="selbox"></div>
+  <div id="hud" class="hidden">
+    <div id="top">
+      <div class="res" id="r-food" title="Food">🍖 <b>0</b></div>
+      <div class="res" id="r-wood" title="Wood">🪵 <b>0</b></div>
+      <div class="res" id="r-gold" title="Gold">🪙 <b>0</b></div>
+      <div class="res" id="r-favor" title="Favor — spent on mythic units, ages and god powers">✨ <b>0</b></div>
+      <div class="res" id="r-pop" title="Population">👥 <b>0/0</b></div>
+      <div class="res age" id="r-age">Archaic Age</div>
+      <button id="power" class="power" title="God power (Q)"><span class="pname"></span><small class="pcost"></small><i class="pcd"></i></button>
+      <div class="spacer"></div>
+      <button id="b-speed" title="Game speed (+/-)">1×</button>
+      <button id="b-pause" title="Pause (P)">⏸</button>
+      <button id="b-mute" title="Sound (M)">🔊</button>
+      <button id="b-help" title="Help (F1)">?</button>
+    </div>
+    <div id="hint"></div>
+    <div id="log"></div>
+    <div id="choice" class="hidden"></div>
+    <div id="bottom">
+      <canvas id="mini" width="190" height="190"></canvas>
+      <div id="sel"></div>
+      <div id="cmd"></div>
+    </div>
+  </div>
+  <div id="menu"></div>
+  <div id="help" class="hidden"></div>
+  <div id="end" class="hidden"></div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
