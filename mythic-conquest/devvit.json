@@ -1,0 +1,31 @@
+{
+  "$schema": "https://developers.reddit.com/schema/config-file.v1.json",
+  "name": "mythic-conquest",
+  "post": {
+    "dir": "dist/client",
+    "entrypoints": {
+      "default": { "entry": "index.html", "height": "tall" }
+    }
+  },
+  "server": {
+    "dir": "dist/server",
+    "entry": "index.cjs"
+  },
+  "permissions": {
+    "reddit": true
+  },
+  "menu": {
+    "items": [
+      {
+        "label": "Create Mythic Conquest post",
+        "description": "Posts the game to this subreddit",
+        "location": "subreddit",
+        "forUserType": "moderator",
+        "endpoint": "/internal/menu/post-create"
+      }
+    ]
+  },
+  "triggers": {
+    "onAppInstall": "/internal/on-app-install"
+  }
+}
