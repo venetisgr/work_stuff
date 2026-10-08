@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+    <title>Thor: Trial of Asgard</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div id="stage"></div>
+      <div id="flash"></div>
+      <div id="vignette"></div>
+
+      <div id="hud" class="hidden">
+        <div id="hud-score"><span class="lbl">SCORE</span><span id="score">0</span></div>
+        <div id="hud-time"><span class="lbl">TIME</span><span id="time">75</span></div>
+        <div id="hud-combo"><span class="lbl">COMBO</span><span id="combo">x1</span></div>
+        <button id="btn-mute" class="ui-btn" aria-label="Mute">🔊</button>
+        <div id="hud-bottom">
+          <div id="hp"></div>
+          <div id="charge-wrap">
+            <span class="lbl">ODINFORCE</span>
+            <div id="charge"><div id="charge-fill"></div><span id="charge-hint"></span></div>
+          </div>
+        </div>
+        <div id="banner"></div>
+        <div id="popups"></div>
+      </div>
+
+      <div id="touch">
+        <div id="joy-zone"></div>
+        <div id="joy-base"><div id="joy-knob"></div></div>
+        <div id="touch-btns">
+          <button id="btn-ult" class="tbtn">ᛟ<small>ULT</small></button>
+          <button id="btn-dodge" class="tbtn">➤<small>DODGE</small></button>
+          <button id="btn-attack" class="tbtn big">🔨<small>SMASH</small></button>
+        </div>
+      </div>
+
+      <div id="loading" class="screen">
+        <div class="title-small">THOR</div>
+        <div class="bar"><div id="load-fill"></div></div>
+        <div class="hint">Forging Mjölnir…</div>
+      </div>
+
+      <div id="menu" class="screen hidden ui-panel">
+        <div class="menu-top"><div class="crest">🔨</div>
+        <h1>THOR<br /><span>TRIAL OF ASGARD</span></h1>
+        <p class="tag">Survive 75 seconds. Smash the draugr, wolves and frost giants. Defend Asgard.</p></div>
+        <div class="menu-bottom"><div class="menu-best">BEST <b id="menu-best">0</b></div>
+        <button id="play-free" class="big-btn ui-btn">PLAY</button>
+        <button id="play-daily" class="big-btn alt ui-btn">DAILY TRIAL <small id="daily-date"></small></button>
+        <div class="controls">
+          <span><b>WASD</b> move</span><span><b>CLICK / SPACE</b> Mjölnir</span><span><b>SHIFT</b> dodge</span><span><b>E</b> Odin's wrath</span>
+        </div>
+        <div class="controls touch-only"><span>Left thumb: move</span><span>Right: smash · dodge · ultimate</span></div></div>
+      </div>
+
+      <div id="results" class="screen hidden ui-panel">
+        <div id="res-title">ASGARD STANDS</div>
+        <div class="res-label">FINAL SCORE</div>
+        <div id="res-score">0</div>
+        <div id="res-new">NEW BEST!</div>
+        <div class="res-grid">
+          <div><span>BEST SCORE</span><b id="res-best">0</b></div>
+          <div><span>ENEMIES DEFEATED</span><b id="res-kills">0</b></div>
+          <div><span>MAX COMBO</span><b id="res-combo">x1</b></div>
+        </div>
+        <div id="res-board"></div>
+        <button id="play-again" class="big-btn ui-btn">PLAY AGAIN</button>
+        <button id="to-menu" class="link-btn ui-btn">menu / daily trial</button>
+      </div>
+    </div>
+    <script type="module" src="./main.ts"></script>
+  </body>
+</html>
