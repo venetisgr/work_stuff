@@ -16,24 +16,26 @@ npm run soak       # headless AI-vs-AI simulation test (3 matches)
 
 Dev shortcut: `?civ=norse&god=thor&enemy=greek&diff=hard&seed=7` skips the menu; add `&auto=1` to let the AI play your side too (spectate).
 
-## Put it on Reddit (Devvit Web) from GitHub Codespaces
+## Put it on Reddit (Devvit Web)
 
-1. **Open a Codespace** on this branch: GitHub repo → green **Code** button → **Codespaces** → **Create codespace on `claude/mythic-conquest-rts`**.
-2. In the Codespaces terminal:
-   ```bash
-   cd mythic-conquest
-   npm install
-   npm run build            # dist/client (game) + dist/server (post creator)
-   ```
-3. **Log in to Reddit:** `npx devvit login` — it prints a link; open it, authorize, and paste the code it gives you back into the terminal.
-4. **Target subreddit:** `devvit.json` is set to `r/GreekDevvitGames` (`dev.subreddit`), so the Reddit account you log in with must moderate it. To use another one, change that field or pass the name to the playtest command. Unpublished apps can only be installed on subreddits you moderate.
-5. **Try it live:** `npm run devvit:playtest` — installs a dev build on `r/GreekDevvitGames` and hot-reloads on changes.
-   Then open https://www.reddit.com/r/GreekDevvitGames/ → mod menu (⋯) → **Create Mythic Conquest post** (the app also creates a post when first installed).
-6. **Upload a real version:** `npm run devvit:upload` (builds, then uploads; the first run asks you to name/register the app — `mythic-conquest`).
-   Then install it from the app's page at developers.reddit.com/apps, or run `npx devvit publish` to request public listing.
+Use the **copy-paste** login/upload mode: it works from GitHub Codespaces or any remote terminal because it never needs a `localhost` redirect.
 
-Notes: the game is mouse + keyboard (right-click orders, hotkeys), so it plays best on desktop. Open the post and use the expand button for full-screen.
-Run `npm run dev` for the plain-browser version (no Reddit needed).
+```bash
+cd mythic-conquest
+npm install
+npm run build
+npx devvit upload --copy-paste           # first run: log in (open the link, Allow, paste the code back) and register the app
+npx devvit publish --public --copy-paste # optional: submit for public listing (Reddit reviews it)
+```
+
+(`npm run devvit:upload` and `npm run devvit:publish` run the same commands.)
+
+Then install it on the subreddit:
+1. Open https://developers.reddit.com/apps → **mythic-conquest** → **Install** → **r/GreekDevvitGames** (the account must moderate it).
+2. In the subreddit, mod menu (⋯) → **Create Mythic Conquest post**. The install may also create a post by itself.
+
+`devvit.json` sets `r/GreekDevvitGames` as the default dev subreddit. To update later, run the upload command again.
+The game is mouse + keyboard (right-click orders, hotkeys), so it plays best on desktop. Run `npm run dev` for the plain-browser version.
 
 ## How to play
 
