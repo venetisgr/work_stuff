@@ -26,8 +26,10 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
 }
 
 function send(res: ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(body));
+  // Devvit's proxy rejects responses without an explicit Content-Length.
+  const payload = JSON.stringify(body);
+  res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) });
+  res.end(payload);
 }
 
 async function topBoard(day: string): Promise<LeaderboardEntry[]> {
@@ -114,8 +116,13 @@ const server = createServer(async (req, res) => {
       return send(res, 200, { navigateTo: post });
     }
     if (req.method === 'POST' && url.startsWith('/internal/on-app-install')) {
-      await createPost();
-      return send(res, 200, { status: 'ok' });
+      // A failed post must never fail the install itself.
+      try {
+        await createPost();
+      } catch (err) {
+        console.error('could not create the install post', err);
+      }
+      return send(res, 200, {});
     }
     send(res, 404, { error: 'not found' });
   } catch (err) {
