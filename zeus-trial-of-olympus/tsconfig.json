@@ -8,7 +8,12 @@
     "noUnusedLocals": true,
     "skipLibCheck": true,
     "noEmit": true,
-    "types": ["node", "vite/client"]
+    "types": ["node", "vite/client"],
+    "baseUrl": ".",
+    "paths": {
+      "@devvit/web/client": ["node_modules/@devvit/web/client/index.d.ts"],
+      "@devvit/client": ["node_modules/@devvit/client/index.d.ts"]
+    }
   },
   "include": ["src", "vite.*.ts", "tools/*.ts"]
 }

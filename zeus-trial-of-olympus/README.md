@@ -78,6 +78,8 @@ If `zeus.glb` fails to load, a simple stand-in model is used so the game still r
 `Arena` (platform, columns, braziers, clouds, backdrop, storm atmosphere) · `Effects` (pooled bolts, particles,
 rings, shake, flash) · `UI` (HUD, menu, results) · `Input` · `Audio` · `DailyChallenge` · `config` (all tuning).
 
+Posts show a branded splash card (`splash.html`, big PLAY button) that opens the game (`game.html`) in expanded mode.
+
 Server (`src/server/index.ts`): `GET /api/init`, `POST /api/score`, plus the post-creation menu/trigger.
 Redis keys: `zeus:best:<user>` (personal best), `zeus:lb:<YYYY-MM-DD>` (daily sorted set, 14-day TTL).
 

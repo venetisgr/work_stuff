@@ -33,7 +33,9 @@ export class UI {
     fill: $('charge-fill'),
     charge: $('charge'),
     hint: $('charge-hint'),
-    hp: $('hp'),
+    health: $('health'),
+    healthFill: $('health-fill'),
+    healthText: $('health-text'),
     banner: $('banner'),
     popups: $('popups'),
     mute: $('btn-mute'),
@@ -156,10 +158,17 @@ export class UI {
       }
     }
     if (hp !== this.lastHp) {
+      const dropped = this.lastHp > hp && this.lastHp >= 0;
       this.lastHp = hp;
-      let html = '';
-      for (let i = 0; i < CFG.MAX_HP; i++) html += `<i class="${i < hp ? '' : 'off'}"></i>`;
-      this.el.hp.innerHTML = html;
+      const k = Math.max(0, hp) / CFG.MAX_HP;
+      this.el.healthFill.style.width = `${k * 100}%`;
+      this.el.healthText.textContent = `${hp} / ${CFG.MAX_HP}`;
+      this.el.health.classList.toggle('low', hp <= 1);
+      this.el.health.classList.toggle('mid', hp === 2 || hp === 3);
+      if (dropped) {
+        this.el.health.classList.add('hit');
+        setTimeout(() => this.el.health.classList.remove('hit'), 300);
+      }
       this.el.vignette.classList.toggle('danger', hp <= 1);
     }
   }

@@ -5,7 +5,7 @@
   "type": "module",
   "description": "Zeus: Trial of Olympus — a 75-second Three.js arena survival game for Reddit (Devvit Web).",
   "scripts": {
-    "dev:client": "vite --config vite.client.config.ts",
+    "dev:client": "vite --config vite.client.config.ts --open /splash.html",
     "build:client": "vite build --config vite.client.config.ts",
     "build:server": "vite build --config vite.server.config.ts",
     "build": "npm run build:client && npm run build:server",

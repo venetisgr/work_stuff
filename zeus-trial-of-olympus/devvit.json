@@ -4,7 +4,8 @@
   "post": {
     "dir": "dist/client",
     "entrypoints": {
-      "default": { "entry": "index.html", "height": "tall" }
+      "default": { "entry": "splash.html", "height": "tall" },
+      "game": { "entry": "game.html" }
     }
   },
   "server": {
